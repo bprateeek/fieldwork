@@ -1,0 +1,604 @@
+#!/usr/bin/env python3
+"""fieldwork-bot — Telegram approval-gate daemon.
+
+Runs as the unprivileged `fieldwork-bot` system user. Watches the broker's
+pending-requests directory for new approval requests, sends a Telegram
+message with Approve / Deny inline-keyboard buttons to each allowlisted
+chat ID, and on callback POSTs the decision to the broker's approve socket.
+
+Security model:
+- Holds the Telegram bot token. Does NOT hold the GitHub PAT (the broker
+  does). Does NOT have a socket-group membership that would let it submit
+  forged /pr requests (only joins `fieldwork-bot`, never the submit socket
+  group).
+- Callback buttons carry an HMAC signature so a spoofed Telegram update
+  cannot drive a decision. Callbacks from non-allowlisted chats are logged
+  and silently dropped (no Telegram reply, so a probe gets no signal back).
+- No public inbound port: getUpdates is long-polled.
+
+Stdlib only. Python 3.10+ (Ubuntu 24.04 ships 3.12, which has tomllib).
+"""
+from __future__ import annotations
+
+import hashlib
+import hmac
+import http.client
+import json
+import logging
+import os
+import secrets
+import socket as socket_mod
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+try:
+    import tomllib
+except ImportError:
+    tomllib = None  # type: ignore[assignment]
+
+CONFIG_PATH = os.environ.get("FIELDWORK_BOT_CONFIG_PATH", "/etc/fieldwork-bot/config.toml")
+SECRET_PATH = os.environ.get("FIELDWORK_BOT_SECRET_PATH", "/etc/fieldwork-bot/secret")
+PENDING_DIR = os.environ.get("FIELDWORK_BOT_PENDING_DIR", "/var/lib/fieldwork-pr-broker/pending")
+NOTIFICATIONS_DIR = os.environ.get(
+    "FIELDWORK_BOT_NOTIFICATIONS_DIR",
+    "/var/lib/fieldwork-pr-broker/notifications",
+)
+APPROVE_SOCKET = os.environ.get(
+    "FIELDWORK_BOT_APPROVE_SOCKET",
+    "/run/fieldwork-pr-broker/fieldwork-pr-approve.sock",
+)
+LOG_PATH = os.environ.get("FIELDWORK_BOT_LOG_PATH", "/var/log/fieldwork-bot.log")
+HEALTH_PATH = os.environ.get(
+    "FIELDWORK_BOT_HEALTH_PATH",
+    "/var/lib/fieldwork-bot/bot-health.json",
+)
+
+SCAN_INTERVAL_SECONDS = float(os.environ.get("FIELDWORK_BOT_SCAN_INTERVAL", "2"))
+POLL_TIMEOUT_SECONDS = int(os.environ.get("FIELDWORK_BOT_POLL_TIMEOUT", "30"))
+TELEGRAM_API = os.environ.get("FIELDWORK_BOT_TELEGRAM_API", "https://api.telegram.org")
+HEALTH_PENDING_LIMIT = int(os.environ.get("FIELDWORK_BOT_HEALTH_PENDING_LIMIT", "20"))
+
+logging.basicConfig(
+    filename=LOG_PATH,
+    format="%(asctime)s %(levelname)s %(message)s",
+    level=logging.INFO,
+)
+log = logging.getLogger("fieldwork-bot")
+
+_health_lock = threading.Lock()
+_health_state: dict = {
+    "updated_at": None,
+    "last_poll_ok_at": None,
+    "last_poll_error_at": None,
+    "last_poll_error": None,
+    "last_callback_at": None,
+    "last_callback_result": None,
+    "pending_count": 0,
+    "oldest_pending_age_seconds": None,
+    "pending_requests": [],
+    "config_loaded": False,
+    "allowed_chat_count": 0,
+    "chat_binding_configured": False,
+}
+
+
+def load_config(path: str = CONFIG_PATH) -> dict:
+    if tomllib is None:
+        raise RuntimeError("python3 >= 3.11 required (tomllib missing)")
+    with open(path, "rb") as f:
+        cfg = tomllib.load(f)
+    token = cfg.get("bot_token")
+    chats = cfg.get("allowed_chat_ids")
+    if not isinstance(token, str) or not token:
+        raise RuntimeError(f"{path}: bot_token must be a non-empty string")
+    if not isinstance(chats, list) or not all(isinstance(c, int) for c in chats):
+        raise RuntimeError(f"{path}: allowed_chat_ids must be a list of ints")
+    if not chats:
+        raise RuntimeError(f"{path}: allowed_chat_ids must contain at least one chat ID")
+    return {"bot_token": token, "allowed_chat_ids": chats}
+
+
+def load_secret(path: str = SECRET_PATH) -> bytes:
+    return Path(path).read_bytes().strip()
+
+
+def sign_callback(secret: bytes, decision: str, request_id: str) -> str:
+    """Returns a callback_data string under Telegram's 64-byte cap.
+
+    Format: ``{d}:{request_id}:{sig16}`` where ``d`` is ``a`` (approve) or
+    ``d`` (deny), and ``sig16`` is the first 16 hex chars of
+    HMAC-SHA256(secret, decision + ":" + request_id). 16 hex = 64 bits is
+    plenty for short-lived button signatures (the pending file is gone
+    inside 24h either way).
+    """
+    if decision not in ("approve", "deny"):
+        raise ValueError(f"unknown decision: {decision}")
+    msg = f"{decision}:{request_id}".encode("ascii")
+    mac = hmac.new(secret, msg, hashlib.sha256).hexdigest()[:16]
+    short = "a" if decision == "approve" else "d"
+    return f"{short}:{request_id}:{mac}"
+
+
+def verify_callback(secret: bytes, data: str) -> tuple[str, str] | None:
+    """Returns (decision, request_id) on a valid signature, else None."""
+    parts = data.split(":")
+    if len(parts) != 3:
+        return None
+    short, request_id, mac = parts
+    if short == "a":
+        decision = "approve"
+    elif short == "d":
+        decision = "deny"
+    else:
+        return None
+    expected = sign_callback(secret, decision, request_id)
+    if not hmac.compare_digest(expected, data):
+        return None
+    return decision, request_id
+
+
+def telegram_call(token: str, method: str, payload: dict, timeout: int = 15) -> dict:
+    url = f"{TELEGRAM_API}/bot{token}/{method}"
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def send_approval_message(token: str, chat_id: int, record: dict, secret: bytes) -> int | None:
+    """Sends the Telegram message; returns the sent message_id, or None on failure."""
+    repo = record.get("repo", "unknown")
+    branch = record.get("branch", "?")
+    title = record.get("title", "(no title)")
+    expires_at = record.get("expires_at", "?")
+    request_id = record["request_id"]
+    text = (
+        f"🛡 Approval needed\n"
+        f"Repo: {repo}\n"
+        f"Branch: {branch}\n"
+        f"Title: {title}\n"
+        f"Expires: {expires_at} (UTC)\n"
+        f"Request ID: {request_id}"
+    )
+    keyboard = {
+        "inline_keyboard": [[
+            {"text": "✅ Approve", "callback_data": sign_callback(secret, "approve", request_id)},
+            {"text": "✋ Deny", "callback_data": sign_callback(secret, "deny", request_id)},
+        ]]
+    }
+    try:
+        result = telegram_call(token, "sendMessage", {
+            "chat_id": chat_id,
+            "text": text,
+            "reply_markup": keyboard,
+        })
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError) as e:
+        log.warning("sendMessage to %s failed: %s", chat_id, e)
+        return None
+    if not result.get("ok"):
+        log.warning("sendMessage to %s returned not-ok: %s", chat_id, result)
+        return None
+    return result.get("result", {}).get("message_id")
+
+
+def edit_message(token: str, chat_id: int, message_id: int, text: str) -> None:
+    try:
+        telegram_call(token, "editMessageText", {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": text,
+        })
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError) as e:
+        log.warning("editMessageText %s/%s failed: %s", chat_id, message_id, e)
+
+
+def answer_callback(token: str, callback_query_id: str, text: str = "") -> None:
+    try:
+        telegram_call(token, "answerCallbackQuery", {
+            "callback_query_id": callback_query_id,
+            "text": text,
+        })
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError):
+        pass
+
+
+def write_sidecar(request_id: str, chats: list[tuple[int, int]]) -> None:
+    """Records that we sent the approval prompt — survives a bot restart.
+
+    Stored as ``pending/<rid>.json.notified`` next to the broker's pending
+    file. Group-writable by fieldwork-bot via the dir's mode 0770 +
+    setgid. The broker removes both files on /approve / /deny.
+    """
+    path = Path(PENDING_DIR) / f"{request_id}.json.notified"
+    payload = {"sent_at": _utcnow_iso(), "chats": [[c, m] for c, m in chats]}
+    with open(path, "w") as f:
+        json.dump(payload, f, sort_keys=True)
+    try:
+        os.chmod(path, 0o640)
+    except OSError:
+        pass
+
+
+def read_sidecar(request_id: str) -> dict | None:
+    try:
+        with open(Path(PENDING_DIR) / f"{request_id}.json.notified") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def list_pending() -> list[Path]:
+    try:
+        return sorted(
+            Path(entry.path) for entry in os.scandir(PENDING_DIR)
+            if entry.is_file() and entry.name.endswith(".json")
+            and not entry.name.endswith(".json.notified")
+        )
+    except FileNotFoundError:
+        return []
+
+
+def list_notifications() -> list[Path]:
+    try:
+        return sorted(
+            Path(entry.path) for entry in os.scandir(NOTIFICATIONS_DIR)
+            if entry.is_file() and entry.name.endswith(".json")
+        )
+    except FileNotFoundError:
+        return []
+
+
+def _parse_utc_iso(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def _pending_age_seconds(record: dict, path: Path, now: datetime) -> int:
+    queued_at = record.get("queued_at") or record.get("created_at")
+    queued_dt = _parse_utc_iso(queued_at)
+    if queued_dt is None:
+        try:
+            queued_dt = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+        except OSError:
+            queued_dt = now
+    return max(0, int((now - queued_dt).total_seconds()))
+
+
+def pending_health_summary() -> tuple[int, int | None, list[dict]]:
+    now = datetime.now(timezone.utc)
+    summaries: list[dict] = []
+    for path in list_pending():
+        try:
+            with open(path) as f:
+                record = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+        request_id = record.get("request_id", path.stem)
+        if not isinstance(request_id, str):
+            request_id = path.stem
+        repo = record.get("repo", "unknown")
+        branch = record.get("branch", "?")
+        age_seconds = _pending_age_seconds(record, path, now)
+        summaries.append({
+            "request_id": request_id,
+            "repo": repo if isinstance(repo, str) and repo else "unknown",
+            "branch": branch if isinstance(branch, str) and branch else "?",
+            "age_seconds": age_seconds,
+        })
+    summaries.sort(key=lambda item: item["age_seconds"], reverse=True)
+    oldest = summaries[0]["age_seconds"] if summaries else None
+    return len(summaries), oldest, summaries[:HEALTH_PENDING_LIMIT]
+
+
+def write_health(**updates: object) -> None:
+    with _health_lock:
+        _health_state.update(updates)
+        _health_state["updated_at"] = _utcnow_iso()
+        payload = dict(_health_state)
+    path = Path(HEALTH_PATH)
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}.{threading.get_ident()}")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(tmp, "w") as f:
+            json.dump(payload, f, sort_keys=True)
+            f.write("\n")
+        try:
+            os.chmod(tmp, 0o644)
+        except OSError:
+            pass
+        os.replace(tmp, path)
+    except OSError as e:
+        log.debug("health write failed at %s: %s", path, e)
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
+def refresh_pending_health() -> None:
+    pending_count, oldest_age, pending_requests = pending_health_summary()
+    write_health(
+        pending_count=pending_count,
+        oldest_pending_age_seconds=oldest_age,
+        pending_requests=pending_requests,
+    )
+
+
+def record_config_health(cfg: dict) -> None:
+    chat_count = len(cfg.get("allowed_chat_ids", []))
+    write_health(
+        config_loaded=True,
+        allowed_chat_count=chat_count,
+        chat_binding_configured=chat_count > 0,
+    )
+
+
+def process_pending_dir(cfg: dict, secret: bytes) -> int:
+    """Send approval prompts for any pending entries we have not notified yet.
+
+    Returns the count of newly-notified entries (useful for tests).
+    """
+    sent = 0
+    for path in list_pending():
+        try:
+            with open(path) as f:
+                record = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            log.warning("skipping unreadable pending file: %s", path)
+            continue
+        request_id = record.get("request_id")
+        if not isinstance(request_id, str):
+            log.warning("pending file %s missing request_id", path)
+            continue
+        if read_sidecar(request_id) is not None:
+            continue
+        results: list[tuple[int, int]] = []
+        for chat_id in cfg["allowed_chat_ids"]:
+            msg_id = send_approval_message(cfg["bot_token"], chat_id, record, secret)
+            if msg_id is not None:
+                results.append((chat_id, msg_id))
+        if results:
+            write_sidecar(request_id, results)
+            log.info("notified %d chat(s) about rid=%s", len(results), request_id)
+            sent += 1
+    refresh_pending_health()
+    return sent
+
+
+def process_notifications_dir(cfg: dict) -> int:
+    """Forward outbound notification drop-offs from the agent user.
+
+    File shape: ``{"text": "..."}`` (one JSON file per message). The bot
+    deletes the file after sending so notifications are at-least-once: a
+    crash mid-delivery may resend, but never silently drop.
+    """
+    sent = 0
+    for path in list_notifications():
+        try:
+            with open(path) as f:
+                payload = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            continue
+        text = payload.get("text") if isinstance(payload, dict) else None
+        if not isinstance(text, str) or not text:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            continue
+        delivered = 0
+        for chat_id in cfg["allowed_chat_ids"]:
+            try:
+                telegram_call(cfg["bot_token"], "sendMessage", {
+                    "chat_id": chat_id, "text": text,
+                })
+                delivered += 1
+            except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError) as e:
+                log.warning("notification forward to %s failed: %s", chat_id, e)
+        if delivered:
+            sent += 1
+        try:
+            path.unlink()
+        except OSError:
+            pass
+    return sent
+
+
+def post_approve_decision(request_id: str, decision: str, chat_id: int) -> tuple[int, dict]:
+    body = json.dumps({
+        "request_id": request_id,
+        "decision": decision,
+        "chat_id": chat_id,
+    }).encode("utf-8")
+    head = (
+        f"POST /approve HTTP/1.1\r\nHost: localhost\r\n"
+        f"Content-Type: application/json\r\n"
+        f"Content-Length: {len(body)}\r\n"
+        f"Connection: close\r\n\r\n"
+    ).encode("ascii")
+    sock = socket_mod.socket(socket_mod.AF_UNIX, socket_mod.SOCK_STREAM)
+    try:
+        sock.connect(APPROVE_SOCKET)
+        sock.sendall(head + body)
+        chunks: list[bytes] = []
+        while True:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    finally:
+        sock.close()
+    raw = b"".join(chunks)
+    head_bytes, _, body_bytes = raw.partition(b"\r\n\r\n")
+    status_line = head_bytes.split(b"\r\n", 1)[0].decode("latin-1", errors="replace")
+    parts = status_line.split(" ", 2)
+    status = int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else 0
+    try:
+        payload = json.loads(body_bytes.decode("utf-8") or "{}")
+    except json.JSONDecodeError:
+        payload = {}
+    return status, payload
+
+
+def handle_callback(cfg: dict, secret: bytes, update: dict) -> None:
+    cq = update.get("callback_query")
+    if not isinstance(cq, dict):
+        return
+    cq_id = cq.get("id")
+    chat = (cq.get("message") or {}).get("chat") or {}
+    chat_id = chat.get("id")
+    user = cq.get("from") or {}
+    user_name = user.get("username") or user.get("first_name") or str(user.get("id") or "?")
+    data = cq.get("data")
+    message = cq.get("message") or {}
+    message_id = message.get("message_id")
+    token = cfg["bot_token"]
+
+    if chat_id not in cfg["allowed_chat_ids"]:
+        log.warning("callback from non-allowlisted chat=%s user=%s — dropped", chat_id, user_name)
+        # No answerCallbackQuery: silent drop so a probe gets no signal back.
+        return
+
+    if not isinstance(data, str):
+        if cq_id:
+            answer_callback(token, cq_id, "invalid callback")
+        return
+    verified = verify_callback(secret, data)
+    if verified is None:
+        log.warning("callback signature failed chat=%s user=%s", chat_id, user_name)
+        if cq_id:
+            answer_callback(token, cq_id, "invalid signature")
+        return
+    decision, request_id = verified
+
+    log.info("callback decision=%s rid=%s chat=%s user=%s", decision, request_id, chat_id, user_name)
+    try:
+        status, payload = post_approve_decision(request_id, decision, chat_id)
+    except OSError as e:
+        log.error("approve socket POST failed: %s", e)
+        write_health(last_callback_at=_utcnow_iso(), last_callback_result="broker_unreachable")
+        if cq_id:
+            answer_callback(token, cq_id, "broker unreachable")
+        return
+    if status == 200 and payload.get("ok"):
+        write_health(last_callback_at=_utcnow_iso(), last_callback_result="ok")
+        refresh_pending_health()
+    else:
+        write_health(last_callback_at=_utcnow_iso(), last_callback_result=f"broker_rejected:{status}")
+
+    if cq_id:
+        answer_callback(token, cq_id)
+
+    if message_id is None:
+        return
+    if status == 200 and payload.get("ok"):
+        if decision == "approve":
+            pr_url = payload.get("url", "")
+            new_text = f"✅ Approved by @{user_name} — {pr_url}".strip()
+        else:
+            new_text = f"✋ Denied by @{user_name}"
+    else:
+        err = payload.get("error", f"HTTP {status}")
+        new_text = f"⚠️ broker rejected ({decision}): {err}"
+    edit_message(token, chat_id, message_id, new_text)
+
+
+def poll_telegram(cfg: dict, secret: bytes, stop: threading.Event) -> None:
+    token = cfg["bot_token"]
+    offset = 0
+    attempt = 0
+    consecutive_failures = 0
+    while not stop.is_set():
+        try:
+            result = telegram_call(
+                token, "getUpdates",
+                {"timeout": POLL_TIMEOUT_SECONDS, "offset": offset, "allowed_updates": ["callback_query"]},
+                timeout=POLL_TIMEOUT_SECONDS + 5,
+            )
+            write_health(last_poll_ok_at=_utcnow_iso(), last_poll_error_at=None, last_poll_error=None)
+            attempt = 0
+            consecutive_failures = 0
+        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError) as e:
+            attempt += 1
+            consecutive_failures += 1
+            backoff = min(60, 2 ** attempt)
+            write_health(last_poll_error_at=_utcnow_iso(), last_poll_error=str(e)[:300])
+            if consecutive_failures % 5 == 1:
+                log.warning("getUpdates failed (attempt %d): %s; sleeping %ds", attempt, e, backoff)
+            stop.wait(backoff)
+            continue
+        if not result.get("ok"):
+            log.warning("getUpdates returned not-ok: %s", result)
+            write_health(last_poll_error_at=_utcnow_iso(), last_poll_error=str(result)[:300])
+            stop.wait(5)
+            continue
+        for update in result.get("result", []):
+            try:
+                handle_callback(cfg, secret, update)
+            except Exception:
+                log.exception("handle_callback raised")
+            update_id = update.get("update_id")
+            if isinstance(update_id, int):
+                offset = max(offset, update_id + 1)
+
+
+def _utcnow_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def generate_secret_hex() -> str:
+    return secrets.token_hex(32)
+
+
+def main() -> int:
+    cfg = load_config()
+    secret = load_secret()
+    record_config_health(cfg)
+    refresh_pending_health()
+    log.info(
+        "fieldwork-bot started: pending=%s notifications=%s approve_socket=%s health=%s chats=%s",
+        PENDING_DIR, NOTIFICATIONS_DIR, APPROVE_SOCKET, HEALTH_PATH, cfg["allowed_chat_ids"],
+    )
+
+    stop = threading.Event()
+    poll_thread = threading.Thread(
+        target=poll_telegram, args=(cfg, secret, stop), daemon=True, name="telegram-poll",
+    )
+    poll_thread.start()
+
+    try:
+        while not stop.is_set():
+            try:
+                process_pending_dir(cfg, secret)
+                process_notifications_dir(cfg)
+            except Exception:
+                log.exception("scan iteration failed")
+            stop.wait(SCAN_INTERVAL_SECONDS)
+    except KeyboardInterrupt:
+        log.info("fieldwork-bot shutting down")
+        stop.set()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

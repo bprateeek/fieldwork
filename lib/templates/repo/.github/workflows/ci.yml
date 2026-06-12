@@ -1,0 +1,51 @@
+name: ci
+
+# Node + TypeScript template. fieldwork-init removes this file when no package.json
+# is detected, then replaces __PKG_*__ placeholders from package scripts/lockfiles.
+# For non-npm package managers, an extra setup-action such as pnpm/action-setup or
+# oven-sh/setup-bun may still be needed.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: __PKG_INSTALL__
+      - run: __PKG_RUN_LINT__
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: __PKG_INSTALL__
+      - run: __PKG_RUN_BUILD__
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: __PKG_INSTALL__
+      - run: __PKG_RUN_TEST__

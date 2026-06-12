@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+"""fieldwork-verify — unix-socket client for the verify runner.
+
+Forwards a single verify request to fieldwork-verify-runner.socket
+(systemd user socket), demultiplexes the tagged response stream, and
+exits with the pipeline's exit code.
+
+This client is what the agent's /verify-before-pr skill invokes via the
+absolute path /home/fieldwork/.local/bin/fieldwork-verify. It's listed
+in the agent's sandbox excludedCommands, so it runs unwrapped — but
+because the agent process itself has PR_SET_NO_NEW_PRIVS and lives in
+a user namespace, this process inherits both. We therefore cannot run
+bwrap directly from here. The runner, started via systemd --user,
+lives outside that confinement and is the one that actually invokes
+the verify pipeline. See lib/scripts/fieldwork-verify-runner for the
+wire-protocol details.
+
+Usage:
+    fieldwork-verify <repo-path>
+
+Exit codes pass through verbatim from the pipeline:
+    0   ok
+    10  lint                14  semgrep
+    11  typecheck           20  abuse / sandbox-unavailable / path-escape
+    12  tests               30  deps-missing
+    13  gitleaks
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import socket
+import sys
+
+
+SOCKET_NAME = "fieldwork-verify.sock"
+
+
+def runtime_dir() -> str:
+    # systemd sets XDG_RUNTIME_DIR for user sessions. Fall back to the
+    # conventional path so manual invocations from SSH (where it isn't
+    # always set) still find the socket.
+    rd = os.environ.get("XDG_RUNTIME_DIR")
+    if rd:
+        return rd
+    return f"/run/user/{os.getuid()}"
+
+
+def fail_closed(message: str, code: int = 20) -> "None":
+    sys.stderr.write(f"fieldwork-verify: {message}\n")
+    sys.exit(code)
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) != 2:
+        fail_closed("usage: fieldwork-verify <repo-path>")
+    repo_path = argv[1]
+    if not repo_path:
+        fail_closed("repo-path must not be empty")
+
+    sock_path = os.path.join(runtime_dir(), SOCKET_NAME)
+    if not os.path.exists(sock_path):
+        fail_closed(
+            f"runner socket not available at {sock_path}\n"
+            "  Install the socket-activated runner with:\n"
+            "    fieldwork doctor --remote        # diagnoses + prescribes\n"
+            "  Or, manually, on the VPS as the fieldwork user:\n"
+            "    systemctl --user daemon-reload\n"
+            "    systemctl --user enable --now fieldwork-verify-runner.socket"
+        )
+
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.connect(sock_path)
+    except OSError as exc:
+        fail_closed(f"runner socket connect failed ({sock_path}): {exc}")
+
+    request = (json.dumps({"repo_path": repo_path}) + "\n").encode("utf-8")
+    try:
+        sock.sendall(request)
+        # Close our write half so the runner sees EOF on its stdin and
+        # never blocks waiting for more requests. The socket-activated
+        # service is one-shot per connection.
+        sock.shutdown(socket.SHUT_WR)
+    except OSError as exc:
+        fail_closed(f"runner request write failed: {exc}")
+
+    exit_code: int | None = None
+    buffer = b""
+    while True:
+        try:
+            chunk = sock.recv(8192)
+        except OSError as exc:
+            fail_closed(f"runner read failed mid-stream: {exc}")
+        if not chunk:
+            break
+        buffer += chunk
+        while b"\n" in buffer:
+            raw_line, buffer = buffer.split(b"\n", 1)
+            if b"\t" not in raw_line:
+                # Frames the runner emits are always TAG\tPAYLOAD; skip
+                # anything malformed rather than guess. Surface as stderr
+                # to aid debugging.
+                sys.stderr.buffer.write(b"fieldwork-verify: malformed frame: " + raw_line + b"\n")
+                continue
+            tag, payload = raw_line.split(b"\t", 1)
+            if tag == b"O":
+                sys.stdout.buffer.write(payload + b"\n")
+                sys.stdout.flush()
+            elif tag == b"E":
+                sys.stderr.buffer.write(payload + b"\n")
+                sys.stderr.flush()
+            elif tag == b"X":
+                try:
+                    exit_code = int(payload.decode("ascii"))
+                except ValueError:
+                    fail_closed(f"runner sent non-integer exit frame: {payload!r}")
+            else:
+                sys.stderr.buffer.write(b"fieldwork-verify: unknown frame tag: " + tag + b"\n")
+
+    if exit_code is None:
+        fail_closed("runner closed connection without emitting an exit frame")
+    return exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

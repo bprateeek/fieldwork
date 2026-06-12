@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# fieldwork-verify-runner — socket-activated frontend to the verify pipeline.
+#
+# Invoked by systemd as fieldwork-verify-runner@<conn>.service when a client
+# connects to the fieldwork-verify-runner.socket socket. The socket gives us
+# its file descriptor on stdin/stdout (StandardInput=socket /
+# StandardOutput=socket in the unit). This runner reads one JSON line of
+# request, runs fieldwork-verify-pipeline, and writes a tagged stream of
+# stdout/stderr lines plus a final exit-code frame back to the same socket.
+#
+# Why this layer exists at all: the agent process that calls
+# /home/fieldwork/.local/bin/fieldwork-verify has PR_SET_NO_NEW_PRIVS set
+# and runs inside its own user namespace (claude remote-control --sandbox).
+# A bwrap child of that process cannot create the user namespace it needs,
+# because AppArmor's profile transition into fieldwork-bwrap is blocked by
+# NNP. Routing the verify call through this socket-activated unit puts the
+# real work under the user manager (systemd --user) — outside the agent's
+# userns, with NNP clear, in a context where bwrap works.
+#
+# Wire protocol (one direction in, one direction out, line-delimited):
+#
+#   client → server:  {"repo_path": "/home/fieldwork/projects/foo"}\n
+#   server → client:  one or more frames, each a single \n-terminated line:
+#                       O\t<line>     stdout from pipeline
+#                       E\t<line>     stderr from pipeline
+#                       X\t<exit>     final exit code (always last)
+#
+# The tag/payload split uses ASCII TAB so payloads containing ': ' or spaces
+# don't need escaping. A single embedded NL inside a pipeline line would be
+# split across two frames; tooling output is line-oriented in practice so
+# this hasn't been a concern, and the client reassembles by newline anyway.
+
+set -uo pipefail
+
+PROJECTS_ROOT="${FIELDWORK_PROJECTS_ROOT:-/home/fieldwork/projects}"
+WORKTREES_ROOT="${FIELDWORK_WORKTREES_ROOT:-/home/fieldwork/worktrees}"
+
+# $0 is whatever path systemd exec'd us through — typically a symlink at
+# ~/.local/bin/fieldwork-verify-runner pointing into ~/.fieldwork/scripts/
+# pointing into the installed lib/scripts/ checkout. The pipeline lives
+# next to the runner's canonical (post-symlink-resolution) location, not
+# next to the user-facing ~/.local/bin/ symlink, so resolve all the way
+# before computing the sibling path.
+PIPELINE="$(dirname -- "$(readlink -f -- "$0")")/fieldwork-verify-pipeline"
+
+emit_error_and_exit() {
+  # Emit a framed error + exit-code so the client sees something coherent,
+  # then exit 0 from the runner itself (systemd treats non-zero as service
+  # failure and may rate-limit re-spawns; we'd rather report cleanly).
+  local msg="$1" code="$2"
+  printf 'E\trunner: %s\n' "$msg"
+  printf 'X\t%d\n' "$code"
+  exit 0
+}
+
+# ---- Read the request line (one JSON object, terminated by \n) -------------
+
+if ! IFS= read -r request_line; then
+  emit_error_and_exit "no request received on stdin" 20
+fi
+
+if ! command -v jq >/dev/null 2>&1; then
+  emit_error_and_exit "jq not installed on the runner host" 20
+fi
+
+repo_path="$(printf '%s' "$request_line" | jq -r '.repo_path // empty' 2>/dev/null || true)"
+if [ -z "$repo_path" ]; then
+  emit_error_and_exit "request missing repo_path" 20
+fi
+
+# Defence in depth: even though the pipeline re-validates, we reject
+# obviously-malformed paths before spawning anything. The pipeline's path
+# allowlist (and symlink check) is the load-bearing check.
+case "$repo_path" in
+  "$PROJECTS_ROOT"/*|"$WORKTREES_ROOT"/*) ;;
+  *)
+    emit_error_and_exit "repo_path outside allowlist: $repo_path" 20
+    ;;
+esac
+
+if [ ! -x "$PIPELINE" ]; then
+  emit_error_and_exit "fieldwork-verify-pipeline not executable at $PIPELINE" 20
+fi
+
+# ---- Set up framed output ---------------------------------------------------
+#
+# We need to interleave stdout and stderr lines from the pipeline into the
+# single socket fd, tagged so the client can demux. FIFOs + background line
+# taggers preserve real-time streaming (the verify pipeline takes 30-60s on
+# realistic repos; the agent would appear hung if we batched).
+#
+# The taggers exit on EOF, which they get when the pipeline closes its fds
+# at process exit.
+
+tmpdir="$(mktemp -d)"
+out_fifo="$tmpdir/out"
+err_fifo="$tmpdir/err"
+mkfifo -m 0600 "$out_fifo" "$err_fifo"
+trap 'rm -rf "$tmpdir"' EXIT
+
+# Background line-tagger for stdout. Writes go to the socket (our stdout).
+( while IFS= read -r line; do printf 'O\t%s\n' "$line"; done < "$out_fifo" ) &
+tag_out_pid=$!
+
+# Background line-tagger for stderr.
+( while IFS= read -r line; do printf 'E\t%s\n' "$line"; done < "$err_fifo" ) &
+tag_err_pid=$!
+
+# ---- Run the pipeline -------------------------------------------------------
+
+ec=0
+"$PIPELINE" "$repo_path" >"$out_fifo" 2>"$err_fifo" || ec=$?
+
+# Pipeline has exited and closed its fds; FIFOs now signal EOF to taggers.
+wait "$tag_out_pid" 2>/dev/null || true
+wait "$tag_err_pid" 2>/dev/null || true
+
+# Final exit frame — always last on the wire.
+printf 'X\t%d\n' "$ec"
+exit 0

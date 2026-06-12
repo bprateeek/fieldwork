@@ -1,0 +1,61 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: static-checks.sh
+        run: bash tests/static-checks.sh
+
+      - name: broker-validation-tests
+        run: python3 tests/broker-validation-tests.py
+
+      - name: bot-tests
+        run: python3 tests/bot-tests.py
+
+      - name: pr-prepare-validation-tests
+        run: python3 tests/pr-prepare-validation-tests.py
+
+  shellcheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: shellcheck (errors only)
+        run: |
+          # Lint tracked shell scripts, including extensionless ones with a
+          # bash/sh shebang. Scoped to severity=error so the gate catches real
+          # bugs rather than drowning in style warnings.
+          grep -rlE '^#!.*\b(bash|sh)\b' bin lib tests examples install.sh 2>/dev/null \
+            | sort -u | tee /dev/stderr | xargs -r shellcheck -S error
+
+  eval-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: eval up + smoke
+        run: |
+          bash bin/fieldwork eval up
+          bash bin/fieldwork eval smoke
+
+      - name: eval down
+        if: always()
+        run: bash bin/fieldwork eval down || true

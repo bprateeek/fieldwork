@@ -1,0 +1,212 @@
+#!/usr/bin/env bash
+# fieldwork-clone — first-time clone of a private repo onto the VPS via per-repo
+# read-only deploy key. Pairs with fieldwork-init: this script makes the checkout,
+# fieldwork-init configures it.
+#
+# Usage:
+#   fieldwork-clone <owner>/<repo>
+#   fieldwork-clone --prepare-deploy-key <owner>/<repo>
+#   fieldwork-clone --clone-after-deploy-key <owner>/<repo>
+#
+# What it does:
+#   1. Generates ~/.ssh/id_ed25519_<slug> (refuses overwrite).
+#   2. Appends a `Host github-<slug>` alias to ~/.ssh/config (idempotent).
+#   3. Prints the public key and pauses.
+#   4. You add the printed key as a READ-ONLY deploy key on github.com → repo
+#      → Settings → Deploy keys → Add. Press Enter to continue.
+#   5. Clones git@github-<slug>:<owner>/<repo>.git into ~/projects/<slug>.
+#
+# The deploy key is read-only by design: the broker pushes via HTTPS+PAT, so
+# the local clone never needs write access.
+
+set -euo pipefail
+SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/scripts/fieldwork-status
+source "$SCRIPT_DIR/fieldwork-status"
+trap 'fieldwork_status_cleanup' EXIT
+
+# Ensure ~/.local/bin is on PATH for non-interactive ssh shells (matches fieldwork-init).
+export PATH="$HOME/.local/bin:$PATH"
+
+say() { echo "[fieldwork-clone] $*"; }
+section() {
+  echo
+  echo "$1"
+}
+
+MODE="standalone"
+case "${1:-}" in
+  --prepare-deploy-key)
+    MODE="prepare"
+    shift
+    ;;
+  --clone-after-deploy-key)
+    MODE="clone"
+    shift
+    ;;
+  --help|-h)
+    sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+    exit 0
+    ;;
+esac
+
+OWNER_REPO="${1:-}"
+[ -n "$OWNER_REPO" ] || { echo "usage: $0 <owner>/<repo>" >&2; exit 2; }
+case "$OWNER_REPO" in
+  */*) ;;
+  *) echo "expected <owner>/<repo>, got: $OWNER_REPO" >&2; exit 2;;
+esac
+
+OWNER="${OWNER_REPO%%/*}"
+REPO_NAME="${OWNER_REPO#*/}"
+[[ "$OWNER" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,37}[a-zA-Z0-9])?$ ]] || {
+  echo "[fieldwork-clone] FAIL: owner '$OWNER' is not a valid GitHub user/org name" >&2
+  exit 2
+}
+[[ "$OWNER" != *--* ]] || {
+  echo "[fieldwork-clone] FAIL: owner '$OWNER' contains consecutive hyphens" >&2
+  exit 2
+}
+[[ "$REPO_NAME" =~ ^[a-zA-Z0-9._-]{1,100}$ ]] || {
+  echo "[fieldwork-clone] FAIL: repo name '$REPO_NAME' contains characters outside [A-Za-z0-9._-] or is too long" >&2
+  exit 2
+}
+
+SLUG="$REPO_NAME"
+
+# slug must match broker server.py REPO_PATH_RE (^[a-z0-9][a-z0-9-]{0,30}$)
+[[ "$SLUG" =~ ^[a-z0-9][a-z0-9-]{0,30}$ ]] || {
+  echo "slug '$SLUG' fails ^[a-z0-9][a-z0-9-]{0,30}\$ — broker will reject" >&2
+  exit 2
+}
+
+PROJECTS_DIR="$HOME/projects"
+DEST="$PROJECTS_DIR/$SLUG"
+KEY="$HOME/.ssh/id_ed25519_$SLUG"
+HOST_ALIAS="github-$SLUG"
+CONFIG="$HOME/.ssh/config"
+BROKER_USER="${FIELDWORK_BROKER_USER:-fieldwork-pr-broker}"
+
+prepare_deploy_key() {
+  local verbose="${1:-0}"
+  install -d -m 755 "$PROJECTS_DIR"
+  mkdir -p "$HOME/.ssh"
+  chmod 700 "$HOME/.ssh"
+
+  # Keygen is idempotent so onboarding can resume after a partial run.
+  if [ ! -f "$KEY" ]; then
+    ssh-keygen -t ed25519 -N "" -C "fieldwork-${SLUG}-deploy" -f "$KEY" >/dev/null
+    [ "$verbose" = "1" ] && say "created SSH key $KEY"
+  else
+    [ "$verbose" = "1" ] && say "reusing existing SSH key $KEY"
+  fi
+
+  touch "$CONFIG"
+  chmod 600 "$CONFIG"
+  if ! grep -q "^Host $HOST_ALIAS\b" "$CONFIG"; then
+    cat >> "$CONFIG" <<EOC
+
+# BEGIN FIELDWORK GITHUB SSH CONFIG: $HOST_ALIAS
+Host $HOST_ALIAS
+  HostName github.com
+  User git
+  IdentityFile $KEY
+  IdentitiesOnly yes
+# END FIELDWORK GITHUB SSH CONFIG: $HOST_ALIAS
+EOC
+    [ "$verbose" = "1" ] && say "added SSH host alias $HOST_ALIAS"
+  else
+    [ "$verbose" = "1" ] && say "SSH host alias $HOST_ALIAS already present"
+  fi
+  return 0
+}
+
+grant_broker_read_access() {
+  [ -d "$DEST/.git" ] || return 0
+  chmod o+x "$HOME" "$PROJECTS_DIR" 2>/dev/null || true
+  if command -v setfacl >/dev/null 2>&1 && id "$BROKER_USER" >/dev/null 2>&1; then
+    setfacl -m "u:$BROKER_USER:--x" "$HOME" "$PROJECTS_DIR" 2>/dev/null || true
+    setfacl -R -m "u:$BROKER_USER:rX" "$DEST" 2>/dev/null || true
+  else
+    # Fallback for hosts without ACL support. The broker runs as a separate
+    # system user, so it needs read/traverse access to validate and push.
+    chmod -R o+rX "$DEST" 2>/dev/null || true
+  fi
+}
+
+clone_after_deploy_key() {
+  local verbose="${1:-0}" log
+  [ ! -e "$DEST" ] || { echo "[fieldwork-clone] $DEST already exists — refusing to overwrite" >&2; exit 1; }
+
+  prepare_deploy_key 0
+  ssh-keygen -F github.com >/dev/null 2>&1 || ssh-keyscan -t ed25519 github.com >> "$HOME/.ssh/known_hosts" 2>/dev/null
+
+  log="$(mktemp)"
+  fieldwork_status_start "checking deploy-key access"
+  if git ls-remote "git@$HOST_ALIAS:$OWNER_REPO.git" HEAD >"$log" 2>&1; then
+    fieldwork_status_succeed "deploy key can read $OWNER_REPO"
+  else
+    fieldwork_status_fail "deploy key cannot read $OWNER_REPO"
+    echo "[fieldwork-clone] FAIL: deploy key cannot read $OWNER_REPO" >&2
+    echo "Next action:" >&2
+    echo "  confirm the deploy key was added as read-only, then rerun fieldwork onboard $OWNER_REPO" >&2
+    sed 's/^/  /' "$log" >&2
+    rm -f "$log"
+    exit 1
+  fi
+  rm -f "$log"
+
+  log="$(mktemp)"
+  fieldwork_status_start "cloning repository"
+  if git clone --quiet "git@$HOST_ALIAS:$OWNER_REPO.git" "$DEST" >"$log" 2>&1; then
+    fieldwork_status_succeed "repository cloned"
+  else
+    fieldwork_status_fail "git clone failed"
+    echo "[fieldwork-clone] FAIL: git clone failed" >&2
+    sed 's/^/  /' "$log" >&2
+    rm -f "$log"
+    exit 1
+  fi
+  rm -f "$log"
+  grant_broker_read_access
+
+  # Tell gh which repo this clone represents — the deploy-key alias URL hides the
+  # real github.com host so gh's auto-detection fails without this hint.
+  (cd "$DEST" && gh repo set-default "$OWNER_REPO" >/dev/null 2>&1) || {
+    [ "$verbose" = "1" ] && say "note: 'gh repo set-default $OWNER_REPO' failed; pass '--repo $OWNER_REPO' to fieldwork-init"
+  }
+  return 0
+}
+
+case "$MODE" in
+  prepare)
+    prepare_deploy_key 0
+    cat "$KEY.pub"
+    ;;
+  clone)
+    clone_after_deploy_key 0
+    ;;
+  standalone)
+    [ ! -e "$DEST" ] || { echo "[fieldwork-clone] $DEST already exists — refusing to overwrite" >&2; exit 1; }
+    section "Deploy key"
+    prepare_deploy_key 1
+
+    section "GitHub deploy key"
+    echo "  Purpose: give the VPS read-only clone access without giving the agent a write token."
+    echo "  GitHub path: $OWNER_REPO -> Settings -> Deploy keys -> Add deploy key"
+    echo "  Important: leave Allow write access unchecked."
+    echo
+    echo "Public key:"
+    echo
+    cat "$KEY.pub"
+    echo
+    read -r -p "Press Enter once the deploy key has been added (Ctrl-C to abort) " _
+
+    section "Clone"
+    clone_after_deploy_key 1
+    echo
+    say "cloned into $DEST"
+    echo "Next action:"
+    echo "  fieldwork-init --branch fieldwork/init --repo $OWNER_REPO $DEST"
+    ;;
+esac

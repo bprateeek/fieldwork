@@ -1,0 +1,29 @@
+[Unit]
+Description=Fieldwork agent session for %i
+After=network-online.target
+
+[Service]
+WorkingDirectory=%h/projects/%i
+# DO NOT set EnvironmentFile here. Anything in the agent's env propagates to
+# every Bash subprocess it spawns — Telegram tokens, gh tokens, API keys would
+# all leak. Tools that need credentials (notify.sh, gh, MCP servers) load their
+# own secrets at exec time and don't share them with the agent.
+#
+# ExecStart goes through fieldwork-agent-session, not a specific agent binary.
+# That wrapper selects the agent adapter (FIELDWORK_AGENT_ADAPTER, default
+# claude-remote-control) so other agents can be supported without changing this
+# unit, onboarding, or the broker.
+ExecStart=%h/.fieldwork/scripts/fieldwork-agent-session %i
+Restart=on-failure
+RestartSec=10s
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+# The agent needs to write its own state/cache; smoke-test by checking
+# `journalctl --user -u fieldwork-agent@<repo>` for permission-denied errors
+# and extending this list if the agent writes elsewhere.
+ReadWritePaths=%h/projects/%i %h/.fieldwork %h/.claude %h/.claude.json %h/.cache/claude %h/.local/share/claude
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

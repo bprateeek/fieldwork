@@ -1,0 +1,181 @@
+#!/usr/bin/env bash
+# fieldwork-codex-sandbox - version-tolerant Codex sandbox command runner.
+
+usage() {
+  echo "usage: fieldwork-codex-sandbox run [codex-flags...] -- <cmd...>" >&2
+}
+
+codex_version_label() {
+  local version
+  version="$(codex --version 2>/dev/null | head -n 1 || true)"
+  if [ -n "$version" ]; then
+    printf 'codex %s\n' "$version"
+  else
+    printf 'codex unavailable\n'
+  fi
+}
+
+is_candidate_word() {
+  case "${1:-}" in
+    ""|*[!A-Za-z0-9_-]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+candidate_id() {
+  local id="" word
+  for word in "$@"; do
+    is_candidate_word "$word" || return 1
+    if [ -z "$id" ]; then
+      id="$word"
+    else
+      id="${id}|${word}"
+    fi
+  done
+  [ -n "$id" ] || return 1
+  printf '%s\n' "$id"
+}
+
+add_candidate() {
+  local id existing
+  id="$(candidate_id "$@")" || return 0
+  for existing in "${candidate_ids[@]}"; do
+    [ "$existing" = "$id" ] && return 0
+  done
+  candidate_ids+=("$id")
+}
+
+decode_candidate() {
+  local id="$1"
+  IFS='|' read -r -a decoded_candidate_words <<<"$id"
+}
+
+add_help_candidates() {
+  local help line usage token index
+  local -a tokens words
+  help="$(codex sandbox --help 2>/dev/null || true)"
+  [ -n "$help" ] || return 0
+  while IFS= read -r line; do
+    case "$line" in
+      *Usage:*) ;;
+      *) continue ;;
+    esac
+    usage="${line#*Usage:}"
+    tokens=()
+    read -r -a tokens <<<"$usage"
+    [ "${tokens[0]:-}" = "codex" ] || continue
+    words=()
+    index=1
+    while [ "$index" -lt "${#tokens[@]}" ]; do
+      token="${tokens[$index]}"
+      case "$token" in
+        "["*|"<"*|"("*|*"]"*|*">"*|*")"*|*"...") break ;;
+      esac
+      is_candidate_word "$token" || break
+      words+=("$token")
+      index=$((index + 1))
+    done
+    [ "${words[0]:-}" = "sandbox" ] || continue
+    add_candidate "${words[@]}"
+  done <<<"$help"
+}
+
+safe_flag_summary() {
+  local arg name existing duplicate
+  local -a names
+  names=()
+  for arg in "${codex_flags[@]}"; do
+    name=""
+    case "$arg" in
+      --*=*) name="${arg%%=*}" ;;
+      --*) name="$arg" ;;
+      -[A-Za-z]) name="$arg" ;;
+    esac
+    case "$name" in
+      --|""|--*[!A-Za-z0-9_-]*|-[!A-Za-z]) name="" ;;
+    esac
+    [ -n "$name" ] || continue
+    duplicate=0
+    for existing in "${names[@]}"; do
+      [ "$existing" = "$name" ] && duplicate=1
+    done
+    [ "$duplicate" = "1" ] || names+=("$name")
+  done
+  [ "${#names[@]}" -gt 0 ] || return 0
+  printf ' (rejected:'
+  for name in "${names[@]}"; do
+    printf ' %s' "$name"
+  done
+  printf ')'
+}
+
+if [ "${1:-}" != "run" ]; then
+  usage
+  exit 2
+fi
+shift
+
+codex_flags=()
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --)
+      shift
+      break
+      ;;
+    *)
+      codex_flags+=("$1")
+      shift
+      ;;
+  esac
+done
+
+if [ "$#" -eq 0 ]; then
+  usage
+  exit 2
+fi
+
+cmd=("$@")
+candidate_ids=()
+decoded_candidate_words=()
+
+add_candidate sandbox
+add_candidate sandbox linux
+add_help_candidates
+
+bare_working_ids=()
+for candidate in "${candidate_ids[@]}"; do
+  decode_candidate "$candidate"
+  if codex "${decoded_candidate_words[@]}" -- true </dev/null >/dev/null 2>&1; then
+    bare_working_ids+=("$candidate")
+  fi
+done
+
+if [ "${#bare_working_ids[@]}" -eq 0 ]; then
+  echo "fieldwork-codex-sandbox: no working codex sandbox invocation found ($(codex_version_label))" >&2
+  exit 1
+fi
+
+selected_candidate=""
+for candidate in "${bare_working_ids[@]}"; do
+  decode_candidate "$candidate"
+  if codex "${decoded_candidate_words[@]}" "${codex_flags[@]}" -- true </dev/null >/dev/null 2>&1; then
+    selected_candidate="$candidate"
+    break
+  fi
+done
+
+if [ -z "$selected_candidate" ]; then
+  {
+    printf 'fieldwork-codex-sandbox: Codex sandbox found, but caller flags rejected'
+    safe_flag_summary
+    printf ' — %s\n' "$(codex_version_label)"
+  } >&2
+  exit 1
+fi
+
+decode_candidate "$selected_candidate"
+if [ "${#cmd[@]}" -eq 1 ] && [ "${cmd[0]}" = "true" ]; then
+  exit 0
+fi
+
+exec codex "${decoded_candidate_words[@]}" "${codex_flags[@]}" -- "${cmd[@]}"

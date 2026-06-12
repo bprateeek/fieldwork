@@ -1,0 +1,11 @@
+.DS_Store
+*.swp
+*.tmp
+fieldwork.toml
+notify.env
+__pycache__/
+.pytest_cache/
+.fieldwork/local/*
+!.fieldwork/local/.gitkeep
+docs/ux-principles.md
+docs/assets/hero-gif-brief.md

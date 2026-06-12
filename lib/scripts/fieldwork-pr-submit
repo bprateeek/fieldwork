@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# Thin client for the Fieldwork PR broker. The ONLY binary in `excludedCommands`.
+# Reads <repo>/.fieldwork/local/pr-request.json (or another file under .fieldwork/local/),
+# forwards bytes to the broker socket. Holds NO token, does NO git work.
+#
+# Usage: fieldwork-pr-submit <request-file>
+
+set -euo pipefail
+
+req="${1:?request file required (e.g. .fieldwork/local/pr-request.json)}"
+
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" || {
+  echo "[fieldwork-pr-submit] not a git repo (cwd: $PWD)" >&2; exit 1;
+}
+
+req_real="$(realpath -e "$req" 2>/dev/null)" || {
+  echo "[fieldwork-pr-submit] request file missing: $req" >&2; exit 1;
+}
+
+# Path safety: regular file (not symlink), under <repo>/.fieldwork/local/.
+[ -f "$req_real" ] && [ ! -L "$req" ] || {
+  echo "[fieldwork-pr-submit] must be regular file, not symlink" >&2; exit 1;
+}
+case "$req_real" in
+  "$repo_root/.fieldwork/local/"*) ;;
+  *) echo "[fieldwork-pr-submit] request must live under <repo>/.fieldwork/local/" >&2; exit 1;;
+esac
+
+# Size cap (Linux stat -c; fallback to BSD stat -f for macOS).
+size="$(stat -c %s "$req_real" 2>/dev/null || stat -f %z "$req_real")"
+[ "$size" -le 131072 ] || {
+  echo "[fieldwork-pr-submit] request >128KB ($size bytes)" >&2; exit 1;
+}
+
+# JSON shape sanity (don't reinvent broker validation; just pre-flight).
+jq -e 'has("request_id") and has("created_at") and has("repo_path") and has("branch") and has("title") and has("body")' "$req_real" >/dev/null || {
+  echo "[fieldwork-pr-submit] request JSON missing required fields (request_id, created_at, repo_path, branch, title, body)" >&2; exit 1;
+}
+
+# Forward to broker. All real validation + push happens broker-side.
+SOCK="${FIELDWORK_BROKER_SOCKET:-/run/fieldwork-pr-broker/fieldwork-pr.sock}"
+[ -S "$SOCK" ] || {
+  echo "[fieldwork-pr-submit] broker socket missing: $SOCK" >&2
+  echo "[fieldwork-pr-submit] is fieldwork-pr-broker.service running? (systemctl status fieldwork-pr-broker)" >&2
+  exit 1
+}
+
+response="$(curl -sS \
+  --unix-socket "$SOCK" \
+  -H 'Content-Type: application/json' \
+  --data-binary @"$req_real" \
+  http://localhost/pr)" || {
+  echo "[fieldwork-pr-submit] broker request failed before a JSON response" >&2
+  exit 1
+}
+
+printf '%s\n' "$response"
+if printf '%s' "$response" | jq -e '.ok == true' >/dev/null 2>&1; then
+  # Approval-gate path: broker has queued the request for human approval and
+  # will push when an /approve callback arrives. Surface this so the operator
+  # knows the PR has not opened yet.
+  if printf '%s' "$response" | jq -e '.queued == true' >/dev/null 2>&1; then
+    expires_at="$(printf '%s' "$response" | jq -r '.expires_at // empty' 2>/dev/null || true)"
+    if [ -n "$expires_at" ]; then
+      echo "[fieldwork-pr-submit] queued for human approval; expires at $expires_at"
+    else
+      echo "[fieldwork-pr-submit] queued for human approval"
+    fi
+  fi
+  exit 0
+fi
+
+error="$(printf '%s' "$response" | jq -r '.error // empty' 2>/dev/null || true)"
+if [ -n "$error" ]; then
+  echo "[fieldwork-pr-submit] broker rejected request: $error" >&2
+else
+  echo "[fieldwork-pr-submit] broker returned an unexpected response" >&2
+fi
+exit 1

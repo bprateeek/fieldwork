@@ -1,0 +1,22 @@
+# Fieldwork developer preview config.
+# Copy to ./fieldwork.toml or ~/.config/fieldwork/config.toml.
+#
+# These top-level keys are the implicit "default" profile. Environment variables
+# (FIELDWORK_SSH_HOST, ...) override anything set here.
+
+ssh_host = "fieldwork-vps"
+remote_user = "fieldwork"
+projects_dir = "/home/fieldwork/projects"
+default_branch = "main"
+notify_provider = "ntfy"
+# forge = "github"   # only GitHub is supported today
+
+# Optional: define additional named profiles and select one. A profile's keys
+# override the top-level defaults above. Select with `default_profile` here or
+# the FIELDWORK_PROFILE env var (env wins). Today most setups need only the
+# single default profile above.
+# default_profile = "work"
+#
+# [profile.work]
+# ssh_host = "fieldwork-work"
+# projects_dir = "/home/fieldwork/work"

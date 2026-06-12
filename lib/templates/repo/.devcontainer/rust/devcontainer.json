@@ -1,0 +1,28 @@
+{
+  "name": "rust-hardened",
+  "build": { "dockerfile": "Dockerfile" },
+  "remoteUser": "vscode",
+  "containerUser": "vscode",
+  "workspaceFolder": "/workspace",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind",
+  "runArgs": [
+    "--cap-drop=ALL",
+    "--security-opt=no-new-privileges",
+    "--memory=4g",
+    "--cpus=2",
+    "--pids-limit=512"
+  ],
+  "mounts": [],
+  "containerEnv": {
+    "CARGO_NET_GIT_FETCH_WITH_CLI": "false"
+  },
+  "remoteEnv": {
+    "SSH_AUTH_SOCK": ""
+  },
+  "postCreateCommand": "/etc/devcontainer/healthcheck.sh && cargo fetch",
+  "customizations": {
+    "vscode": {
+      "extensions": ["rust-lang.rust-analyzer"]
+    }
+  }
+}

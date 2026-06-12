@@ -1,0 +1,24 @@
+[Unit]
+Description=Fieldwork PR-prepare runner socket
+# Listening socket for fieldwork-pr-prepare. The client
+# (~/.local/bin/fieldwork-pr-prepare) connects here; systemd spawns one
+# fieldwork-pr-prepare-runner@<conn>.service per connection. The runner
+# deliberately runs OUTSIDE the agent's user namespace and without
+# PR_SET_NO_NEW_PRIVS, so the git work it does is unconfined by the
+# agent's sandbox. The agent's claude-side sandbox still blocks the
+# agent process from reading host secrets directly.
+
+[Socket]
+# %t resolves to $XDG_RUNTIME_DIR (typically /run/user/<uid>) for user units.
+# Mode 0600 keeps the socket private to the fieldwork user — same trust
+# boundary as the agent itself.
+ListenStream=%t/fieldwork-pr-prepare.sock
+SocketMode=0600
+Accept=yes
+# A prepare is short (one git checkout + add + commit), so cap concurrency
+# low. The skill issues one prepare per /pr-delivery, so two-in-flight is
+# already paranoid.
+MaxConnections=2
+
+[Install]
+WantedBy=default.target

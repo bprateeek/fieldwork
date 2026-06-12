@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Fieldwork agent adapter: Claude Code Remote Control.
+#
+# An agent adapter is an executable that fieldwork-agent-session invokes as:
+#   <adapter> <repo-slug> <repo-dir>
+# It must exec a single long-running foreground process — the agent session for
+# that repo. systemd keeps it alive (Restart=on-failure).
+#
+# Adapter contract (see docs/agent-adapters.md):
+#   - exec a long-running foreground process; do not background or fork-and-exit
+#   - the agent commits work under the branch prefix in FIELDWORK_BRANCH_PREFIX;
+#     the broker enforces the same prefix and rejects anything else
+#   - the agent never receives the GitHub write token; PRs go through the broker
+#   - hooks that must be skipped in non-local sessions key off
+#     FIELDWORK_SKIP_LOCAL_HOOKS. This adapter does not set it (VPS sessions
+#     want notifications); Claude Code's own CLAUDE_CODE_REMOTE still applies.
+#
+# This is the first agent adapter. It is intentionally thin: the durable parts
+# of Fieldwork (runner, repo setup, notifications, broker) are agent-agnostic.
+
+set -euo pipefail
+
+slug="${1:?agent adapter requires a repo slug}"
+session_name="vps-$slug"
+
+export CLAUDE_REMOTE_CONTROL_SESSION_NAME_PREFIX="$session_name"
+exec "$HOME/.local/bin/claude" remote-control \
+  --name "$session_name" \
+  --remote-control-session-name-prefix "$session_name" \
+  --sandbox --spawn=worktree --capacity=1

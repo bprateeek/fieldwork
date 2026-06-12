@@ -1,0 +1,4735 @@
+#!/usr/bin/env bash
+# Fieldwork developer preview CLI.
+#
+# Fieldwork coordinates coding-agent work from mobile by running one remote
+# session per repository on a user-owned VPS and routing writes through a
+# separate PR broker.
+
+set -euo pipefail
+
+fieldwork_timing_enabled() {
+  [ "${FIELDWORK_SETUP_TIMING:-0}" = "1" ]
+}
+
+fieldwork_time_now() {
+  local now
+  if command -v perl >/dev/null 2>&1; then
+    if now="$(perl -MTime::HiRes=time -e 'printf "%.3f\n", time' 2>/dev/null)"; then
+      printf '%s\n' "$now"
+      return 0
+    fi
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    if now="$(python3 -c 'import time; print(f"{time.time():.3f}")' 2>/dev/null)"; then
+      printf '%s\n' "$now"
+      return 0
+    fi
+  fi
+  date +%s
+}
+
+if fieldwork_timing_enabled && [ -z "${FIELDWORK_CLI_ENTRY_TIME:-}" ]; then
+  FIELDWORK_CLI_ENTRY_TIME="$(fieldwork_time_now)"
+  export FIELDWORK_CLI_ENTRY_TIME
+fi
+
+if [ "${FIELDWORK_STABLE_EXEC:-0}" != "1" ]; then
+  fieldwork_self="${BASH_SOURCE[0]}"
+  fieldwork_dir=""
+  fieldwork_target=""
+  while [ -L "$fieldwork_self" ]; do
+    fieldwork_dir="$(cd -P "$(dirname "$fieldwork_self")" && pwd)"
+    fieldwork_target="$(readlink "$fieldwork_self")"
+    case "$fieldwork_target" in
+      /*) fieldwork_self="$fieldwork_target" ;;
+      *) fieldwork_self="$fieldwork_dir/$fieldwork_target" ;;
+    esac
+  done
+  fieldwork_dir="$(cd -P "$(dirname "$fieldwork_self")" && pwd)"
+  fieldwork_self="$fieldwork_dir/$(basename "$fieldwork_self")"
+  fieldwork_root="$(cd -P "$fieldwork_dir/.." && pwd)"
+  if ! fieldwork_stable_file="$(mktemp "${TMPDIR:-/tmp}/fieldwork.XXXXXX")"; then
+    echo "fieldwork: unable to create stable exec file" >&2
+    exit 1
+  fi
+  if ! cat "$fieldwork_self" >"$fieldwork_stable_file"; then
+    rm -f "$fieldwork_stable_file"
+    echo "fieldwork: unable to prepare stable exec file" >&2
+    exit 1
+  fi
+  FIELDWORK_STABLE_EXEC=1 FIELDWORK_ROOT_OVERRIDE="$fieldwork_root" exec bash -c '
+    fieldwork_stable_file="$1"
+    shift
+    exec 3<"$fieldwork_stable_file"
+    rm -f "$fieldwork_stable_file"
+    # shellcheck source=/dev/fd/3
+    source /dev/fd/3 "$@"
+  ' "$fieldwork_self" "$fieldwork_stable_file" "$@"
+fi
+
+fieldwork_timing_start() {
+  fieldwork_timing_enabled || return 0
+  fieldwork_time_now
+}
+
+fieldwork_timing_since() {
+  local label="$1"
+  local start="${2:-}"
+  local end="${3:-}"
+  local elapsed
+  fieldwork_timing_enabled || return 0
+  [ -n "$start" ] || return 0
+  [ -n "$end" ] || end="$(fieldwork_time_now)"
+  elapsed="$(awk -v start="$start" -v end="$end" 'BEGIN { printf "%.3f", end - start }')"
+  printf '[fieldwork timing] %s %ss\n' "$label" "$elapsed" >&2
+}
+
+fieldwork_setup_timing_from_snapshot() {
+  local key label value
+  fieldwork_timing_enabled || return 0
+  for key in \
+    timing_remote_fingerprint \
+    timing_remote_gh_auth_status \
+    timing_remote_broker_checks \
+    timing_remote_script_total; do
+    value="$(fieldwork_setup_snapshot_value_raw "$key" 2>/dev/null || true)"
+    [ -n "$value" ] || continue
+    case "$key" in
+      timing_remote_fingerprint) label="remote fingerprint" ;;
+      timing_remote_gh_auth_status) label="remote gh auth status" ;;
+      timing_remote_broker_checks) label="remote broker checks" ;;
+      timing_remote_script_total) label="remote script total" ;;
+      *) label="$key" ;;
+    esac
+    printf '[fieldwork timing] %s %ss\n' "$label" "$value" >&2
+  done
+}
+
+resolve_fieldwork_root() {
+  if [ -n "${FIELDWORK_ROOT_OVERRIDE:-}" ]; then
+    printf '%s\n' "$FIELDWORK_ROOT_OVERRIDE"
+    return 0
+  fi
+  local src="${BASH_SOURCE[0]}"
+  local dir target
+  while [ -L "$src" ]; do
+    dir="$(cd -P "$(dirname "$src")" && pwd)"
+    target="$(readlink "$src")"
+    case "$target" in
+      /*) src="$target" ;;
+      *) src="$dir/$target" ;;
+    esac
+  done
+  cd -P "$(dirname "$src")/.." && pwd
+}
+
+FIELDWORK_ROOT="$(resolve_fieldwork_root)"
+unset FIELDWORK_STABLE_EXEC FIELDWORK_ROOT_OVERRIDE
+
+# shellcheck source=lib/scripts/fieldwork-status
+source "$FIELDWORK_ROOT/lib/scripts/fieldwork-status"
+# shellcheck source=lib/cli/config.sh
+source "$FIELDWORK_ROOT/lib/cli/config.sh"
+# Sourced before setup/onboard/provision so they inherit the message helpers.
+# shellcheck source=lib/cli/messaging.sh
+source "$FIELDWORK_ROOT/lib/cli/messaging.sh"
+# shellcheck source=lib/cli/health.sh
+source "$FIELDWORK_ROOT/lib/cli/health.sh"
+# shellcheck source=lib/cli/ssh-config.sh
+source "$FIELDWORK_ROOT/lib/cli/ssh-config.sh"
+# shellcheck source=lib/cli/setup.sh
+source "$FIELDWORK_ROOT/lib/cli/setup.sh"
+# shellcheck source=lib/cli/onboard.sh
+source "$FIELDWORK_ROOT/lib/cli/onboard.sh"
+# shellcheck source=lib/cli/provision.sh
+source "$FIELDWORK_ROOT/lib/cli/provision.sh"
+# shellcheck source=lib/cli/verify-security.sh
+source "$FIELDWORK_ROOT/lib/cli/verify-security.sh"
+# shellcheck source=lib/cli/uninstall.sh
+source "$FIELDWORK_ROOT/lib/cli/uninstall.sh"
+# shellcheck source=lib/cli/developer-preview.sh
+source "$FIELDWORK_ROOT/lib/cli/developer-preview.sh"
+
+# Resolve the control-plane config object (host, user, projects root, default
+# branch, notify provider, forge, identity). Owns the defaults; see lib/cli/config.sh.
+fieldwork_load_config
+FIELDWORK_FINGERPRINT_FILES="bin/fieldwork install.sh AGENTS.md lib/cli/config.sh lib/cli/messaging.sh lib/cli/health.sh lib/cli/ssh-config.sh lib/cli/setup.sh lib/cli/onboard.sh lib/cli/provision.sh lib/cli/verify-security.sh lib/cli/uninstall.sh lib/cli/developer-preview.sh lib/systemd/bootstrap-vps.sh lib/apparmor/fieldwork-bwrap lib/broker/install.sh lib/broker/standalone-install.sh lib/broker/fieldwork-pr-broker.service lib/broker/fieldwork-pr-broker.socket lib/broker/fieldwork-pr-approve.socket lib/broker/server.py schema/pr-request.schema.json schema/pr-prepare-request.schema.json lib/scripts/fieldwork-status lib/scripts/fieldwork-pr-submit lib/scripts/fieldwork-clone lib/scripts/fieldwork-init lib/scripts/fieldwork-launch lib/scripts/fieldwork-agent-session lib/scripts/fieldwork-setup-probe lib/scripts/fieldwork-session-probe lib/scripts/fieldwork-codex-sandbox lib/scripts/fieldwork-bot lib/scripts/fieldwork-pr-prepare lib/scripts/fieldwork-pr-prepare-runner lib/scripts/fieldwork-pr-prepare-impl lib/agents/claude-remote-control lib/templates/repo/AGENTS.md lib/templates/repo/CLAUDE.md lib/templates/repo/.gitignore lib/templates/repo/.fieldwork/expected-origin lib/systemd/fieldwork-agent@.service lib/systemd/fieldwork-bot.service lib/systemd/fieldwork-pr-prepare-runner.socket lib/systemd/fieldwork-pr-prepare-runner@.service lib/systemd/fieldwork-verify-runner.socket lib/systemd/fieldwork-verify-runner@.service examples/eval/docker-compose.yml examples/eval/Dockerfile examples/eval/eval-smoke.sh examples/eval/fake-gh examples/eval/fake-gitleaks examples/eval/gh examples/eval/gitleaks examples/eval/README.md"
+FIELDWORK_UI_COLOR=0
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  FIELDWORK_UI_COLOR=1
+fi
+FIELDWORK_CURSOR_HIDDEN=0
+FIELDWORK_ACTIVE_PID=""
+
+hide_cursor() {
+  [ -t 1 ] || return 0
+  printf '\033[?25l'
+  FIELDWORK_CURSOR_HIDDEN=1
+}
+
+show_cursor() {
+  [ "$FIELDWORK_CURSOR_HIDDEN" = "1" ] || return 0
+  printf '\033[?25h'
+  FIELDWORK_CURSOR_HIDDEN=0
+}
+
+cleanup_active_child() {
+  local pid="${FIELDWORK_ACTIVE_PID:-}"
+  [ -n "$pid" ] || return 0
+  if kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+  fi
+  FIELDWORK_ACTIVE_PID=""
+}
+
+cleanup_terminal() {
+  cleanup_active_child
+  fieldwork_status_cleanup
+  show_cursor
+}
+
+trap 'cleanup_terminal' EXIT
+trap 'cleanup_active_child; show_cursor; trap - INT; kill -INT "$$"' INT
+trap 'cleanup_active_child; show_cursor; trap - TERM; kill -TERM "$$"' TERM
+
+normalize_agents_value() {
+  local raw="$1"
+  raw="$(printf '%s' "$raw" | tr -d '[:space:]')"
+  case "$raw" in
+    claude|codex) printf '%s\n' "$raw" ;;
+    both|claude,codex|codex,claude) printf 'claude,codex\n' ;;
+    "") printf 'claude\n' ;;
+    *) printf 'claude\n' ;;
+  esac
+}
+
+local_agents_value() {
+  if [ -f "$HOME/.fieldwork/agents" ]; then
+    normalize_agents_value "$(cat "$HOME/.fieldwork/agents" 2>/dev/null || true)"
+  else
+    printf 'claude\n'
+  fi
+}
+
+remote_agents_value() {
+  local value
+  value="$(ssh "$FIELDWORK_SSH_HOST" "cat ~/.fieldwork/agents 2>/dev/null || true" 2>/dev/null || true)"
+  normalize_agents_value "$value"
+}
+
+agents_include() {
+  local agents="$1"
+  local wanted="$2"
+  case ",$agents," in
+    *",$wanted,"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+codex_min_version() {
+  printf '%s\n' "${FIELDWORK_CODEX_MIN_VERSION:-0.137.0}"
+}
+
+codex_default_npm_package() {
+  printf '%s\n' "${FIELDWORK_CODEX_NPM_PACKAGE:-@openai/codex@$(codex_min_version)}"
+}
+
+codex_upgrade_command() {
+  local remote_cmd
+  remote_cmd="npm install -g --prefix \"\$HOME/.local\" $(codex_default_npm_package)"
+  printf 'ssh -t %s %s\n' "$FIELDWORK_SSH_HOST" "$(shell_quote "$remote_cmd")"
+}
+
+codex_version_from_text() {
+  printf '%s\n' "$1" | sed -n 's/.*\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | head -n 1
+}
+
+codex_version_ge() {
+  local have="$1"
+  local want="$2"
+  awk -v have="$have" -v want="$want" '
+    BEGIN {
+      split(have, h, ".")
+      split(want, w, ".")
+      for (i = 1; i <= 3; i++) {
+        hv = h[i] + 0
+        wv = w[i] + 0
+        if (hv > wv) exit 0
+        if (hv < wv) exit 1
+      }
+      exit 0
+    }
+  '
+}
+
+codex_local_app_state_snapshot() {
+  local slug="${1:-}"
+  local state_file="$HOME/.codex/.codex-global-state.json"
+  local folder=""
+  [ -z "$slug" ] || folder="$FIELDWORK_PROJECTS_DIR/$slug"
+
+  if [ ! -f "$state_file" ]; then
+    printf 'STATE=missing\n'
+    return 0
+  fi
+  if ! jq -e . "$state_file" >/dev/null 2>&1; then
+    printf 'STATE=invalid\n'
+    return 0
+  fi
+
+  jq -r --arg host "$FIELDWORK_SSH_HOST" --arg folder "$folder" '
+    def bool($b): if $b then "yes" else "no" end;
+    def conns: (.["codex-managed-remote-connections"]? // []);
+    def host_id:
+      ([conns[] | select(
+        (.alias? == $host) or
+        (.displayName? == $host) or
+        ((.hostId? // "") | contains($host))
+      ) | (.hostId? // "")][0] // "");
+    def auto($id):
+      if $id == "" then false
+      else ((.["remote-connection-auto-connect-by-host-id"]? // {})[$id] == true)
+      end;
+    def allowed($id):
+      if $id == "" then false
+      else
+        (.["host-id-remote-control-allowed"]? // null) as $v |
+        if ($v | type) == "object" then ($v[$id] == true)
+        elif ($v | type) == "array" then any($v[]; . == $id)
+        else false
+        end
+      end;
+    def folder_present($path):
+      if $path == "" then false
+      else ([paths(scalars) as $p | getpath($p) | strings | select(. == $path or contains($path))] | length > 0)
+      end;
+    host_id as $id |
+    "STATE=ok",
+    "HOST_ID=\($id)",
+    "HOST_PRESENT=\(bool($id != ""))",
+    "HOST_SELECTED=\(bool((.["selected-remote-host-id"]? // "") == $id and $id != ""))",
+    "HOST_AUTO_CONNECT=\(bool(auto($id)))",
+    "HOST_REMOTE_ALLOWED=\(bool(allowed($id)))",
+    "FOLDER_PRESENT=\(bool(folder_present($folder)))"
+  ' "$state_file" 2>/dev/null || printf 'STATE=invalid\n'
+}
+
+codex_remote_login_snapshot() {
+  ssh "$FIELDWORK_SSH_HOST" 'export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
+out="$(codex login status 2>&1)"
+rc=$?
+if printf "%s\n" "$out" | grep -Eiq "^logged in([[:space:]]|$)"; then
+  printf "CODEX_LOGIN_STATE=logged_in\n"
+elif printf "%s\n" "$out" | grep -Eiq "not logged in|logged out|unauthenticated"; then
+  printf "CODEX_LOGIN_STATE=logged_out\n"
+elif [ "$rc" -eq 0 ]; then
+  printf "CODEX_LOGIN_STATE=logged_out\n"
+elif test -f "$HOME/.fieldwork/state/codex-login-confirmed"; then
+  printf "CODEX_LOGIN_STATE=marker_only\n"
+else
+  printf "CODEX_LOGIN_STATE=unknown\n"
+fi' 2>/dev/null || printf 'CODEX_LOGIN_STATE=unknown\n'
+}
+
+codex_remote_app_server_snapshot() {
+  ssh "$FIELDWORK_SSH_HOST" 'set +e
+ps_args="$(ps -u "$(id -un)" -o args= 2>/dev/null || true)"
+case "$ps_args" in
+  *"codex app-server"*) app_server=present ;;
+  *) app_server=missing ;;
+esac
+case "$ps_args" in
+  *"codex app-server proxy"*) proxy=present ;;
+  *) proxy=missing ;;
+esac
+sock="$HOME/.codex/app-server-control/desktop-ssh-websocket-v0.sock"
+if [ -S "$sock" ]; then socket=present; else socket=missing; fi
+log="$HOME/.codex/app-server-control/app-server.log"
+if [ -f "$log" ] && grep -Eiq "control socket is already in use|address already in use" "$log"; then
+  stale=present
+else
+  stale=missing
+fi
+if [ -f "$log" ] && grep -Eiq "session has ended|app_session_terminated" "$log"; then
+  auth_ended=present
+else
+  auth_ended=missing
+fi
+printf "APP_SERVER_PROCESS=%s\n" "$app_server"
+printf "APP_SERVER_PROXY=%s\n" "$proxy"
+printf "APP_SERVER_SOCKET=%s\n" "$socket"
+printf "APP_SERVER_STALE_SOCKET_LOG=%s\n" "$stale"
+printf "APP_SERVER_AUTH_ENDED_LOG=%s\n" "$auth_ended"
+' 2>/dev/null || true
+}
+
+codex_connection_hint() {
+  local slug="$1"
+  cat <<EOF
+Codex
+  - SSH host: $FIELDWORK_SSH_HOST
+  - User: $FIELDWORK_REMOTE_USER
+  - Repo: $FIELDWORK_PROJECTS_DIR/$slug
+
+  One-time setup:
+    Connections -> SSH -> add or open this connection.
+    In Details, enable "Available from signed-in devices" for mobile access.
+
+  Then:
+    Open $FIELDWORK_PROJECTS_DIR/$slug on mobile or desktop and start building.
+    Before PR work, confirm the mobile header shows $slug on the VPS SSH connection
+    ($FIELDWORK_SSH_HOST or the server display name), not your local Mac/Windows host.
+
+Mobile note
+  - Mobile uses signed-in Desktop connections; do not skip the Details setting.
+  - If the VPS host or repo path is missing, open it once in Codex Desktop.
+
+Codex does not create a named session like Claude's vps-$slug.
+EOF
+}
+
+usage() {
+  cat <<'EOF'
+Fieldwork — self-hosted mobile-to-PR workflows for coding agents
+
+Usage
+  fieldwork <command> [options]
+  fieldwork <command> --help     details for a specific command
+
+Getting started
+  setup               install and configure Fieldwork locally
+  provision <prov>    create a VPS (Hetzner) and wire up SSH
+  onboard <repo>      prepare a GitHub repo for Fieldwork
+  start <repo>        begin a phone-driven session on a repo
+
+Day to day
+  refresh <repo>      update the VPS checkout after merge
+  status [repo]       show session and PR status
+  log [repo]          tail the audit log
+  report [repo]       generate a redacted support bundle
+
+Health and diagnostics
+  health              one-glance OK/not-OK across local, VPS, broker, agents
+  doctor              check local and remote configuration
+  verify-security     run the security boundary checks
+  bot-status          show approval-bot connectivity
+  smoke <repo>        end-to-end test against a real repo
+
+Setup helpers
+  setup-notify        configure notification transport (ntfy / Telegram)
+  sync-vps            push local config to the VPS
+  bootstrap-vps       provision a fresh VPS
+  install-broker      install or update the broker on the VPS
+  adapter list        show available agent adapters
+  adapter doctor      diagnose the active adapter
+
+Evaluation harness
+  eval up|smoke|logs|down|clean    manage the eval environment
+
+Removal
+  uninstall           remove Fieldwork (use --dry-run first)
+
+Configuration:
+  Defaults can be overridden with ./fieldwork.toml, ~/.config/fieldwork/config.toml,
+  or FIELDWORK_* environment variables.
+  Run `fieldwork doctor --explain` to see current values.
+EOF
+}
+
+valid_slug() {
+  [[ "${1:-}" =~ ^[a-z0-9][a-z0-9-]{0,30}$ ]]
+}
+
+valid_owner_repo() {
+  local owner_repo="${1:-}"
+  case "$owner_repo" in
+    */*) ;;
+    *) return 1 ;;
+  esac
+  local owner="${owner_repo%%/*}"
+  local repo="${owner_repo#*/}"
+  [[ "$owner" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,37}[a-zA-Z0-9])?$ ]] || return 1
+  [[ "$owner" != *--* ]] || return 1
+  [[ "$repo" =~ ^[a-zA-Z0-9._-]{1,100}$ ]] || return 1
+}
+
+valid_ssh_host() {
+  local host="${1:-}"
+  [ -n "$host" ] || return 1
+  [[ "$host" != -* ]] || return 1
+  [[ "$host" =~ ^[A-Za-z0-9_.:@-]+$ ]]
+}
+
+valid_remote_user() {
+  [[ "${1:-}" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]
+}
+
+valid_projects_dir() {
+  local path="${1:-}"
+  [ -n "$path" ] || return 1
+  case "$path" in
+    /*) ;;
+    *) return 1 ;;
+  esac
+  [[ "$path" != *$'\n'* ]] || return 1
+  [[ "$path" != *$'\r'* ]] || return 1
+  [[ "$path" =~ ^/[A-Za-z0-9._/-]+$ ]] || return 1
+}
+
+shell_quote() {
+  printf "'"
+  printf '%s' "${1:-}" | sed "s/'/'\\\\''/g"
+  printf "'"
+}
+
+shell_double_quote() {
+  printf '"'
+  printf '%s' "${1:-}" | sed 's/["\\]/\\&/g; s/\$/\\$/g; s/`/\\`/g'
+  printf '"'
+}
+
+display_local_path() {
+  local path="$1"
+  case "$path" in
+    "$HOME") printf '~\n' ;;
+    "$HOME"/*) printf '~/%s\n' "${path#"$HOME"/}" ;;
+    *) printf '%s\n' "$path" ;;
+  esac
+}
+
+display_shell_local_path() {
+  local path="$1"
+  case "$path" in
+    "$HOME") printf '"$HOME"' ;;
+    "$HOME"/*)
+      printf '"$HOME/%s"' "$(printf '%s' "${path#"$HOME"/}" | sed 's/["\\]/\\&/g; s/\$/\\$/g; s/`/\\`/g')"
+      ;;
+    *) shell_quote "$path" ;;
+  esac
+}
+
+FIELDWORK_SSH_MUX_READY=0
+FIELDWORK_SSH_MUX_DISABLED_FOR_PROCESS=0
+FIELDWORK_SSH_MUX_DISABLE_REASON=""
+
+fieldwork_ssh_control_dir() {
+  printf '%s/.cache/fieldwork/ssh-control\n' "$HOME"
+}
+
+fieldwork_ssh_control_path() {
+  printf '%s/%%C\n' "$(fieldwork_ssh_control_dir)"
+}
+
+fieldwork_ssh_control_persist() {
+  printf '%s\n' "${FIELDWORK_SSH_CONTROL_PERSIST:-600}"
+}
+
+fieldwork_ssh_mux_configured() {
+  [ "${FIELDWORK_SSH_MULTIPLEX:-1}" != "0" ] || return 1
+  [ "$FIELDWORK_SSH_MUX_DISABLED_FOR_PROCESS" != "1" ] || return 1
+}
+
+fieldwork_ssh_mux_debug_target() {
+  printf 'control dir %s\n' "$(display_local_path "$(fieldwork_ssh_control_dir)")"
+}
+
+fieldwork_rsync_ssh_command() {
+  if fieldwork_ssh_mux_configured && [ "$FIELDWORK_SSH_MUX_READY" = "1" ]; then
+    printf 'ssh -o ControlMaster=auto -o ControlPersist=%s -o ControlPath=%s\n' \
+      "$(fieldwork_ssh_control_persist)" \
+      "$(fieldwork_ssh_control_path)"
+  else
+    printf 'ssh\n'
+  fi
+}
+
+fieldwork_ssh_prepare_control_dir() {
+  local dir
+  dir="$(fieldwork_ssh_control_dir)"
+  if ! mkdir -p "$dir" 2>/dev/null || ! chmod 700 "$dir" 2>/dev/null; then
+    FIELDWORK_SSH_MUX_READY=0
+    FIELDWORK_SSH_MUX_DISABLED_FOR_PROCESS=1
+    FIELDWORK_SSH_MUX_DISABLE_REASON="control directory unavailable"
+    return 1
+  fi
+}
+
+fieldwork_ssh_try_mux_true() {
+  local err_file="${1:-/dev/null}"
+  FIELDWORK_SSH_MUX_READY=0
+  FIELDWORK_SSH_MUX_DISABLE_REASON=""
+
+  if [ "${FIELDWORK_SSH_MULTIPLEX:-1}" = "0" ]; then
+    FIELDWORK_SSH_MUX_DISABLED_FOR_PROCESS=1
+    FIELDWORK_SSH_MUX_DISABLE_REASON="disabled by FIELDWORK_SSH_MULTIPLEX=0"
+    return 1
+  fi
+  [ "$FIELDWORK_SSH_MUX_DISABLED_FOR_PROCESS" != "1" ] || return 1
+  FIELDWORK_SSH_MUX_DISABLED_FOR_PROCESS=0
+
+  fieldwork_ssh_prepare_control_dir || return 1
+  if command ssh -o BatchMode=yes -o ConnectTimeout=5 -o ControlMaster=auto -o ControlPersist="$(fieldwork_ssh_control_persist)" -o ControlPath="$(fieldwork_ssh_control_path)" "$FIELDWORK_SSH_HOST" true >/dev/null 2>"$err_file"; then
+    FIELDWORK_SSH_MUX_READY=1
+    fieldwork_ssh_debug "preflight ok: $(fieldwork_ssh_mux_debug_target)"
+    return 0
+  fi
+
+  FIELDWORK_SSH_MUX_READY=0
+  FIELDWORK_SSH_MUX_DISABLED_FOR_PROCESS=1
+  FIELDWORK_SSH_MUX_DISABLE_REASON="control socket preflight failed"
+  return 1
+}
+
+fieldwork_ssh_debug() {
+  [ "${FIELDWORK_SSH_DEBUG:-0}" = "1" ] || return 0
+  printf '[fieldwork ssh] %s\n' "$*" >&2
+}
+
+fieldwork_ssh_arg_forces_direct() {
+  local arg
+  for arg in "$@"; do
+    case "$arg" in
+      -G|-t|-tt|root@*) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+fieldwork_ssh_should_mux() {
+  fieldwork_ssh_mux_configured || return 1
+  [ "$FIELDWORK_SSH_MUX_READY" = "1" ] || return 1
+  fieldwork_ssh_arg_forces_direct "$@" && return 1
+  return 0
+}
+
+ssh() {
+  if fieldwork_ssh_should_mux "$@"; then
+    fieldwork_ssh_debug "mux on: $(fieldwork_ssh_mux_debug_target)"
+    command ssh -o ControlMaster=auto -o ControlPersist="$(fieldwork_ssh_control_persist)" -o ControlPath="$(fieldwork_ssh_control_path)" "$@"
+  else
+    fieldwork_ssh_debug "mux off"
+    command ssh "$@"
+  fi
+}
+
+scp() {
+  if fieldwork_ssh_should_mux "$@"; then
+    fieldwork_ssh_debug "scp mux on: $(fieldwork_ssh_mux_debug_target)"
+    command scp -o ControlMaster=auto -o ControlPersist="$(fieldwork_ssh_control_persist)" -o ControlPath="$(fieldwork_ssh_control_path)" "$@"
+  else
+    command scp "$@"
+  fi
+}
+
+fieldwork_ssh_prepare_mux() {
+  if [ "${FIELDWORK_SSH_MULTIPLEX:-1}" = "0" ]; then
+    FIELDWORK_SSH_MUX_READY=0
+    FIELDWORK_SSH_MUX_DISABLED_FOR_PROCESS=1
+    FIELDWORK_SSH_MUX_DISABLE_REASON="disabled by FIELDWORK_SSH_MULTIPLEX=0"
+    return 1
+  fi
+  if [ "$FIELDWORK_SSH_MUX_READY" = "1" ]; then
+    return 0
+  fi
+  [ "$FIELDWORK_SSH_MUX_DISABLED_FOR_PROCESS" != "1" ] || return 1
+  fieldwork_ssh_try_mux_true /dev/null
+}
+
+fieldwork_ssh_mux_active() {
+  fieldwork_ssh_mux_configured || return 1
+  command ssh -o ControlMaster=no -o ControlPath="$(fieldwork_ssh_control_path)" -O check "$FIELDWORK_SSH_HOST" >/dev/null 2>&1
+}
+
+fieldwork_ssh_mux_timing_diagnostics() {
+  local timing_start active_status noop_status
+  fieldwork_timing_enabled || return 0
+  fieldwork_ssh_mux_configured || return 0
+  [ "$FIELDWORK_SSH_MUX_READY" = "1" ] || return 0
+
+  timing_start="$(fieldwork_timing_start)"
+  set +e
+  fieldwork_ssh_mux_active
+  active_status=$?
+  set -e
+  fieldwork_timing_since "ssh mux active check" "$timing_start"
+  if [ "$active_status" -eq 0 ]; then
+    fieldwork_ssh_debug "mux active: yes; $(fieldwork_ssh_mux_debug_target)"
+  else
+    fieldwork_ssh_debug "mux active: no; $(fieldwork_ssh_mux_debug_target)"
+  fi
+
+  [ "${FIELDWORK_SSH_MUX_DIAGNOSTICS:-0}" = "1" ] || return 0
+  timing_start="$(fieldwork_timing_start)"
+  set +e
+  ssh -o BatchMode=yes -o ConnectTimeout=5 "$FIELDWORK_SSH_HOST" true >/dev/null 2>&1
+  noop_status=$?
+  set -e
+  fieldwork_timing_since "ssh mux warm noop" "$timing_start"
+  if [ "$noop_status" -ne 0 ]; then
+    fieldwork_ssh_debug "mux warm noop failed; $(fieldwork_ssh_mux_debug_target)"
+  fi
+  return 0
+}
+
+fieldwork_ssh_mux_status() {
+  if [ "${FIELDWORK_SSH_MULTIPLEX:-1}" = "0" ]; then
+    printf 'disabled by FIELDWORK_SSH_MULTIPLEX=0'
+  elif [ "$FIELDWORK_SSH_MUX_DISABLED_FOR_PROCESS" = "1" ]; then
+    printf 'disabled for this run'
+    [ -n "$FIELDWORK_SSH_MUX_DISABLE_REASON" ] && printf ' (%s)' "$FIELDWORK_SSH_MUX_DISABLE_REASON"
+  else
+    printf 'enabled'
+  fi
+}
+
+vps_sudo_prompt() {
+  printf '[sudo] VPS Linux password for %s: ' "$FIELDWORK_REMOTE_USER"
+}
+
+remote_sudo_passwordless() {
+  if [ -z "${FIELDWORK_REMOTE_SUDO_PASSWORDLESS:-}" ]; then
+    if ssh "$FIELDWORK_SSH_HOST" "sudo -n true" >/dev/null 2>&1; then
+      FIELDWORK_REMOTE_SUDO_PASSWORDLESS=1
+    else
+      FIELDWORK_REMOTE_SUDO_PASSWORDLESS=0
+    fi
+  fi
+  [ "$FIELDWORK_REMOTE_SUDO_PASSWORDLESS" = "1" ]
+}
+
+remote_sudo_prefix() {
+  if remote_sudo_passwordless; then
+    printf 'sudo'
+  else
+    printf 'sudo -p %s' "$(shell_quote "$(vps_sudo_prompt)")"
+  fi
+}
+
+remote_sudo_command() {
+  local command="$1"
+  printf '%s %s' "$(remote_sudo_prefix)" "$command"
+}
+
+remote_sudo_ssh_command() {
+  local command="$1"
+  printf 'ssh -t %s %s' "$FIELDWORK_SSH_HOST" "$(shell_double_quote "$(remote_sudo_command "$command")")"
+}
+
+validate_runtime_config() {
+  valid_ssh_host "$FIELDWORK_SSH_HOST" || {
+    echo "invalid ssh_host: $FIELDWORK_SSH_HOST" >&2
+    return 2
+  }
+  valid_remote_user "$FIELDWORK_REMOTE_USER" || {
+    echo "invalid remote_user: $FIELDWORK_REMOTE_USER" >&2
+    return 2
+  }
+  valid_projects_dir "$FIELDWORK_PROJECTS_DIR" || {
+    echo "invalid projects_dir: $FIELDWORK_PROJECTS_DIR" >&2
+    return 2
+  }
+}
+
+path_contains() {
+  case ":$PATH:" in
+    *":$1:"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+confirm() {
+  local prompt="$1"
+  local yes="${2:-0}"
+  if [ "$yes" = "1" ]; then
+    echo "[fieldwork] $prompt yes"
+    return 0
+  fi
+  printf '%s [y/N] ' "$prompt"
+  local answer=""
+  if ! IFS= read -r answer; then
+    echo
+    return 1
+  fi
+  echo
+  case "$answer" in
+    y|Y|yes|YES) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+supports_utf8() {
+  case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
+    *UTF-8*|*utf8*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+use_color() {
+  [ "$FIELDWORK_UI_COLOR" = "1" ]
+}
+
+green() {
+  if use_color; then
+    printf '\033[32m%s\033[0m' "$1"
+  else
+    printf '%s' "$1"
+  fi
+}
+
+yellow() {
+  if use_color; then
+    printf '\033[33m%s\033[0m' "$1"
+  else
+    printf '%s' "$1"
+  fi
+}
+
+blue() {
+  if use_color; then
+    printf '\033[34m%s\033[0m' "$1"
+  else
+    printf '%s' "$1"
+  fi
+}
+
+red() {
+  if use_color; then
+    printf '\033[31m%s\033[0m' "$1"
+  else
+    printf '%s' "$1"
+  fi
+}
+
+cyan() {
+  if use_color; then
+    printf '\033[36m%s\033[0m' "$1"
+  else
+    printf '%s' "$1"
+  fi
+}
+
+bold() {
+  if use_color; then
+    printf '\033[1m%s\033[0m' "$1"
+  else
+    printf '%s' "$1"
+  fi
+}
+
+status_ok_line() {
+  local label="$1"
+  if [ -t 1 ] && supports_utf8; then
+    printf '  %s  %s\n' "$(green "✓ ready")" "$label"
+  else
+    printf '  [ready] %s\n' "$label"
+  fi
+}
+
+setup_status_line() {
+  local status="$1"
+  local label="$2"
+  case "$status" in
+    ok)
+      status_ok_line "$label"
+      ;;
+    needs)
+      if [ -t 1 ] && supports_utf8; then
+        printf '  %s  %s\n' "$(yellow "! needs action")" "$label"
+      else
+        printf '  [needs-action] %s\n' "$label"
+      fi
+      ;;
+    manual)
+      if [ -t 1 ] && supports_utf8; then
+        printf '  %s  %s\n' "$(blue "→ manual step")" "$label"
+      else
+        printf '  [manual] %s\n' "$label"
+      fi
+      ;;
+    blocked)
+      if [ -t 1 ] && supports_utf8; then
+        printf '  %s  %s\n' "$(red "× blocked")" "$label"
+      else
+        printf '  [blocked] %s\n' "$label"
+      fi
+      ;;
+    info)
+      if [ -t 1 ] && supports_utf8; then
+        printf '  %s %s\n' "$(cyan "i")" "$label"
+      else
+        printf '  [info] %s\n' "$label"
+      fi
+      ;;
+    *)
+      printf '  %-7s %s\n' "$status" "$label"
+      ;;
+  esac
+}
+
+status_info_line() {
+  setup_status_line info "$1"
+}
+
+status_running_mark() {
+  local frame="${1:-0}"
+  if [ -t 1 ]; then
+    if supports_utf8; then
+      if [ $((frame % 2)) -eq 0 ]; then
+        printf '•'
+      else
+        printf '••'
+      fi
+    else
+      if [ $((frame % 2)) -eq 0 ]; then
+        printf '.'
+      else
+        printf '..'
+      fi
+    fi
+  else
+    printf '...'
+  fi
+}
+
+status_pending_line() {
+  local label="$1"
+  local mark
+  mark="$(status_running_mark 0)"
+  if [ -t 1 ] && supports_utf8; then
+    printf '  %-2s %s\n' "$mark" "$label"
+  else
+    printf '  [info] %s\n' "$label"
+  fi
+}
+
+status_pending_live() {
+  local label="$1"
+  local frame="${2:-0}"
+  local mark
+  mark="$(status_running_mark "$frame")"
+  printf '\r\033[K'
+  if [ -t 1 ] && supports_utf8; then
+    printf '  %-2s %s' "$mark" "$label"
+  else
+    printf '  [info] %s' "$label"
+  fi
+}
+
+status_heartbeat_line() {
+  local label="$1"
+  local elapsed="$2"
+  if [ -t 1 ] && supports_utf8; then
+    printf '  %s %s still running... %ss\n' "•" "$label" "$elapsed"
+  else
+    printf '  [info] %s still running... %ss\n' "$label" "$elapsed"
+  fi
+}
+
+status_heartbeat_live() {
+  local label="$1"
+  local elapsed="$2"
+  local frame="${3:-0}"
+  local mark
+  mark="$(status_running_mark "$frame")"
+  printf '\r\033[K'
+  if [ -t 1 ] && supports_utf8; then
+    printf '  %-2s %s still running... %ss' "$mark" "$label" "$elapsed"
+  else
+    printf '  [info] %s still running... %ss' "$label" "$elapsed"
+  fi
+}
+
+clear_live_line() {
+  printf '\r\033[K'
+}
+
+status_failed_line() {
+  local label="$1"
+  if [ -t 1 ] && supports_utf8; then
+    printf '  %s  %s\n' "$(red "× blocked")" "$label"
+  else
+    printf '  [blocked] %s\n' "$label"
+  fi
+}
+
+progress_run() {
+  local pending_label="$1"
+  local done_label="$2"
+  shift 2
+  local log_file err_file status
+  log_file="$(mktemp "${TMPDIR:-/tmp}/fieldwork-progress.XXXXXX")"
+  err_file="$(mktemp "${TMPDIR:-/tmp}/fieldwork-progress-err.XXXXXX")"
+
+  fieldwork_status_start "$pending_label"
+  set +e
+  "$@" >"$log_file" 2>"$err_file"
+  status=$?
+  set -e
+  if [ -s "$err_file" ]; then
+    sed -n '/^\[fieldwork timing\]/p' "$err_file" >&2
+    cat "$err_file" >>"$log_file"
+  fi
+
+  if [ "$status" -eq 0 ]; then
+    fieldwork_status_succeed "$done_label"
+    rm -f "$log_file" "$err_file"
+    return 0
+  fi
+
+  fieldwork_status_fail "$pending_label"
+  if [ -s "$log_file" ]; then
+    echo "  Last output:"
+    tail -20 "$log_file" | sed 's/^/    /'
+  fi
+  rm -f "$log_file" "$err_file"
+  return "$status"
+}
+
+progress_wait() {
+  local label="$1"
+  shift
+  local log_file err_file status
+  log_file="$(mktemp "${TMPDIR:-/tmp}/fieldwork-progress.XXXXXX")"
+  err_file="$(mktemp "${TMPDIR:-/tmp}/fieldwork-progress-err.XXXXXX")"
+
+  fieldwork_status_start "$label"
+  set +e
+  "$@" >"$log_file" 2>"$err_file"
+  status=$?
+  set -e
+  if [ -s "$err_file" ]; then
+    sed -n '/^\[fieldwork timing\]/p' "$err_file" >&2
+    cat "$err_file" >>"$log_file"
+  fi
+
+  if [ "$status" -eq 0 ]; then
+    fieldwork_status_succeed ""
+  else
+    fieldwork_status_fail ""
+  fi
+  if [ "$status" -ne 0 ] && [ -s "$log_file" ]; then
+    tail -5 "$log_file" | sed 's/^/    /' >&2
+  fi
+  rm -f "$log_file" "$err_file"
+  return "$status"
+}
+
+phase_section() {
+  echo
+  if use_color; then
+    printf '%s\n' "$(bold "$(cyan "$1")")"
+  else
+    echo "$1"
+  fi
+}
+
+info_heading() {
+  echo
+  if use_color; then
+    printf '%s\n' "$(bold "$1")"
+  else
+    printf '%s\n' "$1"
+  fi
+  echo
+}
+
+label_line() {
+  local label="$1"
+  local indent="${2:-}"
+  if use_color; then
+    printf '%s%s\n' "$indent" "$(bold "$label:")"
+  else
+    printf '%s%s:\n' "$indent" "$label"
+  fi
+}
+
+label_value() {
+  local indent="$1"
+  local label="$2"
+  local value="$3"
+  if use_color; then
+    printf '%s%s %s\n' "$indent" "$(bold "$label:")" "$value"
+  else
+    printf '%s%s: %s\n' "$indent" "$label" "$value"
+  fi
+}
+
+info_row() {
+  label_value "  " "$1" "$2"
+}
+
+info_note() {
+  label_value "  " "Note" "$1"
+}
+
+info_list_heading() {
+  local label="$1"
+  if use_color; then
+    printf '%s\n' "$(bold "$label")"
+  else
+    printf '%s\n' "$label"
+  fi
+}
+
+info_bullet() {
+  local value="$1"
+  printf '    - %s\n' "$value"
+}
+
+fieldwork_fmt_duration() {
+  local s="${1:-0}"
+  local d h m
+  case "$s" in ''|*[!0-9]*) echo "unknown"; return ;; esac
+  [ "$s" -gt 0 ] || { echo "0s"; return; }
+  d=$((s / 86400)); s=$((s % 86400))
+  h=$((s / 3600)); s=$((s % 3600))
+  m=$((s / 60)); s=$((s % 60))
+  if [ "$d" -gt 0 ]; then
+    [ "$h" -gt 0 ] && printf '%dd %dh\n' "$d" "$h" || printf '%dd\n' "$d"
+  elif [ "$h" -gt 0 ]; then
+    [ "$m" -gt 0 ] && printf '%dh %dm\n' "$h" "$m" || printf '%dh\n' "$h"
+  elif [ "$m" -gt 0 ]; then
+    [ "$s" -gt 0 ] && printf '%dm %ds\n' "$m" "$s" || printf '%dm\n' "$m"
+  else
+    printf '%ds\n' "$s"
+  fi
+}
+
+fieldwork_age_label() {
+  local s="${1:-}"
+  case "$s" in ''|*[!0-9]*) echo "unknown"; return ;; esac
+  printf '%s ago\n' "$(fieldwork_fmt_duration "$s")"
+}
+
+fieldwork_request_count_label() {
+  local count="${1:-unknown}"
+  case "$count" in
+    1) printf '1 request\n' ;;
+    ''|*[!0-9]*) printf 'unknown\n' ;;
+    *) printf '%s requests\n' "$count" ;;
+  esac
+}
+
+fieldwork_pending_label() {
+  local count="${1:-unknown}"
+  case "$count" in
+    1) printf '1 pending\n' ;;
+    ''|*[!0-9]*) printf 'pending unknown\n' ;;
+    *) printf '%s pending\n' "$count" ;;
+  esac
+}
+
+bot_polling_healthy() {
+  local service_state="${1:-}"
+  local last_poll_age="${2:-}"
+  local last_poll_error="${3:-}"
+  [ "$service_state" = "active" ] || return 1
+  [ -z "$last_poll_error" ] || return 1
+  case "$last_poll_age" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$last_poll_age" -le "${FIELDWORK_BOT_POLL_STALE_SECONDS:-120}" ]
+}
+
+fieldwork_bot_snapshot() {
+  local remote_script
+  IFS= read -r -d '' remote_script <<'REMOTE_EOF' || true
+set -u
+
+emit() {
+  local key="$1"
+  local value="${2:-}"
+  value="${value//$'\n'/ }"
+  value="${value//$'\r'/ }"
+  printf '%s=%s\n' "$key" "$value"
+}
+
+service_state="$(systemctl is-active fieldwork-bot.service 2>/dev/null || true)"
+[ -n "$service_state" ] || service_state="unknown"
+emit SERVICE_STATE "$service_state"
+
+broker_socket="/run/fieldwork-pr-broker/fieldwork-pr.sock"
+approve_socket="/run/fieldwork-pr-broker/fieldwork-pr-approve.sock"
+pending_dir="/var/lib/fieldwork-pr-broker/pending"
+
+if [ -S "$broker_socket" ] && printf '{}' | curl -sS --max-time 3 --unix-socket "$broker_socket" -H 'Content-Type: application/json' --data-binary @- http://localhost/preflight 2>/dev/null | grep -Fq 'preflight request missing required field: repo'; then
+  emit BROKER_SUBMIT_STATUS ok
+  emit BROKER_SUBMIT_DETAIL reachable
+elif [ -S "$broker_socket" ]; then
+  emit BROKER_SUBMIT_STATUS bad
+  emit BROKER_SUBMIT_DETAIL "socket present, preflight failed"
+else
+  emit BROKER_SUBMIT_STATUS bad
+  emit BROKER_SUBMIT_DETAIL "socket missing"
+fi
+
+if [ ! -S "$approve_socket" ]; then
+  emit APPROVE_SOCKET_STATUS bad
+  emit APPROVE_SOCKET_DETAIL "socket missing"
+elif sudo -n -u fieldwork-bot true >/dev/null 2>&1; then
+  if sudo -n -u fieldwork-bot curl -sS --max-time 3 --unix-socket "$approve_socket" -H 'Content-Type: application/json' --data-binary '{}' http://localhost/approve 2>/dev/null | grep -Fq 'approve request missing required field'; then
+    emit APPROVE_SOCKET_STATUS ok
+    emit APPROVE_SOCKET_DETAIL reachable
+  else
+    emit APPROVE_SOCKET_STATUS bad
+    emit APPROVE_SOCKET_DETAIL "connect probe failed"
+  fi
+else
+  emit APPROVE_SOCKET_STATUS unknown
+  emit APPROVE_SOCKET_DETAIL "socket present; sudo probe unavailable"
+fi
+
+if sudo -n true >/dev/null 2>&1; then
+  if sudo -n test -f /etc/fieldwork-bot/config.toml 2>/dev/null; then
+    if sudo -n grep -Eq '^[[:space:]]*bot_token[[:space:]]*=[[:space:]]*".+"' /etc/fieldwork-bot/config.toml 2>/dev/null; then
+      emit TOKEN_CONFIG_STATUS ok
+    else
+      emit TOKEN_CONFIG_STATUS bad
+    fi
+    if sudo -n grep -Eq '^[[:space:]]*allowed_chat_ids[[:space:]]*=[[:space:]]*\[[^]]*[0-9]' /etc/fieldwork-bot/config.toml 2>/dev/null; then
+      emit CHAT_BINDING_STATUS ok
+    else
+      emit CHAT_BINDING_STATUS bad
+    fi
+  else
+    emit TOKEN_CONFIG_STATUS bad
+    emit CHAT_BINDING_STATUS bad
+  fi
+else
+  emit TOKEN_CONFIG_STATUS unknown
+  emit CHAT_BINDING_STATUS unknown
+fi
+
+health_file=""
+for candidate in \
+  "/var/lib/fieldwork-bot/bot-health.json" \
+  "/var/lib/fieldwork-pr-broker/bot-health/health.json" \
+  "/var/lib/fieldwork-pr-broker/bot-health.json" \
+  "$HOME/.local/state/fieldwork/bot-health.json"; do
+  if [ -r "$candidate" ]; then
+    health_file="$candidate"
+    break
+  fi
+done
+
+if [ -n "$health_file" ]; then
+  FIELDWORK_HEALTH_PATH="$health_file" python3 - <<'PY'
+import json
+import os
+from datetime import datetime, timezone
+
+def emit(key, value=""):
+    value = "" if value is None else str(value)
+    value = value.replace("\n", " ").replace("\r", " ")
+    print(f"{key}={value}")
+
+def parse_ts(value):
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+def age(value):
+    ts = parse_ts(value)
+    if ts is None:
+        return ""
+    return max(0, int((datetime.now(timezone.utc) - ts).total_seconds()))
+
+path = os.environ["FIELDWORK_HEALTH_PATH"]
+try:
+    with open(path) as f:
+        payload = json.load(f)
+except Exception:
+    emit("HEALTH_PRESENT", "0")
+    raise SystemExit(0)
+
+emit("HEALTH_PRESENT", "1")
+emit("HEALTH_PATH", path)
+for key in (
+    "updated_at",
+    "last_poll_ok_at",
+    "last_poll_error_at",
+    "last_poll_error",
+    "last_callback_at",
+    "last_callback_result",
+):
+    emit("HEALTH_" + key.upper(), payload.get(key))
+emit("HEALTH_UPDATED_AGE_SECONDS", age(payload.get("updated_at")))
+emit("HEALTH_LAST_POLL_OK_AGE_SECONDS", age(payload.get("last_poll_ok_at")))
+emit("HEALTH_LAST_POLL_ERROR_AGE_SECONDS", age(payload.get("last_poll_error_at")))
+emit("HEALTH_PENDING_COUNT", payload.get("pending_count", ""))
+emit("HEALTH_OLDEST_PENDING_AGE_SECONDS", payload.get("oldest_pending_age_seconds", ""))
+emit("HEALTH_CONFIG_LOADED", "1" if payload.get("config_loaded") else "0")
+emit("HEALTH_ALLOWED_CHAT_COUNT", payload.get("allowed_chat_count", ""))
+emit("HEALTH_CHAT_BINDING_CONFIGURED", "1" if payload.get("chat_binding_configured") else "0")
+for item in payload.get("pending_requests", [])[:20]:
+    if not isinstance(item, dict):
+        continue
+    repo = str(item.get("repo") or "unknown").replace("\t", " ")
+    branch = str(item.get("branch") or "?").replace("\t", " ")
+    request_id = str(item.get("request_id") or "?").replace("\t", " ")
+    age_seconds = item.get("age_seconds")
+    print(f"HEALTH_PENDING_ITEM={repo}\t{branch}\t{age_seconds}\t{request_id}")
+PY
+else
+  emit HEALTH_PRESENT 0
+fi
+
+pending_py='
+import json
+import os
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+def parse_ts(value):
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+def age_for(record, path, now):
+    ts = parse_ts(record.get("queued_at") or record.get("created_at"))
+    if ts is None:
+        try:
+            ts = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+        except OSError:
+            ts = now
+    return max(0, int((now - ts).total_seconds()))
+
+pending_dir = Path(os.environ["FIELDWORK_PENDING_DIR"])
+now = datetime.now(timezone.utc)
+items = []
+try:
+    entries = sorted(pending_dir.glob("*.json"))
+except OSError:
+    raise SystemExit(1)
+for path in entries:
+    if path.name.endswith(".json.notified"):
+        continue
+    try:
+        with open(path) as f:
+            record = json.load(f)
+    except Exception:
+        continue
+    repo_path = record.get("repo_path") or ""
+    slug = os.path.basename(repo_path) if repo_path else os.path.basename(str(record.get("repo") or ""))
+    items.append({
+        "repo": str(record.get("repo") or "unknown").replace("\t", " "),
+        "branch": str(record.get("branch") or "?").replace("\t", " "),
+        "request_id": str(record.get("request_id") or path.stem).replace("\t", " "),
+        "age_seconds": age_for(record, path, now),
+        "slug": str(slug or "").replace("\t", " "),
+    })
+items.sort(key=lambda item: item["age_seconds"], reverse=True)
+print("DIR_PENDING_COUNT=%d" % len(items))
+print("DIR_OLDEST_PENDING_AGE_SECONDS=%s" % (items[0]["age_seconds"] if items else ""))
+for item in items[:20]:
+    print("DIR_PENDING_ITEM=%s\t%s\t%s\t%s\t%s" % (
+        item["repo"], item["branch"], item["age_seconds"], item["request_id"], item["slug"],
+    ))
+'
+
+if FIELDWORK_PENDING_DIR="$pending_dir" python3 -c "$pending_py" 2>/dev/null; then
+  emit DIR_PENDING_SOURCE direct
+elif sudo -n -u fieldwork-bot true >/dev/null 2>&1 && sudo -n -u fieldwork-bot env FIELDWORK_PENDING_DIR="$pending_dir" python3 -c "$pending_py" 2>/dev/null; then
+  emit DIR_PENDING_SOURCE fieldwork-bot
+else
+  emit DIR_PENDING_SOURCE unavailable
+fi
+REMOTE_EOF
+
+  # Bounded: ConnectTimeout caps connection setup, and an outer watchdog kills a
+  # connected-but-stuck command (a single sudo -n read can otherwise hang). Same
+  # pattern as fieldwork_setup_remote_probe. Shared by status/health/bot-status.
+  local snap_script snap_out snap_pid snap_watchdog snap_timeout
+  snap_timeout="${FIELDWORK_BOT_SNAPSHOT_TIMEOUT:-12}"
+  if ! snap_script="$(mktemp "${TMPDIR:-/tmp}/fieldwork-bot-snapshot-script.XXXXXX")"; then
+    return 0
+  fi
+  if ! snap_out="$(mktemp "${TMPDIR:-/tmp}/fieldwork-bot-snapshot.XXXXXX")"; then
+    rm -f "$snap_script"
+    return 0
+  fi
+  printf '%s' "$remote_script" >"$snap_script"
+  ssh -o BatchMode=yes -o ConnectTimeout=5 "$FIELDWORK_SSH_HOST" bash -s <"$snap_script" >"$snap_out" 2>/dev/null &
+  snap_pid=$!
+  ( sleep "$snap_timeout"; kill "$snap_pid" 2>/dev/null || true ) &
+  snap_watchdog=$!
+  set +e
+  wait "$snap_pid"
+  set -e
+  kill "$snap_watchdog" 2>/dev/null || true
+  wait "$snap_watchdog" 2>/dev/null || true
+  cat "$snap_out"
+  rm -f "$snap_script" "$snap_out"
+  return 0
+}
+
+# Best-effort, non-interactive read of the broker audit log for the "last PR"
+# row. The audit log belongs to the broker user, so this relies on passwordless
+# sudo; after setup removes the temporary sudoers grant it will usually be
+# unavailable, in which case it returns nonzero and the caller shows a hint
+# instead of prompting (never `ssh -t` / `fieldwork_log`).
+fieldwork_pr_audit_fetch() {
+  local path out pid wd rc
+  path="${FIELDWORK_BROKER_AUDIT_LOG_PATH:-/var/lib/fieldwork-pr-broker/audit.jsonl}"
+  out="$(mktemp "${TMPDIR:-/tmp}/fieldwork-audit-row.XXXXXX")" || return 1
+  ssh -o BatchMode=yes -o ConnectTimeout=5 "$FIELDWORK_SSH_HOST" \
+    "sudo -n tail -n 400 $(shell_quote "$path") 2>/dev/null" >"$out" 2>/dev/null &
+  pid=$!
+  ( sleep 12; kill "$pid" 2>/dev/null || true ) &
+  wd=$!
+  set +e
+  wait "$pid"
+  rc=$?
+  set -e
+  kill "$wd" 2>/dev/null || true
+  wait "$wd" 2>/dev/null || true
+  if [ "$rc" -ne 0 ]; then
+    rm -f "$out"
+    return 1
+  fi
+  cat "$out"
+  rm -f "$out"
+  return 0
+}
+
+print_ssh_config_hint() {
+  cat <<EOF
+
+Add this to ~/.ssh/config on your workstation, then replace HostName with
+your VPS hostname or IP (public, DNS, or a private-network name if you have one):
+
+EOF
+  print_ssh_config_snippet "<vps-host-or-ip>" "~/.ssh/id_ed25519"
+  echo
+}
+
+first_time_reference() {
+  local path="$FIELDWORK_ROOT/docs/first-time-infrastructure.md"
+  path="${path// /%20}"
+  printf 'file://%s\n' "$path"
+}
+
+ssh_alias_looks_configured() {
+  local ssh_config
+  ssh_config="$(ssh -G "$FIELDWORK_SSH_HOST" 2>/dev/null || true)"
+  [ -n "$ssh_config" ] || return 1
+
+  local resolved_host resolved_user
+  resolved_host="$(printf '%s\n' "$ssh_config" | awk '$1 == "hostname" { print $2; exit }')"
+  resolved_user="$(printf '%s\n' "$ssh_config" | awk '$1 == "user" { print $2; exit }')"
+
+  [ "$resolved_user" = "$FIELDWORK_REMOTE_USER" ] || return 1
+  [ "$resolved_host" != "$FIELDWORK_SSH_HOST" ] || ssh_config_has_host "$FIELDWORK_SSH_HOST"
+}
+
+remote_fieldwork_cli_installed() {
+  if fieldwork_setup_snapshot_is_ok fieldwork_cli; then
+    return 0
+  elif [ "$FIELDWORK_SETUP_SNAPSHOT_READY" = "1" ] && [ "$FIELDWORK_SETUP_SNAPSHOT_DIRTY" != "1" ]; then
+    return 1
+  fi
+  ssh "$FIELDWORK_SSH_HOST" "test -x ~/.local/bin/fieldwork" >/dev/null 2>&1
+}
+
+remote_projects_dir_exists() {
+  local projects_dir_q
+  if fieldwork_setup_snapshot_is_ok projects_dir; then
+    return 0
+  elif [ "$FIELDWORK_SETUP_SNAPSHOT_READY" = "1" ] && [ "$FIELDWORK_SETUP_SNAPSHOT_DIRTY" != "1" ]; then
+    return 1
+  fi
+  projects_dir_q="$(shell_quote "$FIELDWORK_PROJECTS_DIR")"
+  ssh "$FIELDWORK_SSH_HOST" "test -d $projects_dir_q" >/dev/null 2>&1
+}
+
+broker_preflight_contract_ok() {
+  ssh "$FIELDWORK_SSH_HOST" "printf '{}' | curl -sS --unix-socket /run/fieldwork-pr-broker/fieldwork-pr.sock -H 'Content-Type: application/json' --data-binary @- http://localhost/preflight 2>/dev/null | grep -Fq 'preflight request missing required field: repo'" >/dev/null 2>&1
+}
+
+fieldwork_sudoers_path() {
+  printf '/etc/sudoers.d/fieldwork-%s\n' "$FIELDWORK_REMOTE_USER"
+}
+
+temporary_passwordless_sudo_present() {
+  local sudoers_q
+  if fieldwork_setup_snapshot_is_ok temporary_sudo; then
+    return 0
+  elif [ "$FIELDWORK_SETUP_SNAPSHOT_READY" = "1" ] && [ "$FIELDWORK_SETUP_SNAPSHOT_DIRTY" != "1" ]; then
+    return 1
+  fi
+  sudoers_q="$(shell_quote "$(fieldwork_sudoers_path)")"
+  ssh "$FIELDWORK_SSH_HOST" "test -f $sudoers_q" >/dev/null 2>&1
+}
+
+remove_temporary_passwordless_sudo() {
+  local sudoers_q rc
+  sudoers_q="$(shell_quote "$(fieldwork_sudoers_path)")"
+  ssh -t "$FIELDWORK_SSH_HOST" "$(remote_sudo_command "rm -f $sudoers_q")"
+  rc=$?
+  FIELDWORK_REMOTE_SUDO_PASSWORDLESS=""
+  [ "$rc" -eq 0 ] && fieldwork_setup_snapshot_mark_dirty
+  return $rc
+}
+
+remote_public_ssh_rule_present() {
+  if fieldwork_setup_snapshot_is_ok public_ssh_rule; then
+    return 0
+  elif [ "$FIELDWORK_SETUP_SNAPSHOT_READY" = "1" ] && [ "$FIELDWORK_SETUP_SNAPSHOT_DIRTY" != "1" ]; then
+    return 1
+  fi
+  ssh "$FIELDWORK_SSH_HOST" "sudo -n ufw status 2>/dev/null | grep -Ei '^[[:space:]]*22/tcp[[:space:]]+ALLOW' | grep -Eiv '(on[[:space:]]+(tailscale|wg|tun)[0-9]*|(^|[^0-9.])(10\\.|192\\.168\\.|172\\.(1[6-9]|2[0-9]|3[0-1])\\.|100\\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\\.))' >/dev/null" >/dev/null 2>&1
+}
+
+local_fieldwork_fingerprint() {
+  (cd "$FIELDWORK_ROOT" && cksum $FIELDWORK_FINGERPRINT_FILES 2>/dev/null)
+}
+
+local_fieldwork_fingerprint_hash() {
+  local fingerprint
+  fingerprint="$(local_fieldwork_fingerprint)" || return 1
+  printf '%s\n' "$fingerprint" | cksum | awk '{ print $1 ":" $2 }'
+}
+
+FIELDWORK_SETUP_SNAPSHOT_ACTIVE=0
+FIELDWORK_SETUP_SNAPSHOT_READY=0
+FIELDWORK_SETUP_SNAPSHOT_DIRTY=1
+FIELDWORK_SETUP_SNAPSHOT_FAILED=0
+FIELDWORK_SETUP_SNAPSHOT=""
+FIELDWORK_SETUP_SNAPSHOT_PROBE_RESULT=""
+FIELDWORK_SETUP_SNAPSHOT_FALLBACK_REASON=""
+FIELDWORK_SETUP_PROBE_MODE="normal"
+FIELDWORK_SETUP_GH_AUTH_TIMEOUT_HINT=0
+
+fieldwork_setup_snapshot_mark_dirty() {
+  FIELDWORK_SETUP_SNAPSHOT_DIRTY=1
+  FIELDWORK_SETUP_SNAPSHOT_FAILED=0
+  FIELDWORK_SETUP_SNAPSHOT_PROBE_RESULT=""
+  FIELDWORK_SETUP_SNAPSHOT_FALLBACK_REASON=""
+}
+
+fieldwork_setup_snapshot_value_raw() {
+  local key="$1"
+  printf '%s\n' "$FIELDWORK_SETUP_SNAPSHOT" | awk -F= -v key="$key" '
+    $1 == key {
+      sub(/^[^=]*=/, "")
+      print
+      found = 1
+      exit
+    }
+    END { exit found ? 0 : 1 }
+  '
+}
+
+fieldwork_setup_snapshot_validate() {
+  local snapshot="$1"
+  local key
+  [ -n "$snapshot" ] || return 1
+  printf '%s\n' "$snapshot" | awk -F= '
+    NF < 2 || $1 !~ /^[a-z][a-z0-9_]*$/ { bad = 1 }
+    END { exit bad ? 1 : 0 }
+  ' || return 1
+  for key in \
+    remote_user \
+    fieldwork_cli \
+    fieldwork_checkout \
+    path_configured \
+    bootstrap_ready \
+    claude_login \
+    gh_cli \
+    gh_hosts \
+    gh_live \
+    verify_runner \
+    prepare_runner \
+    claude_service \
+    broker_socket \
+    broker_pat_tool \
+    broker_thin_client \
+    broker_pat_marker \
+    broker_pat_sudo \
+    temporary_sudo \
+    public_ssh_rule \
+    projects_dir; do
+    printf '%s\n' "$snapshot" | grep -Eq "^$key=" || return 1
+  done
+}
+
+fieldwork_setup_snapshot_set_probe_result() {
+  case "$1" in
+    valid|reached_untrusted|transport_failed)
+      FIELDWORK_SETUP_SNAPSHOT_PROBE_RESULT="$1"
+      ;;
+    *)
+      FIELDWORK_SETUP_SNAPSHOT_PROBE_RESULT="reached_untrusted"
+      ;;
+  esac
+}
+
+fieldwork_setup_snapshot_set_fallback_reason() {
+  case "$1" in
+    helper-missing|malformed|partial|nonzero|timeout|transport)
+      FIELDWORK_SETUP_SNAPSHOT_FALLBACK_REASON="$1"
+      ;;
+    *)
+      FIELDWORK_SETUP_SNAPSHOT_FALLBACK_REASON="malformed"
+      ;;
+  esac
+  fieldwork_timing_enabled || return 0
+  printf '[fieldwork timing] setup snapshot fallback %s 0.000s\n' "$FIELDWORK_SETUP_SNAPSHOT_FALLBACK_REASON" >&2
+}
+
+fieldwork_setup_snapshot_untrusted_reason() {
+  local snapshot="$1"
+  local key
+  [ -n "$snapshot" ] || {
+    printf 'malformed\n'
+    return 0
+  }
+  if ! printf '%s\n' "$snapshot" | awk -F= '
+    NF < 2 || $1 !~ /^[a-z][a-z0-9_]*$/ { bad = 1 }
+    END { exit bad ? 1 : 0 }
+  '; then
+    printf 'malformed\n'
+    return 0
+  fi
+  for key in \
+    remote_user \
+    fieldwork_cli \
+    fieldwork_checkout \
+    path_configured \
+    bootstrap_ready \
+    claude_login \
+    gh_cli \
+    gh_hosts \
+    gh_live \
+    verify_runner \
+    prepare_runner \
+    claude_service \
+    broker_socket \
+    broker_pat_tool \
+    broker_thin_client \
+    broker_pat_marker \
+    broker_pat_sudo \
+    temporary_sudo \
+    public_ssh_rule \
+    projects_dir; do
+    printf '%s\n' "$snapshot" | grep -Eq "^$key=" || {
+      printf 'partial\n'
+      return 0
+    }
+  done
+  printf 'malformed\n'
+}
+
+fieldwork_setup_remote_probe() {
+  local expected_hash timeout script_file out_file err_file timeout_file remote_script status probe_pid watchdog_pid timing_start probe_mode remote_command
+  FIELDWORK_SETUP_SNAPSHOT_PROBE_RESULT=""
+  FIELDWORK_SETUP_SNAPSHOT_FALLBACK_REASON=""
+  timing_start="$(fieldwork_timing_start)"
+  expected_hash="$(local_fieldwork_fingerprint_hash)" || return 1
+  fieldwork_timing_since "probe local fingerprint" "$timing_start"
+  timing_start="$(fieldwork_timing_start)"
+  timeout="${FIELDWORK_SETUP_PROBE_TIMEOUT_SECONDS:-8}"
+  case "$timeout" in
+    ''|*[!0-9]*) timeout=8 ;;
+  esac
+  script_file="$(mktemp "${TMPDIR:-/tmp}/fieldwork-setup-probe-script.XXXXXX")"
+  out_file="$(mktemp "${TMPDIR:-/tmp}/fieldwork-setup-probe.XXXXXX")"
+  err_file="$(mktemp "${TMPDIR:-/tmp}/fieldwork-setup-probe-err.XXXXXX")"
+  timeout_file="$(mktemp "${TMPDIR:-/tmp}/fieldwork-setup-probe-timeout.XXXXXX")"
+  rm -f "$timeout_file"
+  fieldwork_timing_since "probe temp files" "$timing_start"
+
+  probe_mode="${FIELDWORK_SETUP_PROBE_MODE:-normal}"
+  remote_command="FIELDWORK_SETUP_TIMING=$(shell_quote "${FIELDWORK_SETUP_TIMING:-0}") FIELDWORK_SETUP_AGENTS=$(shell_quote "${FIELDWORK_SETUP_AGENTS:-claude}") FIELDWORK_EXPECTED_FINGERPRINT_HASH=$(shell_quote "$expected_hash") FIELDWORK_FINGERPRINT_FILES=$(shell_quote "$FIELDWORK_FINGERPRINT_FILES") FIELDWORK_PROJECTS_DIR=$(shell_quote "$FIELDWORK_PROJECTS_DIR") FIELDWORK_REMOTE_USER=$(shell_quote "$FIELDWORK_REMOTE_USER") \"\$HOME/.local/bin/fieldwork-setup-probe\""
+  timing_start="$(fieldwork_timing_start)"
+  case "$probe_mode" in
+    mux)
+      fieldwork_ssh_prepare_control_dir || {
+        fieldwork_setup_snapshot_set_fallback_reason transport
+        rm -f "$script_file" "$out_file" "$err_file" "$timeout_file"
+        return 255
+      }
+      command ssh -o BatchMode=yes -o ConnectTimeout=5 -o ControlMaster=auto -o ControlPersist="$(fieldwork_ssh_control_persist)" -o ControlPath="$(fieldwork_ssh_control_path)" "$FIELDWORK_SSH_HOST" "$remote_command" >"$out_file" 2>"$err_file" &
+      ;;
+    plain)
+      command ssh -o BatchMode=yes -o ConnectTimeout=5 "$FIELDWORK_SSH_HOST" "$remote_command" >"$out_file" 2>"$err_file" &
+      ;;
+    *)
+      ssh "$FIELDWORK_SSH_HOST" "$remote_command" >"$out_file" 2>"$err_file" &
+      ;;
+  esac
+  probe_pid=$!
+  ( sleep "$timeout"; touch "$timeout_file"; kill "$probe_pid" 2>/dev/null || true ) &
+  watchdog_pid=$!
+  set +e
+  wait "$probe_pid"
+  status=$?
+  set -e
+  kill "$watchdog_pid" 2>/dev/null || true
+  wait "$watchdog_pid" 2>/dev/null || true
+  fieldwork_timing_since "probe helper transport" "$timing_start"
+  fieldwork_timing_since "probe ssh transport" "$timing_start"
+  if [ -f "$timeout_file" ]; then
+    fieldwork_setup_snapshot_set_fallback_reason timeout
+    rm -f "$script_file" "$out_file" "$err_file" "$timeout_file"
+    return 124
+  fi
+  if [ "$probe_mode" = "mux" ] && [ "$status" -ne 255 ]; then
+    FIELDWORK_SSH_MUX_READY=1
+    fieldwork_ssh_debug "preflight ok: $(fieldwork_ssh_mux_debug_target)"
+  fi
+  if [ "$status" -eq 255 ]; then
+    VPS_REACHABILITY_ERROR="$(sed -n '1,4p' "$err_file")"
+    fieldwork_setup_snapshot_set_fallback_reason transport
+    rm -f "$script_file" "$out_file" "$err_file" "$timeout_file"
+    return 255
+  fi
+  if [ "$status" -eq 127 ]; then
+    fieldwork_setup_snapshot_set_fallback_reason helper-missing
+  elif [ "$status" -ne 0 ]; then
+    FIELDWORK_SETUP_SNAPSHOT="$(cat "$out_file")"
+    if [ -n "$FIELDWORK_SETUP_SNAPSHOT" ]; then
+      fieldwork_setup_snapshot_set_fallback_reason "$(fieldwork_setup_snapshot_untrusted_reason "$FIELDWORK_SETUP_SNAPSHOT")"
+    else
+      fieldwork_setup_snapshot_set_fallback_reason nonzero
+    fi
+  fi
+  if [ "$status" -eq 0 ]; then
+    timing_start="$(fieldwork_timing_start)"
+    FIELDWORK_SETUP_SNAPSHOT="$(cat "$out_file")"
+    fieldwork_timing_since "probe snapshot read" "$timing_start"
+    if fieldwork_setup_snapshot_validate "$FIELDWORK_SETUP_SNAPSHOT"; then
+      rm -f "$script_file" "$out_file" "$err_file" "$timeout_file"
+      return 0
+    fi
+    fieldwork_setup_snapshot_set_fallback_reason "$(fieldwork_setup_snapshot_untrusted_reason "$FIELDWORK_SETUP_SNAPSHOT")"
+  fi
+  FIELDWORK_SETUP_SNAPSHOT=""
+  : >"$out_file"
+  rm -f "$timeout_file"
+
+  timing_start="$(fieldwork_timing_start)"
+  IFS= read -r -d '' remote_script <<'REMOTE_EOF' || true
+set -u
+
+emit() {
+  local key="$1"
+  local value="${2:-}"
+  value="${value//$'\n'/ }"
+  value="${value//$'\r'/ }"
+  printf '%s=%s\n' "$key" "$value"
+}
+
+timing_enabled() {
+  [ "${FIELDWORK_SETUP_TIMING:-0}" = "1" ]
+}
+
+timing_now() {
+  timing_enabled || {
+    printf '0\n'
+    return 0
+  }
+  local now
+  if command -v perl >/dev/null 2>&1; then
+    if now="$(perl -MTime::HiRes=time -e 'printf "%.3f\n", time' 2>/dev/null)"; then
+      printf '%s\n' "$now"
+      return 0
+    fi
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    if now="$(python3 -c 'import time; print(f"{time.time():.3f}")' 2>/dev/null)"; then
+      printf '%s\n' "$now"
+      return 0
+    fi
+  fi
+  date +%s
+}
+
+timing_elapsed() {
+  local start="$1"
+  local end
+  end="$(timing_now)"
+  awk -v start="$start" -v end="$end" 'BEGIN { printf "%.3f", end - start }'
+}
+
+timing_emit() {
+  local key="$1"
+  local start="$2"
+  timing_enabled || return 0
+  emit "$key" "$(timing_elapsed "$start")"
+}
+
+status_for() {
+  local key="$1"
+  shift
+  if "$@" >/dev/null 2>&1; then
+    emit "$key" ok
+  else
+    emit "$key" missing
+  fi
+}
+
+path_configured() {
+  case ":$PATH:" in *":$HOME/.local/bin:"*) return 0 ;; esac
+  grep -Eq "Fieldwork local bin|[$]HOME/\\.local/bin|/\\.local/bin" "$HOME/.profile" 2>/dev/null
+}
+
+fingerprint_current() {
+  [ -x "$HOME/.local/bin/fieldwork" ] || return 1
+  [ -d "$HOME/fieldwork" ] || return 1
+  local remote_hash
+  remote_hash="$(cd "$HOME/fieldwork" && cksum $FIELDWORK_FINGERPRINT_FILES 2>/dev/null | cksum | awk '{ print $1 ":" $2 }')" || return 1
+  [ -n "$remote_hash" ] && [ "$remote_hash" = "$FIELDWORK_EXPECTED_FINGERPRINT_HASH" ]
+}
+
+bootstrap_ready() {
+  export PATH="$HOME/.local/bin:$PATH"
+  command -v gh >/dev/null 2>&1 &&
+    test -d "$FIELDWORK_PROJECTS_DIR" &&
+    test -f "$HOME/.config/systemd/user/fieldwork-verify-runner.socket" &&
+    test -f "$HOME/.config/systemd/user/fieldwork-pr-prepare-runner.socket" || return 1
+  case "${FIELDWORK_SETUP_AGENTS:-claude}" in
+    claude|both|claude,codex|codex,claude)
+      command -v claude >/dev/null 2>&1 &&
+        test -f "$HOME/.config/systemd/user/fieldwork-agent@.service"
+      ;;
+    *) return 0 ;;
+  esac
+}
+
+verify_runner_ready() {
+  export PATH="$HOME/.local/bin:$PATH"
+  local runtime_dir
+  test -x "$HOME/.local/bin/fieldwork-verify" &&
+    test -x "$HOME/.local/bin/fieldwork-verify-runner" &&
+    test -x "$HOME/.fieldwork/scripts/fieldwork-verify-pipeline" &&
+    test -f "$HOME/.config/systemd/user/fieldwork-verify-runner.socket" &&
+    test -f "$HOME/.config/systemd/user/fieldwork-verify-runner@.service" &&
+    systemctl --user is-active --quiet fieldwork-verify-runner.socket || return 1
+  runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+  test -S "$runtime_dir/fieldwork-verify.sock" &&
+    command -v bwrap >/dev/null 2>&1 &&
+    bwrap --unshare-user --unshare-net --unshare-pid --unshare-uts --unshare-ipc \
+      --ro-bind / / --tmpfs /tmp --dev /dev --proc /proc \
+      -- /bin/true
+}
+
+gh_live_status() {
+  export PATH="$HOME/.local/bin:$PATH"
+  command -v gh >/dev/null 2>&1 || { emit gh_live missing; return 0; }
+  local marker pid watcher status
+  marker="${TMPDIR:-/tmp}/fieldwork-gh-timeout.$$"
+  rm -f "$marker"
+  ( gh auth status >/dev/null 2>&1 ) &
+  pid=$!
+  ( sleep 3; touch "$marker"; kill "$pid" 2>/dev/null || true ) &
+  watcher=$!
+  set +e
+  wait "$pid"
+  status=$?
+  set +e
+  kill "$watcher" 2>/dev/null || true
+  wait "$watcher" 2>/dev/null || true
+  if [ -f "$marker" ]; then
+    rm -f "$marker"
+    emit gh_live timeout
+  elif [ "$status" -eq 0 ]; then
+    emit gh_live ok
+  else
+    emit gh_live missing
+  fi
+}
+
+broker_pat_sudo() {
+  sudo -n stat -c '%U:%G %a' /etc/fieldwork-pr-broker/gh-token 2>/dev/null | grep -qx 'fieldwork-pr-broker:fieldwork-pr-broker 600'
+}
+
+# Distinguishes "token absent" from "passwordless sudo denied" (post-hardening):
+# unavailable = cannot run sudo -n, so token state is unknown; missing = sudo
+# worked but the token file is absent/wrong perms; ok = token present, 600.
+broker_pat_sudo_probe() {
+  if ! sudo -n true >/dev/null 2>&1; then
+    emit broker_pat_sudo_probe unavailable
+    return 0
+  fi
+  if broker_pat_sudo; then
+    emit broker_pat_sudo_probe ok
+  else
+    emit broker_pat_sudo_probe missing
+  fi
+}
+
+codex_cli_ready() {
+  export PATH="$HOME/.local/bin:$PATH"
+  command -v codex >/dev/null 2>&1 || return 1
+  codex --version >/dev/null 2>&1
+}
+
+# Mirrors normalize_agents_value() in bin/fieldwork, and additionally reports
+# whether ~/.fieldwork/agents is absent (missing) or unparseable (invalid) —
+# normalization alone would silently report an invalid file as "claude".
+agents_probe() {
+  local file="$HOME/.fieldwork/agents" raw stripped
+  if [ ! -f "$file" ]; then
+    emit configured_agents_raw ""
+    emit configured_agents claude
+    emit configured_agents_status missing
+    return 0
+  fi
+  raw="$(cat "$file" 2>/dev/null || true)"
+  emit configured_agents_raw "$raw"
+  stripped="$(printf '%s' "$raw" | tr -d '[:space:]')"
+  case "$stripped" in
+    claude|codex)
+      emit configured_agents "$stripped"
+      emit configured_agents_status ok
+      ;;
+    both|claude,codex|codex,claude)
+      emit configured_agents claude,codex
+      emit configured_agents_status ok
+      ;;
+    *)
+      emit configured_agents claude
+      emit configured_agents_status invalid
+      ;;
+  esac
+}
+
+public_ssh_rule() {
+  sudo -n ufw status 2>/dev/null |
+    grep -Ei '^[[:space:]]*22/tcp[[:space:]]+ALLOW' |
+    grep -Eiv '(on[[:space:]]+(tailscale|wg|tun)[0-9]*|(^|[^0-9.])(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.))' >/dev/null
+}
+
+remote_script_start="$(timing_now)"
+emit remote_user "$(id -un 2>/dev/null || printf unknown)"
+status_for fieldwork_cli test -x "$HOME/.local/bin/fieldwork"
+fieldwork_checkout_start="$(timing_now)"
+status_for fieldwork_checkout fingerprint_current
+timing_emit timing_remote_fingerprint "$fieldwork_checkout_start"
+status_for path_configured path_configured
+status_for bootstrap_ready bootstrap_ready
+status_for claude_login test -f "$HOME/.fieldwork/state/claude-login-confirmed"
+export PATH="$HOME/.local/bin:$PATH"
+status_for claude_cli command -v claude
+status_for codex_cli codex_cli_ready
+status_for codex_login test -f "$HOME/.fieldwork/state/codex-login-confirmed"
+agents_probe
+status_for gh_cli command -v gh
+status_for gh_hosts test -s "$HOME/.config/gh/hosts.yml"
+gh_live_start="$(timing_now)"
+gh_live_status
+timing_emit timing_remote_gh_auth_status "$gh_live_start"
+status_for verify_runner verify_runner_ready
+status_for prepare_runner test -f "$HOME/.config/systemd/user/fieldwork-pr-prepare-runner.socket"
+status_for claude_service test -f "$HOME/.config/systemd/user/fieldwork-agent@.service"
+broker_checks_start="$(timing_now)"
+status_for broker_socket sh -c 'test -S /run/fieldwork-pr-broker/fieldwork-pr.sock && test -w /run/fieldwork-pr-broker/fieldwork-pr.sock'
+status_for broker_pat_tool test -f /usr/local/sbin/rotate-pat
+status_for broker_thin_client test -e "$HOME/.local/bin/fieldwork-pr-submit"
+status_for broker_pat_marker test -f "$HOME/.fieldwork/state/broker-pat-confirmed"
+status_for broker_pat_sudo broker_pat_sudo
+broker_pat_sudo_probe
+timing_emit timing_remote_broker_checks "$broker_checks_start"
+status_for temporary_sudo test -f "/etc/sudoers.d/fieldwork-$FIELDWORK_REMOTE_USER"
+status_for public_ssh_rule public_ssh_rule
+status_for projects_dir test -d "$FIELDWORK_PROJECTS_DIR"
+timing_emit timing_remote_script_total "$remote_script_start"
+REMOTE_EOF
+
+  printf '%s' "$remote_script" >"$script_file"
+  fieldwork_timing_since "probe script materialization" "$timing_start"
+  timing_start="$(fieldwork_timing_start)"
+  ssh "$FIELDWORK_SSH_HOST" \
+    "FIELDWORK_SETUP_TIMING=$(shell_quote "${FIELDWORK_SETUP_TIMING:-0}") FIELDWORK_SETUP_AGENTS=$(shell_quote "${FIELDWORK_SETUP_AGENTS:-claude}") FIELDWORK_EXPECTED_FINGERPRINT_HASH=$(shell_quote "$expected_hash") FIELDWORK_FINGERPRINT_FILES=$(shell_quote "$FIELDWORK_FINGERPRINT_FILES") FIELDWORK_PROJECTS_DIR=$(shell_quote "$FIELDWORK_PROJECTS_DIR") FIELDWORK_REMOTE_USER=$(shell_quote "$FIELDWORK_REMOTE_USER") bash -s" \
+    <"$script_file" >"$out_file" 2>"$err_file" &
+  probe_pid=$!
+  ( sleep "$timeout"; touch "$timeout_file"; kill "$probe_pid" 2>/dev/null || true ) &
+  watchdog_pid=$!
+  set +e
+  wait "$probe_pid"
+  status=$?
+  set -e
+  kill "$watchdog_pid" 2>/dev/null || true
+  wait "$watchdog_pid" 2>/dev/null || true
+  fieldwork_timing_since "probe inline transport" "$timing_start"
+  fieldwork_timing_since "probe ssh transport" "$timing_start"
+  if [ -f "$timeout_file" ]; then
+    fieldwork_setup_snapshot_set_fallback_reason timeout
+    rm -f "$script_file" "$out_file" "$err_file" "$timeout_file"
+    return 124
+  fi
+  if [ "$status" -eq 255 ] && [ -z "$FIELDWORK_SETUP_SNAPSHOT_FALLBACK_REASON" ]; then
+    VPS_REACHABILITY_ERROR="$(sed -n '1,4p' "$err_file")"
+    fieldwork_setup_snapshot_set_fallback_reason transport
+    rm -f "$script_file" "$out_file" "$err_file" "$timeout_file"
+    return 255
+  fi
+  if [ "$status" -ne 0 ]; then
+    FIELDWORK_SETUP_SNAPSHOT="$(cat "$out_file")"
+    if [ -n "$FIELDWORK_SETUP_SNAPSHOT" ]; then
+      fieldwork_setup_snapshot_set_fallback_reason "$(fieldwork_setup_snapshot_untrusted_reason "$FIELDWORK_SETUP_SNAPSHOT")"
+    elif [ -z "$FIELDWORK_SETUP_SNAPSHOT_FALLBACK_REASON" ]; then
+      fieldwork_setup_snapshot_set_fallback_reason nonzero
+    fi
+    rm -f "$script_file" "$out_file" "$err_file" "$timeout_file"
+    if [ "$status" -eq 255 ] && [ -n "$FIELDWORK_SETUP_SNAPSHOT_FALLBACK_REASON" ]; then
+      return 1
+    fi
+    return "$status"
+  fi
+  timing_start="$(fieldwork_timing_start)"
+  FIELDWORK_SETUP_SNAPSHOT="$(cat "$out_file")"
+  fieldwork_timing_since "probe snapshot read" "$timing_start"
+  rm -f "$script_file" "$out_file" "$err_file" "$timeout_file"
+}
+
+fieldwork_setup_snapshot_ensure() {
+  local timing_start validation_timing_start probe_status
+  [ "$FIELDWORK_SETUP_SNAPSHOT_ACTIVE" = "1" ] || return 1
+  if [ "$FIELDWORK_SETUP_SNAPSHOT_READY" = "1" ] && [ "$FIELDWORK_SETUP_SNAPSHOT_DIRTY" != "1" ]; then
+    fieldwork_setup_snapshot_set_probe_result valid
+    return 0
+  fi
+  if [ "$FIELDWORK_SETUP_SNAPSHOT_FAILED" = "1" ] && [ "$FIELDWORK_SETUP_SNAPSHOT_DIRTY" != "1" ]; then
+    return 1
+  fi
+  FIELDWORK_SETUP_SNAPSHOT_READY=0
+  FIELDWORK_SETUP_SNAPSHOT=""
+  FIELDWORK_SETUP_SNAPSHOT_PROBE_RESULT=""
+  timing_start="$(fieldwork_timing_start)"
+  set +e
+  fieldwork_setup_remote_probe
+  probe_status=$?
+  set -e
+  if [ "$probe_status" -eq 0 ]; then
+    validation_timing_start="$(fieldwork_timing_start)"
+    if fieldwork_setup_snapshot_validate "$FIELDWORK_SETUP_SNAPSHOT"; then
+      fieldwork_timing_since "probe snapshot validation" "$validation_timing_start"
+      fieldwork_timing_since "setup snapshot probe total" "$timing_start"
+      FIELDWORK_SETUP_SNAPSHOT_READY=1
+      FIELDWORK_SETUP_SNAPSHOT_DIRTY=0
+      FIELDWORK_SETUP_SNAPSHOT_FAILED=0
+      fieldwork_setup_snapshot_set_probe_result valid
+      fieldwork_setup_timing_from_snapshot
+      return 0
+    fi
+    fieldwork_setup_snapshot_set_fallback_reason "$(fieldwork_setup_snapshot_untrusted_reason "$FIELDWORK_SETUP_SNAPSHOT")"
+    fieldwork_timing_since "probe snapshot validation" "$validation_timing_start"
+  fi
+  fieldwork_timing_since "setup snapshot probe total" "$timing_start"
+  if [ "$probe_status" -eq 255 ] || { [ "$probe_status" -eq 124 ] && [ "$FIELDWORK_SETUP_SNAPSHOT_FALLBACK_REASON" = "timeout" ]; }; then
+    fieldwork_setup_snapshot_set_probe_result transport_failed
+  else
+    fieldwork_setup_snapshot_set_probe_result reached_untrusted
+  fi
+  FIELDWORK_SETUP_SNAPSHOT_READY=0
+  FIELDWORK_SETUP_SNAPSHOT_DIRTY=0
+  FIELDWORK_SETUP_SNAPSHOT_FAILED=1
+  FIELDWORK_SETUP_SNAPSHOT=""
+  return 1
+}
+
+fieldwork_setup_probe_short_plain_reachable() {
+  local err_file status
+  err_file="$(mktemp "${TMPDIR:-/tmp}/fieldwork-ssh-check.XXXXXX")"
+  set +e
+  command ssh -o BatchMode=yes -o ConnectTimeout=5 "$FIELDWORK_SSH_HOST" true >/dev/null 2>"$err_file"
+  status=$?
+  set -e
+  VPS_REACHABILITY_ERROR="$(sed -n '1,4p' "$err_file")"
+  rm -f "$err_file"
+  return "$status"
+}
+
+fieldwork_setup_snapshot_reset_for_probe_retry() {
+  FIELDWORK_SETUP_SNAPSHOT_READY=0
+  FIELDWORK_SETUP_SNAPSHOT_DIRTY=1
+  FIELDWORK_SETUP_SNAPSHOT_FAILED=0
+  FIELDWORK_SETUP_SNAPSHOT=""
+  FIELDWORK_SETUP_SNAPSHOT_PROBE_RESULT=""
+  FIELDWORK_SETUP_SNAPSHOT_FALLBACK_REASON=""
+}
+
+fieldwork_setup_snapshot_probe_connect() {
+  local result reason
+  FIELDWORK_SETUP_SNAPSHOT_ACTIVE=1
+  fieldwork_setup_snapshot_reset_for_probe_retry
+
+  if fieldwork_ssh_mux_configured; then
+    FIELDWORK_SETUP_PROBE_MODE=mux
+    fieldwork_setup_snapshot_ensure || true
+    FIELDWORK_SETUP_PROBE_MODE=normal
+    result="$FIELDWORK_SETUP_SNAPSHOT_PROBE_RESULT"
+    reason="$FIELDWORK_SETUP_SNAPSHOT_FALLBACK_REASON"
+    case "$result" in
+      valid|reached_untrusted)
+        return 0
+        ;;
+      transport_failed)
+        if [ "$reason" = "timeout" ]; then
+          FIELDWORK_SSH_MUX_READY=0
+          FIELDWORK_SSH_MUX_DISABLED_FOR_PROCESS=1
+          FIELDWORK_SSH_MUX_DISABLE_REASON=""
+          if fieldwork_setup_probe_short_plain_reachable; then
+            fieldwork_setup_snapshot_set_probe_result reached_untrusted
+            return 0
+          fi
+          return 1
+        fi
+        FIELDWORK_SSH_MUX_READY=0
+        FIELDWORK_SSH_MUX_DISABLED_FOR_PROCESS=1
+        FIELDWORK_SSH_MUX_DISABLE_REASON="control socket preflight failed"
+        fieldwork_setup_snapshot_reset_for_probe_retry
+        FIELDWORK_SETUP_PROBE_MODE=plain
+        fieldwork_setup_snapshot_ensure || true
+        FIELDWORK_SETUP_PROBE_MODE=normal
+        case "$FIELDWORK_SETUP_SNAPSHOT_PROBE_RESULT" in
+          valid|reached_untrusted) return 0 ;;
+          transport_failed) return 1 ;;
+        esac
+        ;;
+    esac
+  else
+    FIELDWORK_SETUP_PROBE_MODE=plain
+    fieldwork_setup_snapshot_ensure || true
+    FIELDWORK_SETUP_PROBE_MODE=normal
+    if [ "$FIELDWORK_SETUP_SNAPSHOT_PROBE_RESULT" = "transport_failed" ] && [ "$FIELDWORK_SETUP_SNAPSHOT_FALLBACK_REASON" = "timeout" ]; then
+      if fieldwork_setup_probe_short_plain_reachable; then
+        fieldwork_setup_snapshot_set_probe_result reached_untrusted
+        return 0
+      fi
+      return 1
+    fi
+    case "$FIELDWORK_SETUP_SNAPSHOT_PROBE_RESULT" in
+      valid|reached_untrusted) return 0 ;;
+      transport_failed) return 1 ;;
+    esac
+  fi
+  return 1
+}
+
+fieldwork_setup_snapshot_is_ok() {
+  local key="$1" value
+  fieldwork_setup_snapshot_ensure || return 1
+  value="$(fieldwork_setup_snapshot_value_raw "$key")" || return 1
+  [ "$value" = "ok" ]
+}
+
+remote_fieldwork_checkout_current() {
+  local snapshot_value local_fingerprint remote_fingerprint
+  if fieldwork_setup_snapshot_ensure; then
+    snapshot_value="$(fieldwork_setup_snapshot_value_raw fieldwork_checkout 2>/dev/null || true)"
+    if [ -n "$snapshot_value" ]; then
+      [ "$snapshot_value" = "ok" ]
+      return $?
+    fi
+  fi
+  local_fingerprint="$(local_fieldwork_fingerprint)" || return 1
+  remote_fingerprint="$(ssh "$FIELDWORK_SSH_HOST" "cd ~/fieldwork && cksum $FIELDWORK_FINGERPRINT_FILES 2>/dev/null" 2>/dev/null || true)"
+  [ -n "$remote_fingerprint" ] && [ "$local_fingerprint" = "$remote_fingerprint" ]
+}
+
+remote_fieldwork_path_configured() {
+  if fieldwork_setup_snapshot_is_ok path_configured; then
+    return 0
+  elif [ "$FIELDWORK_SETUP_SNAPSHOT_READY" = "1" ] && [ "$FIELDWORK_SETUP_SNAPSHOT_DIRTY" != "1" ]; then
+    return 1
+  fi
+  ssh "$FIELDWORK_SSH_HOST" 'case ":$PATH:" in *":$HOME/.local/bin:"*) exit 0 ;; esac; grep -Eq "Fieldwork local bin|[$]HOME/\\.local/bin|/\\.local/bin" "$HOME/.profile" 2>/dev/null' >/dev/null 2>&1
+}
+
+ensure_remote_fieldwork_path() {
+  local rc
+  ssh "$FIELDWORK_SSH_HOST" 'profile="$HOME/.profile"
+touch "$profile"
+if ! grep -Eq "Fieldwork local bin|[$]HOME/\\.local/bin|/\\.local/bin" "$profile"; then
+  printf "\n# Fieldwork local bin\nexport PATH=\"\$HOME/.local/bin:\$PATH\"\n" >> "$profile"
+fi'
+  rc=$?
+  [ "$rc" -eq 0 ] && fieldwork_setup_snapshot_mark_dirty
+  return "$rc"
+}
+
+health() {
+  case "${1:-}" in
+    --help|-h)
+      cat <<'EOF'
+usage: fieldwork health
+
+One-glance health summary across local tooling, the VPS, agents, the broker,
+runner sockets, the broker token, and (when configured) the approval bot.
+
+Composes a single remote probe plus, when the probe is trusted, one bounded
+broker/bot snapshot. Exit status is nonzero only when something is blocked
+(e.g. the VPS is unreachable); items that merely need attention or are optional
+still exit 0.
+
+For depth: fieldwork doctor [--remote], fieldwork status <repo>, fieldwork
+bot-status.
+EOF
+      return 0
+      ;;
+    "") ;;
+    *) echo "unknown health argument: $1" >&2; return 2 ;;
+  esac
+
+  local local_text snap_text bot_text probe_result fallback_reason rc
+  phase_section "Fieldwork health"
+  local_text="$(health_local_checks)"
+
+  # probe_connect re-enables `set -e` internally before returning, so consume its
+  # nonzero (transport_failed/reached_untrusted) in a condition rather than with a
+  # bare `set +e` wrapper, which it would clobber.
+  fieldwork_setup_snapshot_probe_connect || true
+  probe_result="${FIELDWORK_SETUP_SNAPSHOT_PROBE_RESULT:-}"
+  fallback_reason="${FIELDWORK_SETUP_SNAPSHOT_FALLBACK_REASON:-}"
+  snap_text=""
+  bot_text=""
+  if [ "$probe_result" = "valid" ]; then
+    snap_text="${FIELDWORK_SETUP_SNAPSHOT:-}"
+    bot_text="$(fieldwork_bot_snapshot)"
+  fi
+
+  rc=0
+  health_render "$probe_result" "$fallback_reason" "$snap_text" "$bot_text" "$local_text" || rc=$?
+  return "$rc"
+}
+
+doctor() {
+  local remote=0
+  local explain=0
+  local session_probe=0
+  local repo_slug=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --remote) remote=1; shift ;;
+      --explain) explain=1; shift ;;
+      --session-probe) session_probe=1; shift ;;
+      --help)
+        echo "usage: fieldwork doctor [--remote] [repo-slug] [--explain] [--session-probe]"
+        return 0
+        ;;
+      -*)
+        echo "unknown doctor argument: $1" >&2
+        return 2
+        ;;
+      *)
+        [ -z "$repo_slug" ] || { echo "fieldwork doctor accepts at most one repo slug" >&2; return 2; }
+        repo_slug="$1"
+        shift
+        ;;
+    esac
+  done
+  if [ -n "$repo_slug" ]; then
+    [ "$remote" = "1" ] || { echo "fieldwork doctor <repo-slug> requires --remote" >&2; return 2; }
+    valid_slug "$repo_slug" || { echo "invalid repo slug: $repo_slug" >&2; return 2; }
+  fi
+  if [ "$session_probe" = "1" ] && [ "$remote" != "1" ]; then
+    echo "fieldwork doctor --session-probe requires --remote" >&2
+    return 2
+  fi
+
+  if [ "$remote" != "1" ]; then
+    local failed=0
+    local next_action="fieldwork setup"
+    doctor_local_row() {
+      local status="$1"
+      local label="$2"
+      local detail="${3:-}"
+      local mark
+      case "$status" in
+        ok) mark="✓" ;;
+        needs) mark="!" ;;
+        skipped) mark="–" ;;
+        info) mark="·" ;;
+        *) mark="$status" ;;
+      esac
+      if [ -n "$detail" ]; then
+        printf '  %s  %-22s %s\n' "$mark" "$label" "$detail"
+      else
+        printf '  %s  %s\n' "$mark" "$label"
+      fi
+    }
+    doctor_local_needs() {
+      local label="$1"
+      local detail="$2"
+      local next="$3"
+      doctor_local_row needs "$label" "$detail"
+      failed=1
+      [ "$next_action" = "fieldwork setup" ] && next_action="$next"
+    }
+
+    local tool missing_tools=""
+    for tool in bash git jq ssh scp sed grep rsync; do
+      if ! command -v "$tool" >/dev/null 2>&1; then
+        if [ -n "$missing_tools" ]; then
+          missing_tools="$missing_tools, $tool"
+        else
+          missing_tools="$tool"
+        fi
+      fi
+    done
+
+    local fieldwork_cmd_ok=0
+    if command -v fieldwork >/dev/null 2>&1 || [ -x "$HOME/.local/bin/fieldwork" ] || [ -x "$FIELDWORK_ROOT/bin/fieldwork" ]; then
+      fieldwork_cmd_ok=1
+    fi
+
+    local helpers_ok=0
+    if [ -f "$HOME/.claude/CLAUDE.md" ] \
+      && [ -f "$HOME/.claude/settings.json" ] \
+      && [ -x "$HOME/.fieldwork/scripts/fieldwork-pr-submit" ] \
+      && [ -x "$HOME/.fieldwork/scripts/fieldwork-verify" ] \
+      && [ -x "$HOME/.fieldwork/scripts/fieldwork-pr-prepare" ] \
+      && [ -f "$HOME/.fieldwork/agents" ]; then
+      helpers_ok=1
+    fi
+
+    local broker_ok=0
+    if [ -f "$HOME/.fieldwork/infra/fieldwork-pr-broker/server.py" ] || [ -f "$FIELDWORK_ROOT/lib/broker/server.py" ]; then
+      broker_ok=1
+    fi
+
+    local template_ok=0
+    if [ -d "$HOME/.fieldwork/templates/repo/.claude" ] || [ -d "$FIELDWORK_ROOT/lib/templates/repo/.claude" ]; then
+      template_ok=1
+    fi
+
+    local notifications_configured=0
+    if [ -f "$HOME/.fieldwork/notify.env" ] && grep -Eq '^(NTFY_TOPIC|TG_BOT_TOKEN)=.+' "$HOME/.fieldwork/notify.env"; then
+      notifications_configured=1
+    fi
+
+    echo "Fieldwork doctor"
+    echo
+    echo "Local"
+    if [ -z "$missing_tools" ]; then
+      doctor_local_row ok "workstation tools" "bash, git, jq, ssh, scp, sed, grep, rsync"
+    else
+      doctor_local_needs "workstation tools" "missing: $missing_tools" "install missing local tools"
+    fi
+    if [ "$fieldwork_cmd_ok" = "1" ]; then
+      doctor_local_row ok "Fieldwork command"
+    else
+      doctor_local_needs "Fieldwork command" "run bash install.sh" "bash install.sh"
+    fi
+    if [ "$helpers_ok" = "1" ]; then
+      doctor_local_row ok "Fieldwork helper files"
+    else
+      doctor_local_needs "Fieldwork helper files" "run bash install.sh" "bash install.sh"
+    fi
+    if [ "$broker_ok" = "1" ]; then
+      doctor_local_row ok "Broker server"
+    else
+      doctor_local_needs "Broker server" "missing from checkout" "restore or reclone Fieldwork"
+    fi
+    if [ "$template_ok" = "1" ]; then
+      doctor_local_row ok "Repo template"
+    else
+      doctor_local_needs "Repo template" "missing from checkout" "restore or reclone Fieldwork"
+    fi
+
+    if [ "$explain" = "1" ]; then
+      echo
+      echo "Config (resolved)"
+      echo "  profile: $FIELDWORK_PROFILE"
+      echo "  forge: $FIELDWORK_FORGE"
+      echo "  ssh_host: $FIELDWORK_SSH_HOST"
+      echo "  remote_user: $FIELDWORK_REMOTE_USER"
+      echo "  projects_dir: $FIELDWORK_PROJECTS_DIR"
+      echo "  default_branch: $FIELDWORK_DEFAULT_BRANCH"
+    fi
+
+    echo
+    echo "VPS"
+    if [ "$explain" = "1" ]; then
+      doctor_local_row skipped "not checked" "remote checks were not requested"
+      cat <<'EOF'
+
+  --remote would verify:
+    - SSH access
+    - broker service
+    - systemd units
+    - repo checkout paths
+    - notification transport
+
+  Run:
+    fieldwork doctor --remote
+EOF
+    else
+      doctor_local_row skipped "not checked" "run with --remote"
+    fi
+
+    echo
+    echo "Notifications"
+    if [ "$notifications_configured" = "1" ]; then
+      doctor_local_row ok "configured"
+    elif [ "$explain" = "1" ]; then
+      doctor_local_row info "not configured"
+      cat <<'EOF'
+
+  Optional. Mobile pushes when a session needs input or finishes.
+
+  Enable:
+    fieldwork setup-notify
+EOF
+    else
+      doctor_local_row info "not configured" "optional"
+    fi
+
+    echo
+    echo "Summary"
+    if [ "$failed" = "0" ]; then
+      doctor_local_row ok "Local install is ready."
+    else
+      doctor_local_row needs "Local install needs attention."
+    fi
+    echo
+    echo "Next"
+    echo "  $next_action"
+    return "$failed"
+  fi
+
+  local failed=0
+  local next_action=""
+  local after_action="fieldwork setup"
+  local doctor_current_phase=""
+  local doctor_remote_active=0
+  local doctor_phase_pending_count=0
+  local -a doctor_phase_pending_labels=()
+  local -a doctor_phase_detail_labels=()
+  local -a doctor_phase_detail_whats=()
+  local -a doctor_phase_detail_whys=()
+  local -a doctor_phase_detail_fixes=()
+  local -a doctor_phase_detail_safes=()
+	  local -a doctor_remaining_phases=()
+	  local -a doctor_remaining_labels=()
+	  local -a doctor_remaining_actions=()
+	  doctor_row() {
+	    fieldwork_status_stop_renderer
+	    local status="$1"
+	    local label="$2"
+	    local detail="${3:-}"
+	    local mark
+	    case "$status" in
+	      ok) mark="✓" ;;
+	      needs) mark="!" ;;
+	      skipped) mark="–" ;;
+	      info) mark="·" ;;
+	      *) mark="$status" ;;
+	    esac
+	    if [ -n "$detail" ]; then
+	      printf '  %s  %-22s %s\n' "$mark" "$label" "$detail"
+	    else
+	      printf '  %s  %s\n' "$mark" "$label"
+	    fi
+	    if [ "${doctor_remote_active:-0}" = "1" ]; then
+	      fieldwork_status_start "checking ${doctor_current_phase:-VPS}"
+	    fi
+	  }
+	  doctor_explain_issue() {
+	    local what="$1"
+	    local why="$2"
+	    local fix="$3"
+	    local safe="$4"
+	    [ "$explain" = "1" ] || return 0
+	    echo
+	    echo "    What: $what"
+	    echo "    Why: $why"
+	    echo "    Fix: $fix"
+	    echo "    Safe to rerun: $safe"
+	  }
+	  set_next_action() {
+	    [ -n "$next_action" ] || next_action="$1"
+	  }
+  doctor_kv_value() {
+    local body="$1"
+    local key="$2"
+    printf '%s\n' "$body" | sed -n "s/^$key=//p" | head -n 1
+  }
+  doctor_summary_label() {
+    local label="$1"
+    case "$label" in
+      missing\ *) label="${label#missing }" ;;
+      *" missing or not writable") label="${label% missing or not writable}" ;;
+      *" confirmation needed") label="${label% needed}" ;;
+      *" needed") label="${label% needed}" ;;
+      *" not authenticated") label="${label% not authenticated} login" ;;
+      *" not configured") label="${label% not configured}" ;;
+      *" not ready"*) label="${label%% is not ready*}" ;;
+      *" missing"*) label="${label%% missing*}" ;;
+      *" not executable") label="${label% not executable}" ;;
+      *" skipped"*) label="remote checks" ;;
+      cannot\ reach\ VPS*) label="VPS SSH reachability" ;;
+    esac
+    printf '%s\n' "$label"
+  }
+  doctor_record_pending() {
+    local label="$1"
+    local action="$2"
+    local what="$3"
+    local why="$4"
+    local fix="$5"
+    local safe="$6"
+    local summary_label
+    summary_label="$(doctor_summary_label "$label")"
+    doctor_remaining_phases+=("${doctor_current_phase:-Doctor}")
+    doctor_remaining_labels+=("$summary_label")
+    doctor_remaining_actions+=("$action")
+    doctor_phase_pending_labels+=("$summary_label")
+    doctor_phase_pending_count=$((doctor_phase_pending_count + 1))
+    doctor_phase_detail_labels+=("$summary_label")
+    doctor_phase_detail_whats+=("$what")
+    doctor_phase_detail_whys+=("$why")
+    doctor_phase_detail_fixes+=("$fix")
+    doctor_phase_detail_safes+=("$safe")
+    set_next_action "$action"
+  }
+	  finish_doctor_phase() {
+	    [ -n "$doctor_current_phase" ] || return 0
+	    doctor_current_phase=""
+	    doctor_phase_pending_count=0
+	    doctor_phase_pending_labels=()
+    doctor_phase_detail_labels=()
+    doctor_phase_detail_whats=()
+    doctor_phase_detail_whys=()
+    doctor_phase_detail_fixes=()
+    doctor_phase_detail_safes=()
+	  }
+	  doctor_section() {
+	    fieldwork_status_stop_renderer
+	    finish_doctor_phase
+	    echo
+	    echo "$1"
+	    doctor_current_phase="$1"
+	    if [ "${doctor_remote_active:-0}" = "1" ]; then
+	      fieldwork_status_start "checking $1"
+	    fi
+	  }
+	  doctor_ok() {
+	    doctor_row ok "$1"
+	  }
+	  doctor_info() {
+	    doctor_row info "$1" "$2"
+	  }
+	  doctor_manual() {
+	    local label="$1"
+    local next="$2"
+    local what="$3"
+	    local why="$4"
+	    local fix="$5"
+	    local safe="$6"
+	    doctor_row needs "$label"
+	    doctor_explain_issue "$what" "$why" "$fix" "$safe"
+	    doctor_record_pending "$label" "$next" "$what" "$why" "$fix" "$safe"
+	  }
+	  doctor_needs() {
+    local label="$1"
+    local next="$2"
+    local what="$3"
+	    local why="$4"
+	    local fix="$5"
+	    local safe="$6"
+	    doctor_row needs "$label"
+	    failed=1
+	    doctor_explain_issue "$what" "$why" "$fix" "$safe"
+	    doctor_record_pending "$label" "$next" "$what" "$why" "$fix" "$safe"
+	  }
+	  doctor_fail() {
+    local label="$1"
+    local next="$2"
+    local what="$3"
+	    local why="$4"
+	    local fix="$5"
+	    local safe="$6"
+	    doctor_row needs "$label" "$what"
+	    failed=1
+	    doctor_explain_issue "$what" "$why" "$fix" "$safe"
+	    doctor_record_pending "$label" "$next" "$what" "$why" "$fix" "$safe"
+	  }
+  print_doctor_remaining() {
+    local i printed phase label action last_phase step
+    printed=0
+    last_phase=""
+    step=0
+    for i in "${!doctor_remaining_labels[@]}"; do
+      phase="${doctor_remaining_phases[$i]}"
+      label="${doctor_remaining_labels[$i]}"
+      action="${doctor_remaining_actions[$i]}"
+      if [ -n "$action" ] && [ "$action" = "$next_action" ]; then
+        continue
+      fi
+      if [ "$printed" = "0" ]; then
+        echo
+        label_line "Remaining after that"
+        printed=1
+      fi
+      if [ "$phase" != "$last_phase" ]; then
+        label_line "$phase" "  "
+        last_phase="$phase"
+        step=1
+      else
+        step=$((step + 1))
+      fi
+      if [ -n "$action" ]; then
+        echo "    $step. $label -> $action"
+      else
+        echo "    $step. $label"
+      fi
+    done
+  }
+
+	  echo "Fieldwork doctor"
+	  echo
+		  echo "Local"
+		  local tool missing_tools=""
+	  for tool in bash git jq ssh scp sed grep rsync; do
+	    if ! command -v "$tool" >/dev/null 2>&1; then
+	      if [ -n "$missing_tools" ]; then
+	        missing_tools="$missing_tools, $tool"
+	      else
+	        missing_tools="$tool"
+	      fi
+	    fi
+		  done
+		  if [ -z "$missing_tools" ]; then
+		    doctor_row ok "workstation tools" "bash, git, jq, ssh, scp, sed, grep, rsync"
+		  else
+		    doctor_needs "workstation tools" "install missing local tools" "missing: $missing_tools" "Fieldwork uses local shell tooling for setup, SSH, sync, JSON parsing, and checks" "install $missing_tools with your system package manager, then rerun fieldwork doctor" "yes"
+		  fi
+	  if command -v fieldwork >/dev/null 2>&1 || [ -x "$HOME/.local/bin/fieldwork" ] || [ -x "$FIELDWORK_ROOT/bin/fieldwork" ]; then
+	    doctor_row ok "Fieldwork command"
+	  else
+	    doctor_needs "Fieldwork command" "bash install.sh" "the fieldwork command is not on PATH or installed under ~/.local/bin" "setup, sync, and onboarding expect the local CLI to be installed" "run bash install.sh" "yes"
+	  fi
+	  if { [ -f "$HOME/.claude/CLAUDE.md" ] && [ -f "$HOME/.claude/settings.json" ] && [ -x "$HOME/.fieldwork/scripts/fieldwork-pr-submit" ]; } \
+	    || { [ -f "$FIELDWORK_ROOT/lib/claude/CLAUDE.md" ] && [ -f "$FIELDWORK_ROOT/lib/claude/settings.json" ] && [ -x "$FIELDWORK_ROOT/lib/scripts/fieldwork-pr-submit" ]; }; then
+	    doctor_row ok "Fieldwork helper files"
+	  else
+	    doctor_needs "Fieldwork helper files" "bash install.sh" "Fieldwork helper files are missing from ~/.fieldwork or Claude config is missing from ~/.claude" "Fieldwork sessions use these helpers for launch, verify, prepare, and PR submission" "run bash install.sh" "yes"
+	  fi
+		  [ -f "$HOME/.fieldwork/infra/fieldwork-pr-broker/server.py" ] || [ -f "$FIELDWORK_ROOT/lib/broker/server.py" ] \
+		    && doctor_row ok "Broker server" \
+		    || doctor_needs "Broker server" "restore or reclone Fieldwork" "the broker server source is missing" "the VPS install copies this broker into the separate token-owning service" "restore or reclone the Fieldwork checkout, then rerun doctor" "yes"
+		  [ -d "$HOME/.fieldwork/templates/repo/.claude" ] || [ -d "$FIELDWORK_ROOT/lib/templates/repo/.claude" ] \
+		    && doctor_row ok "Repo template" \
+		    || doctor_needs "Repo template" "restore or reclone Fieldwork" "the per-repo template tree is missing" "onboarding cannot create the initial Claude/PR config without templates" "restore or reclone the Fieldwork checkout, then rerun doctor" "yes"
+
+  if [ "$remote" = 1 ]; then
+    doctor_remote_active=1
+    doctor_section "VPS"
+    if ssh -o BatchMode=yes -o ConnectTimeout=5 "$FIELDWORK_SSH_HOST" "true" >/dev/null 2>&1; then
+      doctor_ok "VPS reachable over SSH"
+      local remote_agents
+      remote_agents="$(remote_agents_value)"
+      case "$remote_agents" in
+        claude|codex|claude,codex) doctor_ok "configured agents: $remote_agents" ;;
+        *) doctor_needs "configured agents invalid" "fieldwork setup --agent claude" "~/.fieldwork/agents is missing or invalid" "doctor needs to know which agent surfaces should be checked" "rerun setup with --agent claude, --agent codex, or --agent both" "yes" ;;
+      esac
+      if fieldwork_ssh_prepare_mux; then
+        if [ "$explain" = "1" ]; then
+          if fieldwork_ssh_mux_active; then
+            doctor_info "SSH multiplexing" "enabled; active control socket; dir $(display_local_path "$(fieldwork_ssh_control_dir)")"
+          else
+            doctor_info "SSH multiplexing" "enabled; no active control socket; dir $(display_local_path "$(fieldwork_ssh_control_dir)")"
+          fi
+        fi
+      elif [ "$explain" = "1" ]; then
+        doctor_info "SSH multiplexing" "$(fieldwork_ssh_mux_status); dir $(display_local_path "$(fieldwork_ssh_control_dir)")"
+      fi
+      if [ "$explain" = "1" ]; then
+        doctor_info "setup timing" "FIELDWORK_SETUP_TIMING=1 fieldwork setup --skip-sync"
+      fi
+      local remote_gh=0
+
+      doctor_section "Remote Fieldwork"
+      if agents_include "$remote_agents" claude; then
+        ssh "$FIELDWORK_SSH_HOST" "export PATH=\"\$HOME/.local/bin:\$PATH\"; command -v claude >/dev/null 2>&1" \
+          && doctor_ok "remote Claude Code CLI installed" \
+          || doctor_needs "remote Claude Code CLI missing" "run ssh -t $FIELDWORK_SSH_HOST 'cd ~/fieldwork && ./bin/fieldwork bootstrap-vps'" "the VPS cannot find the claude command" "Fieldwork starts Claude Code remote-control sessions from systemd user units" "sync Fieldwork if needed, then run ssh -t $FIELDWORK_SSH_HOST 'cd ~/fieldwork && ./bin/fieldwork bootstrap-vps'" "yes"
+      else
+        doctor_row skipped "remote Claude Code CLI" "not configured"
+      fi
+      if agents_include "$remote_agents" codex; then
+        local remote_codex_version_text remote_codex_version
+        remote_codex_version_text="$(ssh "$FIELDWORK_SSH_HOST" "export PATH=\"\$HOME/.local/bin:/usr/local/bin:\$PATH\"; command -v codex >/dev/null 2>&1 && codex --version" 2>/dev/null | head -n 1 | tr -d "\r" || true)"
+        remote_codex_version="$(codex_version_from_text "$remote_codex_version_text")"
+        if [ -n "$remote_codex_version_text" ] && [ -n "$remote_codex_version" ]; then
+          doctor_ok "remote Codex CLI installed on SSH PATH"
+          if codex_version_ge "$remote_codex_version" "$(codex_min_version)"; then
+            doctor_ok "remote Codex CLI version $remote_codex_version"
+          else
+            doctor_needs "remote Codex CLI $remote_codex_version older than $(codex_min_version)" "$(codex_upgrade_command)" "the VPS has Codex $remote_codex_version on the SSH login PATH" "Codex Desktop SSH uses the remote codex binary to start its app server; stale versions can expose missing remote-project or auth bugs" "upgrade Codex with the command above, then reconnect the Codex Desktop SSH host" "yes"
+          fi
+        else
+          doctor_needs "remote Codex CLI missing from SSH PATH" "fieldwork setup --agent codex" "the Codex Desktop SSH login shell cannot resolve codex" "Codex Desktop starts the remote app server by running the real codex binary over SSH" "install the official Codex CLI and ensure SSH login PATH can find it" "yes"
+        fi
+      fi
+      if ssh "$FIELDWORK_SSH_HOST" "export PATH=\"\$HOME/.local/bin:\$PATH\"; command -v gh >/dev/null 2>&1"; then
+        remote_gh=1
+        doctor_ok "remote GitHub CLI installed"
+      else
+        doctor_needs "remote GitHub CLI missing" "run ssh -t $FIELDWORK_SSH_HOST 'cd ~/fieldwork && ./bin/fieldwork bootstrap-vps'" "the VPS cannot find gh" "onboard preflights use gh to resolve repos and inspect PRs" "sync Fieldwork if needed, then run ssh -t $FIELDWORK_SSH_HOST 'cd ~/fieldwork && ./bin/fieldwork bootstrap-vps'" "yes"
+      fi
+      local projects_dir_q projects_mkdir_next
+      projects_dir_q="$(shell_quote "$FIELDWORK_PROJECTS_DIR")"
+      projects_mkdir_next="run ssh -t $FIELDWORK_SSH_HOST \"mkdir -p $projects_dir_q\""
+      remote_projects_dir_exists \
+        && doctor_ok "remote projects dir exists" \
+        || doctor_needs "remote projects dir missing" "$projects_mkdir_next" "the projects directory does not exist" "Fieldwork keeps one repo checkout per onboarded project under this directory" "$projects_mkdir_next" "yes"
+
+      if agents_include "$remote_agents" codex; then
+        doctor_section "Codex Desktop"
+        [ "$explain" = "1" ] && doctor_info "purpose" "verify the local Codex Desktop SSH host and repo-folder state without printing Codex account data"
+        local codex_desktop_snapshot codex_desktop_state codex_host_present codex_host_selected codex_host_auto codex_host_allowed codex_folder_present codex_folder_path
+        codex_desktop_snapshot="$(codex_local_app_state_snapshot "$repo_slug")"
+        codex_desktop_state="$(doctor_kv_value "$codex_desktop_snapshot" STATE)"
+        codex_host_present="$(doctor_kv_value "$codex_desktop_snapshot" HOST_PRESENT)"
+        codex_host_selected="$(doctor_kv_value "$codex_desktop_snapshot" HOST_SELECTED)"
+        codex_host_auto="$(doctor_kv_value "$codex_desktop_snapshot" HOST_AUTO_CONNECT)"
+        codex_host_allowed="$(doctor_kv_value "$codex_desktop_snapshot" HOST_REMOTE_ALLOWED)"
+        codex_folder_present="$(doctor_kv_value "$codex_desktop_snapshot" FOLDER_PRESENT)"
+        codex_folder_path="$FIELDWORK_PROJECTS_DIR/$repo_slug"
+        case "$codex_desktop_state" in
+          ok)
+            if [ "$codex_host_present" = "yes" ]; then
+              doctor_ok "Codex SSH host known to Desktop"
+            else
+              doctor_manual "Codex Desktop SSH host missing" "open Codex Desktop, add an SSH connection named $FIELDWORK_SSH_HOST as user $FIELDWORK_REMOTE_USER" "Codex Desktop global state has no safe reference to $FIELDWORK_SSH_HOST" "Codex mobile controls the Desktop host; Desktop must first know the VPS SSH connection" "open Codex Desktop Settings > Connections, add $FIELDWORK_SSH_HOST, then rerun fieldwork doctor --remote${repo_slug:+ $repo_slug} --explain" "yes"
+            fi
+            if [ "$codex_host_selected" = "yes" ]; then
+              doctor_ok "Codex SSH host selected"
+            else
+              doctor_manual "Codex SSH host not selected" "select the configured VPS SSH connection ($FIELDWORK_SSH_HOST) in Codex Desktop Connections -> SSH${repo_slug:+, then reopen $codex_folder_path}" "local Codex state does not show $FIELDWORK_SSH_HOST as the selected SSH host" "mobile prompts can otherwise run on the local Mac/Windows host or a stale non-VPS context, where Fieldwork runner sockets are not available" "select the VPS host${repo_slug:+, reopen the repo folder}, then rerun fieldwork doctor --remote${repo_slug:+ $repo_slug} --explain" "yes"
+            fi
+            if [ "$codex_host_auto" = "yes" ]; then
+              doctor_ok "Codex SSH host auto-connect enabled"
+            else
+              doctor_info "Codex SSH host auto-connect" "not enabled in local Desktop state"
+            fi
+            if [ "$codex_host_allowed" = "yes" ]; then
+              doctor_ok "Codex SSH host allowed for signed-in devices"
+            else
+              doctor_manual "Codex Desktop remote access not allowed" "enable remote access for $FIELDWORK_SSH_HOST in Codex Desktop" "local Codex state does not mark this SSH host as allowed for signed-in devices" "without Desktop remote access, ChatGPT mobile may only show the Mac host or show the VPS path as unavailable" "enable remote access in Codex Desktop, then keep Desktop connected while using mobile" "yes"
+            fi
+            if [ -n "$repo_slug" ]; then
+              if [ "$codex_folder_present" = "yes" ]; then
+                doctor_ok "Codex Desktop repo folder recorded"
+              else
+                doctor_manual "Codex Desktop repo folder not opened" "open Codex Desktop, connect $FIELDWORK_SSH_HOST, then open $codex_folder_path" "local Codex state has the SSH host but no record of this VPS checkout folder" "Codex mobile does not create Claude-style vps-$repo_slug sessions; it needs Desktop to open the remote project folder first" "open the folder in Codex Desktop, then rerun fieldwork doctor --remote $repo_slug --explain" "yes"
+              fi
+            fi
+            ;;
+          missing)
+            doctor_manual "Codex Desktop state missing" "open Codex Desktop, sign in, and add SSH host $FIELDWORK_SSH_HOST" "the local Codex Desktop state file was not found" "Fieldwork can prepare the VPS, but Codex Desktop owns live SSH project state" "open Codex Desktop and add the SSH host; then rerun fieldwork doctor --remote${repo_slug:+ $repo_slug} --explain" "yes"
+            ;;
+          *)
+            doctor_manual "Codex Desktop state unreadable" "open Codex Desktop and reconnect $FIELDWORK_SSH_HOST" "the local Codex Desktop state file exists but could not be parsed safely" "Fieldwork only reads safe state booleans; it will not inspect auth files or raw sessions" "restart Codex Desktop if needed, then rerun fieldwork doctor --remote${repo_slug:+ $repo_slug} --explain" "yes"
+            ;;
+        esac
+      fi
+
+	      doctor_section "Account access"
+      if agents_include "$remote_agents" claude; then
+        ssh "$FIELDWORK_SSH_HOST" "test -f ~/.fieldwork/state/claude-login-confirmed" \
+          && doctor_ok "Claude Code login confirmed" \
+          || doctor_manual "Claude Code login confirmation needed" "ssh -t $FIELDWORK_SSH_HOST '~/.local/bin/claude login'" "Fieldwork has not recorded Claude Code login confirmation on the VPS" "long-running remote-control sessions need Claude Code authenticated on the VPS" "run ssh -t $FIELDWORK_SSH_HOST '~/.local/bin/claude login', then confirm completion in fieldwork setup" "yes"
+      else
+        doctor_row skipped "Claude Code login" "not configured"
+      fi
+      if agents_include "$remote_agents" codex; then
+        local codex_login_snapshot codex_login_state
+        codex_login_snapshot="$(codex_remote_login_snapshot)"
+        codex_login_state="$(doctor_kv_value "$codex_login_snapshot" CODEX_LOGIN_STATE)"
+        case "$codex_login_state" in
+          logged_in)
+            doctor_ok "Codex login confirmed by Codex CLI"
+            ;;
+          marker_only)
+            doctor_manual "Codex login live status unavailable" "ssh -t $FIELDWORK_SSH_HOST 'export PATH=\"\$HOME/.local/bin:/usr/local/bin:\$PATH\"; codex login --device-auth'" "Fieldwork recorded a prior Codex login, but Codex CLI did not return a live login status" "Codex Desktop SSH sessions need the VPS Linux user authenticated with Codex; a marker alone cannot prove the current app session is healthy" "rerun device-code login, then reconnect Codex Desktop to $FIELDWORK_SSH_HOST" "yes"
+            ;;
+          logged_out)
+            doctor_manual "Codex login not authenticated" "ssh -t $FIELDWORK_SSH_HOST 'export PATH=\"\$HOME/.local/bin:/usr/local/bin:\$PATH\"; codex login --device-auth'" "Codex CLI reported that the VPS user is not logged in" "Fieldwork's marker is ignored when Codex itself reports logged out" "complete Codex device-code login on the VPS, then reconnect Codex Desktop" "yes"
+            ;;
+          *)
+            doctor_manual "Codex login status unknown" "ssh -t $FIELDWORK_SSH_HOST 'export PATH=\"\$HOME/.local/bin:/usr/local/bin:\$PATH\"; codex login --device-auth'" "Codex CLI did not provide a usable login status" "Codex Desktop SSH sessions need Codex authenticated for this Linux user" "complete Codex device-code login on the VPS, then rerun fieldwork doctor --remote${repo_slug:+ $repo_slug} --explain" "yes"
+            ;;
+        esac
+      fi
+      if [ "$remote_gh" = "1" ]; then
+        ssh "$FIELDWORK_SSH_HOST" "export PATH=\"\$HOME/.local/bin:\$PATH\"; gh auth status >/dev/null 2>&1" \
+          && doctor_ok "GitHub CLI authenticated" \
+          || doctor_manual "GitHub CLI login needed" "ssh -t $FIELDWORK_SSH_HOST 'gh auth login'" "gh is installed but not logged in on the VPS" "onboarding needs gh auth for repo-resolution preflights before the broker opens PRs" "run ssh -t $FIELDWORK_SSH_HOST 'gh auth login'" "yes"
+	      fi
+
+      # Opt-in because the probe runs claude headless on the VPS: it spends
+      # model tokens and needs a confirmed login. It exists because claude CLI
+      # updates have changed sandbox.excludedCommands semantics before; if
+      # exclusions stop rescuing the fieldwork clients, remote sessions lose
+      # their only working Bash commands.
+      if [ "$session_probe" = "1" ]; then
+        doctor_section "Session probe"
+        [ "$explain" = "1" ] && doctor_info "purpose" "run claude headless inside a NoNewPrivs + userns cage (the agent's runtime) and confirm the fieldwork clients still skip the per-call sandbox"
+        if ! agents_include "$remote_agents" claude; then
+          doctor_row skipped "sandbox excludedCommands semantics" "Claude not configured"
+        elif ! ssh "$FIELDWORK_SSH_HOST" "test -f ~/.fieldwork/state/claude-login-confirmed"; then
+          doctor_manual "session probe needs Claude Code login" "ssh -t $FIELDWORK_SSH_HOST '~/.local/bin/claude login'" "the probe runs claude headless on the VPS, which requires a confirmed login" "without login the probe can only return inconclusive" "log in, then rerun fieldwork doctor --remote --session-probe" "yes"
+        else
+          local probe_out probe_state probe_detail
+          probe_out="$(ssh "$FIELDWORK_SSH_HOST" "\"\$HOME/.fieldwork/scripts/fieldwork-session-probe\"" 2>/dev/null || true)"
+          probe_state="$(doctor_kv_value "$probe_out" probe)"
+          probe_detail="$(doctor_kv_value "$probe_out" detail)"
+          case "$probe_state" in
+            pass)
+              doctor_ok "sandbox excludedCommands semantics hold on the installed claude CLI"
+              ;;
+            fail)
+              doctor_needs "sandbox excludedCommands no longer rescue the fieldwork clients" "inspect ~/.claude/settings.json sandbox.excludedCommands against the installed claude version" "${probe_detail:-the excluded client hit the per-call sandbox}" "remote sessions lose their only working Bash commands when exclusions break, so verify and PR delivery dead-end" "compare the installed claude version with the last known-good one, adjust the exclusion patterns if their matching changed, then rerun fieldwork doctor --remote --session-probe" "yes"
+              if [ "$explain" = "1" ]; then
+                printf '%s\n' "$probe_out" | sed -n -e '/^detail_/s/^/      /p' -e '/^raw=/s/^/      /p'
+              fi
+              ;;
+            *)
+              doctor_manual "session probe inconclusive" "fieldwork doctor --remote --session-probe --explain" "${probe_detail:-the probe produced no usable transcript}" "inconclusive is not proof of drift; it usually means login expiry, a startup abort, or model deviation" "check claude login on the VPS and rerun; raw probe lines print with --explain" "yes"
+              if [ "$explain" = "1" ]; then
+                printf '%s\n' "$probe_out" | sed -n -e '/^detail_/s/^/      /p' -e '/^raw=/s/^/      /p'
+              fi
+              ;;
+          esac
+        fi
+      fi
+
+	      doctor_section "Notifications"
+	      [ "$explain" = "1" ] && doctor_info "purpose" "optional mobile pushes from Claude lifecycle hooks; Codex lifecycle notifications are not wired in this milestone"
+	      if [ -f "$HOME/.fieldwork/notify.env" ] && grep -Eq '^(NTFY_TOPIC|TG_BOT_TOKEN)=.+' "$HOME/.fieldwork/notify.env"; then
+	        doctor_ok "local notifications configured"
+	      else
+	        doctor_info "local" "not configured; optional — fieldwork setup-notify"
+	      fi
+	      ssh "$FIELDWORK_SSH_HOST" "test -f ~/.fieldwork/notify.env && grep -Eq '^(NTFY_TOPIC|TG_BOT_TOKEN)=.+' ~/.fieldwork/notify.env" \
+	        && doctor_ok "remote notifications configured" \
+	        || doctor_info "remote" "not configured; optional — fieldwork setup-notify --remote"
+
+	      doctor_section "Remote services"
+	      [ "$explain" = "1" ] && doctor_info "purpose" "verify Fieldwork user services and runner sockets"
+      if agents_include "$remote_agents" claude; then
+        ssh "$FIELDWORK_SSH_HOST" "test -f ~/.config/systemd/user/fieldwork-agent@.service" \
+          && doctor_ok "fieldwork-agent@ systemd user unit installed" \
+          || doctor_manual "fieldwork-agent@ unit missing; rerun bootstrap after Fieldwork install" "run fieldwork sync-vps, then ssh -t $FIELDWORK_SSH_HOST 'cd ~/fieldwork && ./bin/fieldwork bootstrap-vps'" "the per-repo systemd template is missing" "fieldwork onboard enables fieldwork-agent@<repo> from this template" "run fieldwork sync-vps, then rerun bootstrap-vps on the VPS" "yes"
+      else
+        doctor_row skipped "fieldwork-agent@ unit" "not configured for Codex-only setup"
+      fi
+
+	      doctor_section "Verify runner"
+	      [ "$explain" = "1" ] && doctor_info "purpose" "verify /verify-before-pr can confine repo-controlled lint/test steps"
+      # The /verify-before-pr skill invokes ~/.local/bin/fieldwork-verify (a
+      # unix-socket client). The client connects to fieldwork-verify-runner.sock,
+      # which systemd activates per-connection. The runner runs the actual
+      # pipeline under the user manager (outside the agent's userns + NNP),
+      # so its bwrap-confined inner steps can create user namespaces.
+      ssh "$FIELDWORK_SSH_HOST" "test -x ~/.local/bin/fieldwork-verify" \
+        && doctor_ok "fieldwork-verify client installed" \
+        || doctor_manual "fieldwork-verify client missing" "fieldwork sync-vps" "the verify client is not symlinked into ~/.local/bin" "without the client, /verify-before-pr exits with command-not-found and the agent cannot ship" "run fieldwork sync-vps to re-link the client" "yes"
+      ssh "$FIELDWORK_SSH_HOST" "test -x ~/.local/bin/fieldwork-verify-runner && test -x ~/.fieldwork/scripts/fieldwork-verify-pipeline" \
+        && doctor_ok "fieldwork-verify-runner + pipeline installed" \
+        || doctor_manual "fieldwork-verify-runner or pipeline missing" "fieldwork sync-vps" "the runner script (or its pipeline backend) is not on disk" "without the runner, the socket has nothing to invoke when the client connects" "run fieldwork sync-vps to re-link the runner" "yes"
+      # Verify the socket unit is installed in ~/.config/systemd/user, enabled,
+      # and actively listening. The "active" + "listening" pair distinguishes
+      # "user copied unit files but didn't enable" from "enabled but daemon-reload
+      # not run since file changed".
+      runner_install_cmd="ssh -t $FIELDWORK_SSH_HOST 'cp ~/.fieldwork/infra/fieldwork-verify-runner.socket ~/.fieldwork/infra/fieldwork-verify-runner@.service ~/.config/systemd/user/ && systemctl --user daemon-reload && systemctl --user enable --now fieldwork-verify-runner.socket'"
+      ssh "$FIELDWORK_SSH_HOST" "test -f ~/.config/systemd/user/fieldwork-verify-runner.socket && test -f ~/.config/systemd/user/fieldwork-verify-runner@.service" \
+        && doctor_ok "verify runner user units installed" \
+        || doctor_manual \
+             "verify runner user units missing from ~/.config/systemd/user" \
+             "$runner_install_cmd" \
+             "the socket + template service files have not been copied into the user systemd directory" \
+             "without them, systemctl --user can't activate the socket and the verify client has nothing to talk to" \
+             "copy the units, daemon-reload, and enable the socket; the command above does all three" \
+             "yes"
+      if ssh "$FIELDWORK_SSH_HOST" "systemctl --user is-active --quiet fieldwork-verify-runner.socket"; then
+        runner_socket_path="$(ssh "$FIELDWORK_SSH_HOST" 'echo "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/fieldwork-verify.sock"' 2>/dev/null | tr -d "\r\n")"
+        if ssh "$FIELDWORK_SSH_HOST" "test -S '$runner_socket_path'"; then
+          doctor_ok "verify runner socket active and listening at $runner_socket_path"
+        else
+          doctor_manual \
+            "verify runner socket unit is active but no socket file at $runner_socket_path" \
+            "ssh -t $FIELDWORK_SSH_HOST 'systemctl --user daemon-reload && systemctl --user restart fieldwork-verify-runner.socket'" \
+            "systemd reports the unit active but the socket inode is missing" \
+            "the verify client connects to this socket; without it, /verify-before-pr fails fast with a clear error" \
+            "daemon-reload + restart the socket; if still failing, check journalctl --user -u fieldwork-verify-runner.socket" \
+            "yes"
+        fi
+      else
+        doctor_manual \
+          "verify runner socket not active" \
+          "ssh -t $FIELDWORK_SSH_HOST 'systemctl --user daemon-reload && systemctl --user enable --now fieldwork-verify-runner.socket'" \
+          "fieldwork-verify-runner.socket is not enabled or not started" \
+          "the verify client connects to this socket; without it, /verify-before-pr fails fast" \
+          "daemon-reload + enable --now; journalctl --user -u fieldwork-verify-runner.socket shows activation errors" \
+          "yes"
+      fi
+      prepare_runner_install_cmd="ssh -t $FIELDWORK_SSH_HOST 'cp ~/.fieldwork/infra/fieldwork-pr-prepare-runner.socket ~/.fieldwork/infra/fieldwork-pr-prepare-runner@.service ~/.config/systemd/user/ && systemctl --user daemon-reload && systemctl --user enable --now fieldwork-pr-prepare-runner.socket'"
+      ssh "$FIELDWORK_SSH_HOST" "test -x ~/.local/bin/fieldwork-pr-prepare && test -x ~/.local/bin/fieldwork-pr-prepare-runner && test -x ~/.fieldwork/scripts/fieldwork-pr-prepare-impl" \
+        && doctor_ok "fieldwork-pr-prepare client + runner installed" \
+        || doctor_manual "fieldwork-pr-prepare client or runner missing" "fieldwork sync-vps" "the PR prepare delivery client or runner is missing" "agents need this socket client to commit through the controlled runner before broker submit" "run fieldwork sync-vps to re-link the prepare client and runner" "yes"
+      ssh "$FIELDWORK_SSH_HOST" "test -f ~/.config/systemd/user/fieldwork-pr-prepare-runner.socket && test -f ~/.config/systemd/user/fieldwork-pr-prepare-runner@.service" \
+        && doctor_ok "PR prepare runner user units installed" \
+        || doctor_manual "PR prepare runner user units missing" "$prepare_runner_install_cmd" "the PR prepare socket + template service files have not been copied into the user systemd directory" "without them, fieldwork-pr-prepare cannot reach the controlled commit runner" "copy the units, daemon-reload, and enable the socket; the command above does all three" "yes"
+      prepare_runner_socket_path="$(ssh "$FIELDWORK_SSH_HOST" 'echo "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/fieldwork-pr-prepare.sock"' 2>/dev/null | tr -d "\r\n")"
+      ssh "$FIELDWORK_SSH_HOST" "systemctl --user is-active --quiet fieldwork-pr-prepare-runner.socket && test -S '$prepare_runner_socket_path'" \
+        && doctor_ok "PR prepare runner socket active and listening at $prepare_runner_socket_path" \
+        || doctor_manual "PR prepare runner socket not active" "ssh -t $FIELDWORK_SSH_HOST 'systemctl --user daemon-reload && systemctl --user enable --now fieldwork-pr-prepare-runner.socket'" "fieldwork-pr-prepare-runner.socket is not enabled, not started, or not listening" "fieldwork-pr-prepare connects to this socket before broker submit; Codex also needs it allowed through its sandbox" "daemon-reload + enable --now; check journalctl --user -u fieldwork-pr-prepare-runner.socket if it still fails" "yes"
+      remote_bwrap_installed() {
+        ssh "$FIELDWORK_SSH_HOST" "command -v bwrap >/dev/null 2>&1"
+      }
+      remote_bwrap_probe_ok() {
+        ssh "$FIELDWORK_SSH_HOST" "bwrap --unshare-user --unshare-net --unshare-pid --unshare-uts --unshare-ipc --ro-bind / / --tmpfs /tmp --dev /dev --proc /proc -- /bin/true >/dev/null 2>&1"
+      }
+      remote_systemd_run_user_probe_ok() {
+        ssh "$FIELDWORK_SSH_HOST" "command -v systemd-run >/dev/null 2>&1 && systemd-run --user --scope --quiet -p PrivateNetwork=yes -p PrivateTmp=yes -- /bin/true >/dev/null 2>&1"
+      }
+	      if remote_bwrap_installed; then
+	        if remote_bwrap_probe_ok; then
+	          doctor_ok "verify inner sandbox ready (bwrap with unprivileged user namespaces)"
+	        else
+	          systemd_run_note=""
+	          if remote_systemd_run_user_probe_ok; then
+	            doctor_info "systemd-run fallback" "launches, but is not accepted as verify-ready because it is not bwrap-equivalent"
+	            systemd_run_note=" systemd-run --user launches on this host, but Fieldwork does not count it as verify-ready because its isolation is not equivalent to bwrap."
+	          fi
+	          # Read BOTH userns sysctls. Ubuntu 24.04+ adds
+	          # kernel.apparmor_restrict_unprivileged_userns on top of
+	          # kernel.unprivileged_userns_clone. We never recommend disabling
+	          # the AppArmor restriction system-wide; instead we ship a per-
+	          # binary profile that grants `userns` to /usr/bin/bwrap only.
+	          userns_clone="$(ssh "$FIELDWORK_SSH_HOST" "cat /proc/sys/kernel/unprivileged_userns_clone 2>/dev/null" || echo "?")"
+	          userns_apparmor="$(ssh "$FIELDWORK_SSH_HOST" "cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null" || echo "?")"
+	          bwrap_profile_loaded="$(ssh "$FIELDWORK_SSH_HOST" "sudo -n aa-status 2>/dev/null | grep -qx '.*fieldwork-bwrap.*' && echo yes || echo no" 2>/dev/null || echo "?")"
+	          if [ "$userns_clone" != "1" ]; then
+	            # Stock Ubuntu ships unprivileged_userns_clone=1; a 0 here means
+	            # the operator deliberately hardened. Fieldwork does not suggest
+	            # or apply a broad sysctl relaxation for this case.
+	            doctor_manual \
+	              "verify inner sandbox unavailable — kernel.unprivileged_userns_clone is disabled" \
+	              "choose a VPS policy where bwrap can create unprivileged user namespaces, then rerun fieldwork doctor --remote" \
+	              "kernel.unprivileged_userns_clone=0 — the kernel itself refuses unprivileged user-namespace creation" \
+	              "fieldwork-verify needs a bwrap inner sandbox to confine repo-controlled steps; without unprivileged userns there is no accepted mechanism.$systemd_run_note" \
+	              "Fieldwork will not apply or prescribe a global userns sysctl relaxation; use a host policy where bwrap's user namespace probe passes, then rerun doctor" \
+	              "no"
+	          elif [ "$userns_apparmor" = "1" ]; then
+	            # The narrow fix: load lib/apparmor/fieldwork-bwrap which grants
+	            # `userns` to /usr/bin/bwrap only. Every other unprivileged
+	            # userns consumer stays restricted.
+	            install_cmd="ssh -t $FIELDWORK_SSH_HOST \"sudo install -m 644 ~/fieldwork/lib/apparmor/fieldwork-bwrap /etc/apparmor.d/fieldwork-bwrap && sudo apparmor_parser -r /etc/apparmor.d/fieldwork-bwrap\""
+	            doctor_manual \
+	              "verify inner sandbox unavailable — AppArmor restricts bwrap from unprivileged userns" \
+	              "$install_cmd" \
+	              "kernel.apparmor_restrict_unprivileged_userns=1 (default on Ubuntu 24.04+); bwrap is not allowlisted" \
+	              "fieldwork-verify needs bwrap to create a user namespace for inner-step confinement. Fieldwork ships a narrow AppArmor profile (lib/apparmor/fieldwork-bwrap) that grants userns to /usr/bin/bwrap only — every other unprivileged userns consumer on the host stays restricted.$systemd_run_note" \
+	              "load the per-binary profile (one-time, persists), then rerun fieldwork doctor --remote. fieldwork-bwrap profile currently loaded: $bwrap_profile_loaded" \
+	              "yes"
+	          else
+	            doctor_manual \
+	              "verify inner sandbox unavailable — userns sysctls open but bwrap still fails" \
+	              "ssh $FIELDWORK_SSH_HOST 'bwrap --unshare-user --bind / / -- /bin/true 2>&1'" \
+	              "both userns sysctls allow it, yet bwrap returns a permission error — uncommon" \
+	              "verify cannot run without an accepted bwrap inner sandbox; root cause needs hand inspection (kernel build flags, another AppArmor profile attached to bwrap, seccomp default, …).$systemd_run_note" \
+	              "run the bwrap test command and report the exact error" \
+	              "yes"
+	          fi
+	        fi
+	      else
+	        systemd_run_note=""
+	        if remote_systemd_run_user_probe_ok; then
+	          doctor_info "systemd-run fallback" "launches, but is not accepted as verify-ready because it is not bwrap-equivalent"
+	          systemd_run_note=" systemd-run --user launches on this host, but Fieldwork does not count it as verify-ready because its isolation is not equivalent to bwrap."
+	        fi
+	        doctor_manual \
+	          "verify inner sandbox unavailable — bwrap is not installed" \
+	          "ssh -t $FIELDWORK_SSH_HOST 'sudo apt-get install -y bubblewrap'" \
+	          "bwrap is missing from the VPS" \
+	          "fieldwork-verify needs bwrap to run each repo-controlled step inside the accepted inner sandbox.$systemd_run_note" \
+	          "install bubblewrap on the VPS (sudo apt-get install -y bubblewrap), then rerun fieldwork doctor --remote" \
+	          "yes"
+	      fi
+
+	      doctor_section "PR broker"
+	      [ "$explain" = "1" ] && doctor_info "purpose" "verify the separate broker that owns the GitHub write token"
+      ssh "$FIELDWORK_SSH_HOST" "test -f /usr/local/sbin/rotate-pat" \
+        && doctor_ok "PR broker installer ran" \
+        || doctor_manual "PR broker install needed" "fieldwork setup" "the broker daemon and rotate-pat helper are not installed yet" "the broker is the only component with the GitHub write token, so onboarding cannot open PRs without it" "run fieldwork setup and complete Install PR services" "yes"
+      if ssh "$FIELDWORK_SSH_HOST" "test -S /run/fieldwork-pr-broker/fieldwork-pr.sock && test -w /run/fieldwork-pr-broker/fieldwork-pr.sock"; then
+        doctor_ok "PR broker socket present and writable"
+        broker_preflight_contract_ok \
+          && doctor_ok "PR broker preflight route current" \
+          || doctor_manual "PR broker preflight route stale or unavailable" "fieldwork sync-vps --force-install; $(remote_sudo_ssh_command "bash ~/.fieldwork/infra/fieldwork-pr-broker/install.sh")" "the broker socket did not answer /preflight with the current Fieldwork contract" "onboarding uses /preflight to check broker PAT reach before it creates an init PR" "sync Fieldwork to the VPS, reinstall the broker, then rerun fieldwork doctor --remote" "yes"
+      else
+        doctor_manual "PR broker socket missing or not writable" "fieldwork setup" "the agent user cannot write to the broker Unix socket" "onboarding submits PR requests through this socket instead of exposing the GitHub token to Claude sessions" "run fieldwork setup and complete Install PR services; reconnect if group membership is stale" "yes"
+      fi
+      ssh "$FIELDWORK_SSH_HOST" "test -f ~/.fieldwork/state/broker-pat-confirmed || sudo -n stat -c '%U:%G %a' /etc/fieldwork-pr-broker/gh-token 2>/dev/null | grep -qx 'fieldwork-pr-broker:fieldwork-pr-broker 600'" \
+        && doctor_ok "broker GitHub PAT stored" \
+        || doctor_manual "broker GitHub PAT not confirmed" "fieldwork setup" "setup has not confirmed a root-owned broker token" "the token must belong to the broker service user, not the agent session user" "run fieldwork setup and complete the Broker GitHub PAT step" "yes"
+
+      if agents_include "$remote_agents" codex; then
+        doctor_section "Codex runtime"
+        [ "$explain" = "1" ] && doctor_info "purpose" "verify Codex Desktop SSH sessions can run delivery clients through Codex's sandbox socket allowlist"
+        ssh "$FIELDWORK_SSH_HOST" "test \"\$(id -un)\" = $(shell_quote "$FIELDWORK_REMOTE_USER")" \
+          && doctor_ok "Codex SSH identity is $FIELDWORK_REMOTE_USER" \
+          || doctor_needs "Codex SSH identity mismatch" "fix Host $FIELDWORK_SSH_HOST User in ~/.ssh/config" "SSH does not resolve to the configured Fieldwork Linux user" "verify-security and broker socket checks assume Codex runs as the Fieldwork user" "fix the SSH config User and rerun doctor" "yes"
+        ssh "$FIELDWORK_SSH_HOST" "export PATH=\"\$HOME/.local/bin:/usr/local/bin:\$PATH\"; command -v fieldwork-verify >/dev/null 2>&1 && command -v fieldwork-pr-prepare >/dev/null 2>&1 && command -v fieldwork-pr-submit >/dev/null 2>&1" \
+          && doctor_ok "delivery clients available on Codex SSH PATH" \
+          || doctor_needs "delivery clients missing from Codex SSH PATH" "fieldwork sync-vps --force-install" "the SSH login shell cannot resolve one or more fieldwork delivery clients" "Codex must run verify, prepare, and submit from inside its task session" "re-sync Fieldwork and ensure ~/.local/bin is on the SSH login PATH" "yes"
+        ssh "$FIELDWORK_SSH_HOST" 'test "$(loginctl show-user "$(id -un)" -p Linger --value 2>/dev/null)" = yes' \
+          && doctor_ok "systemd user lingering enabled" \
+          || doctor_manual "systemd user lingering disabled" "$(remote_sudo_ssh_command "loginctl enable-linger $FIELDWORK_REMOTE_USER")" "the user manager may stop when the SSH session closes" "Codex-only hosts need runner sockets available independently of a Claude service" "enable lingering and rerun doctor" "yes"
+        ssh "$FIELDWORK_SSH_HOST" 'uid="$(id -u)"; runtime="${XDG_RUNTIME_DIR:-/run/user/$uid}"; test "$runtime" = "/run/user/$uid" && test -d "$runtime"' \
+          && doctor_ok "XDG runtime dir ready" \
+          || doctor_needs "XDG runtime dir missing" "reconnect to the VPS, then rerun fieldwork doctor --remote" "the login shell does not point at /run/user/<uid>" "runner sockets live under XDG_RUNTIME_DIR; Codex needs the same path inside sandbox config" "ensure systemd user session is active and reconnect" "yes"
+        local codex_app_server_snapshot codex_app_server_process codex_app_server_proxy codex_app_server_socket codex_app_server_stale codex_app_server_auth_ended
+        codex_app_server_snapshot="$(codex_remote_app_server_snapshot)"
+        codex_app_server_process="$(doctor_kv_value "$codex_app_server_snapshot" APP_SERVER_PROCESS)"
+        codex_app_server_proxy="$(doctor_kv_value "$codex_app_server_snapshot" APP_SERVER_PROXY)"
+        codex_app_server_socket="$(doctor_kv_value "$codex_app_server_snapshot" APP_SERVER_SOCKET)"
+        codex_app_server_stale="$(doctor_kv_value "$codex_app_server_snapshot" APP_SERVER_STALE_SOCKET_LOG)"
+        codex_app_server_auth_ended="$(doctor_kv_value "$codex_app_server_snapshot" APP_SERVER_AUTH_ENDED_LOG)"
+        if [ "$codex_app_server_process" = "present" ]; then
+          doctor_ok "Codex app-server process running"
+        else
+          doctor_info "Codex app-server process" "not running; Codex Desktop starts it when connected"
+        fi
+        if [ "$codex_app_server_proxy" = "present" ]; then
+          doctor_ok "Codex app-server SSH proxy running"
+        else
+          doctor_info "Codex app-server SSH proxy" "not running; expected when Codex Desktop is disconnected"
+        fi
+        if [ "$codex_app_server_socket" = "present" ]; then
+          doctor_ok "Codex SSH app-server socket present"
+        else
+          doctor_info "Codex SSH app-server socket" "not present; expected until Codex Desktop connects"
+        fi
+        if [ "$codex_app_server_stale" = "present" ]; then
+          doctor_manual "Codex app-server stale socket seen" "quit Codex Desktop's $FIELDWORK_SSH_HOST connection, reopen it, then rerun fieldwork doctor --remote${repo_slug:+ $repo_slug} --explain" "Codex app-server logs contain a sanitized stale-socket signal" "a stale socket can leave Desktop showing the SSH host without making remote folders usable" "reconnect Codex Desktop; if it persists, inspect the VPS Codex app-server process manually" "yes"
+        fi
+        if [ "$codex_app_server_auth_ended" = "present" ]; then
+          doctor_manual "Codex app-server saw ended app session" "ssh -t $FIELDWORK_SSH_HOST 'export PATH=\"\$HOME/.local/bin:/usr/local/bin:\$PATH\"; codex login --device-auth'" "Codex app-server logs contain a sanitized ended-session signal" "Desktop can keep a stale remote app-server after browser/device auth changes" "refresh Codex login on the VPS, then reconnect Codex Desktop to $FIELDWORK_SSH_HOST" "yes"
+        fi
+        ssh "$FIELDWORK_SSH_HOST" 'uid="$(id -u)"; runtime="${XDG_RUNTIME_DIR:-/run/user/$uid}"; cfg="$HOME/.codex/config.toml"; grep -Fq "default_permissions = \"fieldwork\"" "$cfg" && grep -Fq "[permissions.fieldwork.network]" "$cfg" && grep -Fq "enabled = true" "$cfg" && grep -Fq "mode = \"limited\"" "$cfg" && grep -Fq "[permissions.fieldwork.network.unix_sockets]" "$cfg" && grep -Fq "\"/run/fieldwork-pr-broker/fieldwork-pr.sock\" = \"allow\"" "$cfg" && grep -Fq "\"$runtime/fieldwork-verify.sock\" = \"allow\"" "$cfg" && grep -Fq "\"$runtime/fieldwork-pr-prepare.sock\" = \"allow\"" "$cfg"' \
+          && doctor_ok "Codex Unix-socket allowlist configured" \
+          || doctor_needs "Codex Unix-socket allowlist missing" "fieldwork setup --agent codex" "Codex config does not allow the broker and runner sockets" "Codex task sandbox blocks AF_UNIX sockets outside the workspace unless explicitly allowed" "rerun setup so it writes the fieldwork permissions profile" "yes"
+        if ssh "$FIELDWORK_SSH_HOST" 'export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"; command -v fieldwork-codex-sandbox >/dev/null 2>&1'; then
+          doctor_ok "Codex sandbox helper installed"
+          ssh "$FIELDWORK_SSH_HOST" 'set -eu
+uid="$(id -u)"
+runtime="${XDG_RUNTIME_DIR:-/run/user/$uid}"
+export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
+fieldwork-codex-sandbox run -- python3 - /run/fieldwork-pr-broker/fieldwork-pr.sock "$runtime/fieldwork-verify.sock" "$runtime/fieldwork-pr-prepare.sock" <<'"'"'PY'"'"'
+import socket
+import sys
+
+for path in sys.argv[1:]:
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(2)
+    try:
+        sock.connect(path)
+    finally:
+        sock.close()
+PY' \
+            && doctor_ok "Codex sandbox can reach Fieldwork sockets" \
+            || doctor_needs "Codex sandbox cannot reach Fieldwork sockets" "fieldwork setup --agent codex" "a process inside Codex's sandbox could not connect to the broker/runner sockets" "the real Codex delivery flow runs inside this sandbox; a bare SSH probe is not enough" "check socket units and rerun setup to refresh the allowlist" "yes"
+        else
+          doctor_needs "Codex sandbox helper missing" "fieldwork sync-vps --force-install" "the VPS checkout has not linked fieldwork-codex-sandbox into ~/.local/bin" "Codex setup, doctor, and status use this helper to adapt to the installed Codex CLI sandbox syntax" "sync Fieldwork to the VPS and rerun doctor" "yes"
+        fi
+      fi
+
+	      doctor_section "Git identity"
+	      [ "$explain" = "1" ] && doctor_info "purpose" "verify the agent user can author commits"
+      remote_git_user_email="$(ssh "$FIELDWORK_SSH_HOST" "git config --get user.email 2>/dev/null || true" 2>/dev/null | tr -d "\r\n" || echo "")"
+      remote_git_user_name="$(ssh "$FIELDWORK_SSH_HOST" "git config --get user.name 2>/dev/null || true" 2>/dev/null | tr -d "\r\n" || echo "")"
+      if [ -n "$remote_git_user_email" ] && [ -n "$remote_git_user_name" ]; then
+        doctor_ok "remote git user.name=$remote_git_user_name, user.email=$remote_git_user_email"
+      else
+        git_identity_fix="ssh -t $FIELDWORK_SSH_HOST 'git config --global user.email \"you@example.com\" && git config --global user.name \"Your Name\"'"
+        doctor_manual \
+          "remote git user.name/user.email not configured" \
+          "$git_identity_fix" \
+          "git config --get user.name or user.email returns empty on the VPS" \
+          "fieldwork-pr-prepare-impl exits 20 when it tries to author the commit; the broker rolls back cleanly but the PR never lands" \
+          "set both globally on the VPS (one-time, persists across onboards); the command above does it, then rerun fieldwork doctor --remote" \
+          "yes"
+      fi
+
+      if [ -n "$repo_slug" ]; then
+        doctor_section "Repo verify readiness"
+        [ "$explain" = "1" ] && doctor_info "purpose" "verify $repo_slug has the host toolchain and manually primed dependencies needed by /verify-before-pr"
+        repo_path="$FIELDWORK_PROJECTS_DIR/$repo_slug"
+        repo_path_q="$(shell_quote "$repo_path")"
+        repo_snapshot="$(ssh "$FIELDWORK_SSH_HOST" "repo_path=$repo_path_q
+if [ ! -d \"\$repo_path\" ]; then
+  echo repo=missing
+  exit 0
+fi
+if [ ! -d \"\$repo_path/.git\" ] && [ ! -f \"\$repo_path/.git\" ]; then
+  echo repo=not_git
+  exit 0
+fi
+cd \"\$repo_path\" || {
+  echo repo=missing
+  exit 0
+}
+echo repo=ok
+echo branch=\$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)
+if [ -n \"\$(git status --porcelain 2>/dev/null | head -n 1)\" ]; then
+  echo dirty=yes
+else
+  echo dirty=no
+fi
+if [ -f package.json ]; then
+  stack=node
+elif [ -f go.mod ]; then
+  stack=go
+elif [ -f Cargo.toml ]; then
+  stack=rust
+elif [ -f pyproject.toml ] || [ -f requirements.txt ]; then
+  stack=python
+else
+  stack=none
+fi
+echo stack=\$stack
+case \"\$stack\" in
+  node)
+    if [ -f pnpm-lock.yaml ]; then
+      pkg_mgr=pnpm
+      install_cmd='pnpm install --frozen-lockfile'
+    elif [ -f yarn.lock ]; then
+      pkg_mgr=yarn
+      install_cmd='yarn install --frozen-lockfile'
+    elif [ -f bun.lockb ] || [ -f bun.lock ]; then
+      pkg_mgr=bun
+      install_cmd='bun install --frozen-lockfile'
+    else
+      pkg_mgr=npm
+      install_cmd='npm ci'
+    fi
+    echo pkg_mgr=\$pkg_mgr
+    echo install_cmd=\$install_cmd
+    command -v node >/dev/null 2>&1 && echo node=ok || echo node=missing
+    command -v npm >/dev/null 2>&1 && echo npm=ok || echo npm=missing
+    command -v \"\$pkg_mgr\" >/dev/null 2>&1 && echo pkg_mgr_tool=ok || echo pkg_mgr_tool=missing
+    [ -d node_modules ] && echo project_deps=ok || echo project_deps=missing
+    ;;
+  go)
+    command -v go >/dev/null 2>&1 && echo go=ok || echo go=missing
+    ;;
+  rust)
+    command -v cargo >/dev/null 2>&1 && echo cargo=ok || echo cargo=missing
+    ;;
+  python)
+    command -v python3 >/dev/null 2>&1 && echo python3=ok || echo python3=missing
+    ;;
+esac" 2>/dev/null || true)"
+        repo_state="$(doctor_kv_value "$repo_snapshot" repo)"
+        repo_stack="$(doctor_kv_value "$repo_snapshot" stack)"
+        case "$repo_state" in
+          ok)
+            doctor_ok "repo checkout exists at $repo_path"
+            repo_branch="$(doctor_kv_value "$repo_snapshot" branch)"
+            repo_dirty="$(doctor_kv_value "$repo_snapshot" dirty)"
+            if [ "$repo_branch" = "fieldwork/init" ]; then
+              doctor_needs \
+                "repo checkout parked on fieldwork/init" \
+                "merge the init PR for $repo_slug, then run fieldwork refresh $repo_slug" \
+                "the VPS checkout HEAD is the unmerged init branch" \
+                "fieldwork-agent-session refuses to serve sessions from the init branch, so mobile sessions for this repo stay gated until the checkout returns to the default branch" \
+                "merge the init PR and run fieldwork refresh $repo_slug" \
+                "yes"
+            fi
+            if [ "$repo_dirty" = "yes" ]; then
+              doctor_manual \
+                "repo checkout has uncommitted changes" \
+                "ssh -t $FIELDWORK_SSH_HOST 'cd $repo_path && git status'" \
+                "the VPS checkout has staged, modified, or untracked files" \
+                "fieldwork refresh refuses dirty checkouts, and the broker rejects dirty worktrees at PR time" \
+                "inspect the changes over SSH, then stash, commit through a session, or discard them by hand" \
+                "yes"
+            fi
+            ;;
+          missing)
+            doctor_needs \
+              "repo checkout missing for $repo_slug" \
+              "fieldwork onboard <owner>/$repo_slug" \
+              "$repo_path does not exist on the VPS" \
+              "/verify-before-pr needs a real checkout under the configured projects directory" \
+              "onboard the repo, then rerun fieldwork doctor --remote $repo_slug --explain" \
+              "yes"
+            repo_stack=""
+            ;;
+          not_git)
+            doctor_needs \
+              "repo checkout is not a git repo" \
+              "inspect $repo_path on $FIELDWORK_SSH_HOST" \
+              "$repo_path exists but has no .git directory or gitfile" \
+              "verify refuses paths that are not git checkouts" \
+              "repair or reclone the checkout, then rerun fieldwork doctor --remote $repo_slug --explain" \
+              "yes"
+            repo_stack=""
+            ;;
+          *)
+            doctor_needs \
+              "repo readiness check failed" \
+              "fieldwork doctor --remote $repo_slug --explain" \
+              "doctor could not read repo readiness from the VPS" \
+              "without the repo stack snapshot, Fieldwork cannot tell whether verify will hit exit 30" \
+              "rerun with SSH working and inspect the command output above" \
+              "yes"
+            repo_stack=""
+            ;;
+        esac
+        case "$repo_stack" in
+          node)
+            pkg_mgr="$(doctor_kv_value "$repo_snapshot" pkg_mgr)"
+            install_cmd="$(doctor_kv_value "$repo_snapshot" install_cmd)"
+            [ -n "$pkg_mgr" ] || pkg_mgr="npm"
+            [ -n "$install_cmd" ] || install_cmd="npm ci"
+            doctor_ok "repo stack node ($pkg_mgr)"
+            if [ "$(doctor_kv_value "$repo_snapshot" node)" = "ok" ] && [ "$(doctor_kv_value "$repo_snapshot" npm)" = "ok" ]; then
+              doctor_ok "Node.js toolchain installed"
+            else
+              doctor_needs \
+                "Node.js toolchain missing" \
+                "ssh -t $FIELDWORK_SSH_HOST 'cd ~/fieldwork && ./bin/fieldwork bootstrap-vps'" \
+                "node or npm is missing from the VPS PATH visible to systemd and bwrap" \
+                "verify exits 30 before lint/tests when a Node repo cannot find the system-wide Node toolchain" \
+                "rerun bootstrap-vps to install Node.js 22 from the signed NodeSource apt source, then rerun doctor" \
+                "yes"
+            fi
+            if [ "$pkg_mgr" != "npm" ] && [ "$(doctor_kv_value "$repo_snapshot" pkg_mgr_tool)" != "ok" ]; then
+              doctor_needs \
+                "$pkg_mgr package manager missing" \
+                "ssh $FIELDWORK_SSH_HOST 'cd $repo_path && corepack enable'" \
+                "$pkg_mgr lockfile detected but $pkg_mgr is not on PATH" \
+                "verify does not install package managers inside the agent flow" \
+                "install or enable $pkg_mgr outside the agent session, then rerun doctor" \
+                "yes"
+            fi
+            if [ "$(doctor_kv_value "$repo_snapshot" project_deps)" = "ok" ]; then
+              doctor_ok "node_modules present"
+            else
+              doctor_needs \
+                "node_modules missing" \
+                "ssh $FIELDWORK_SSH_HOST 'cd $repo_path && $install_cmd'" \
+                "node_modules is absent in $repo_path" \
+                "verify runs with network disabled and intentionally does not run dependency installers from the agent path" \
+                "run $install_cmd manually as maintenance, then rerun fieldwork doctor --remote $repo_slug --explain" \
+                "yes"
+            fi
+            ;;
+          go)
+            doctor_ok "repo stack go"
+            if [ "$(doctor_kv_value "$repo_snapshot" go)" = "ok" ]; then
+              doctor_ok "Go toolchain installed"
+            else
+              doctor_needs \
+                "Go toolchain missing" \
+                "install Go on $FIELDWORK_SSH_HOST, then rerun fieldwork doctor --remote $repo_slug --explain" \
+                "go.mod is present but go is not on PATH" \
+                "verify exits 30 before Go checks when the Go toolchain is missing" \
+                "install Go system-wide or for the fieldwork user, then rerun doctor" \
+                "yes"
+            fi
+            ;;
+          rust)
+            doctor_ok "repo stack rust"
+            if [ "$(doctor_kv_value "$repo_snapshot" cargo)" = "ok" ]; then
+              doctor_ok "Rust toolchain installed"
+            else
+              doctor_needs \
+                "Rust toolchain missing" \
+                "install Rust/cargo on $FIELDWORK_SSH_HOST, then rerun fieldwork doctor --remote $repo_slug --explain" \
+                "Cargo.toml is present but cargo is not on PATH" \
+                "verify exits 30 before Rust checks when cargo is missing" \
+                "install Rust/cargo system-wide or for the fieldwork user, then rerun doctor" \
+                "yes"
+            fi
+            ;;
+          python)
+            doctor_ok "repo stack python"
+            if [ "$(doctor_kv_value "$repo_snapshot" python3)" = "ok" ]; then
+              doctor_ok "python3 toolchain installed"
+            else
+              doctor_needs \
+                "python3 toolchain missing" \
+                "ssh -t $FIELDWORK_SSH_HOST 'sudo apt-get install -y python3'" \
+                "Python project files are present but python3 is not on PATH" \
+                "verify exits 30 before Python checks when python3 is missing" \
+                "install python3 on the VPS, then rerun doctor" \
+                "yes"
+            fi
+            ;;
+          none)
+            doctor_info "repo stack" "none detected; verify will skip stack-specific lint/typecheck/tests"
+            ;;
+        esac
+      fi
+    else
+      doctor_fail \
+	        "SSH access" \
+	        "fix SSH alias or your network path to the VPS, then rerun fieldwork doctor --remote" \
+	        "cannot reach $FIELDWORK_SSH_HOST" \
+	        "all remote setup, syncing, onboarding, and status commands go through this SSH alias" \
+	        "add or fix Host $FIELDWORK_SSH_HOST in ~/.ssh/config, then run fieldwork doctor --remote. Reference: $(first_time_reference)" \
+	        "yes"
+      [ "$explain" = "1" ] && print_ssh_config_hint
+    fi
+  else
+    doctor_section "VPS"
+    doctor_manual \
+      "remote checks skipped" \
+      "fieldwork doctor --remote" \
+      "doctor only checked the workstation" \
+      "the VPS hosts Claude Code, systemd units, repo checkouts, notifications, and the PR broker" \
+      "run fieldwork doctor --remote" \
+      "yes"
+
+    doctor_section "Notifications"
+    info_row "Purpose" "Optional mobile pushes when Claude needs input, finishes, or fails."
+    if [ -f "$HOME/.fieldwork/notify.env" ] && grep -Eq '^(NTFY_TOPIC|TG_BOT_TOKEN)=.+' "$HOME/.fieldwork/notify.env"; then
+      doctor_ok "local notifications configured"
+    else
+      doctor_info "Local" "not configured (optional; run fieldwork setup-notify)"
+    fi
+  fi
+
+	  doctor_remote_active=0
+	  fieldwork_status_stop_renderer
+	  finish_doctor_phase
+		  echo
+		  echo "Summary"
+		  if [ "$failed" = "0" ] && [ -z "$next_action" ]; then
+		    doctor_row ok "Remote setup is ready."
+		  else
+		    doctor_row needs "Remote setup needs attention."
+		  fi
+	  echo
+	  echo "Next"
+	  if [ -n "$next_action" ]; then
+	    echo "  $next_action"
+	  elif [ -n "$repo_slug" ]; then
+	    echo "  retry /verify-before-pr for $repo_slug"
+	  else
+	    echo "  fieldwork onboard <owner/repo>"
+	  fi
+
+	  return "$failed"
+	}
+
+bootstrap_vps() {
+  local args=()
+  local print_path=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --print-path)
+        print_path=1
+        shift
+        ;;
+      --help|-h)
+        echo "usage: fieldwork bootstrap-vps [--print-path] [--verbose] [--log-file <path>]"
+        return 0
+        ;;
+      --verbose)
+        args+=("$1")
+        shift
+        ;;
+      --log-file)
+        args+=("$1" "${2:?--log-file requires a path}")
+        shift 2
+        ;;
+      "") shift ;;
+      *) echo "unknown bootstrap-vps argument: $1" >&2; return 2 ;;
+    esac
+  done
+  if [ "$print_path" = "1" ]; then
+    printf '%s\n' "$FIELDWORK_ROOT/lib/systemd/bootstrap-vps.sh"
+    return 0
+  fi
+  exec "$FIELDWORK_ROOT/lib/systemd/bootstrap-vps.sh" "${args[@]+"${args[@]}"}"
+}
+
+install_broker() {
+  local args=()
+  local print_path=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --print-path)
+        print_path=1
+        shift
+        ;;
+      --help|-h)
+        echo "usage: fieldwork install-broker [--print-path] [--verbose] [--log-file <path>]"
+        return 0
+        ;;
+      --verbose)
+        args+=("$1")
+        shift
+        ;;
+      --log-file)
+        args+=("$1" "${2:?--log-file requires a path}")
+        shift 2
+        ;;
+      "") shift ;;
+      *) echo "unknown install-broker argument: $1" >&2; return 2 ;;
+    esac
+  done
+  if [ "$print_path" = "1" ]; then
+    printf '%s\n' "$FIELDWORK_ROOT/lib/broker/install.sh"
+    return 0
+  fi
+  local installer="$FIELDWORK_ROOT/lib/broker/install.sh"
+  local host_os
+  host_os="$(uname -s 2>/dev/null || true)"
+  if [ "$host_os" != "Linux" ]; then
+    echo "Broker install target"
+    echo "  This helper installs the PR broker on the machine where you run it."
+    echo "  Current host OS: ${host_os:-unknown}"
+    echo "  Broker installation requires the Linux VPS/systemd host."
+    echo
+    echo "  From your workstation, use: fieldwork setup"
+    echo "  Or run it on the VPS:"
+    echo "    ssh -t $FIELDWORK_SSH_HOST 'cd ~/fieldwork && ./bin/fieldwork install-broker'"
+    return 1
+  fi
+  echo "Current-host sudo authentication"
+  echo "  This helper installs the PR broker on the machine where you run it."
+  echo "  From your workstation, use: fieldwork setup"
+  echo "  Run this helper directly only on the VPS or in advanced broker-only flows."
+  echo
+  if [ "$(id -u)" -eq 0 ]; then
+    echo "  Running as root on this host; no sudo password is required."
+    echo
+    exec bash "$installer" "${args[@]+"${args[@]}"}"
+  fi
+  if sudo -n true >/dev/null 2>&1; then
+    echo "  Sudo is already passwordless or authorized for this user; no password prompt is expected."
+    echo
+    exec sudo -n bash "$installer" "${args[@]+"${args[@]}"}"
+  fi
+  echo "  If prompted, enter the sudo password for the current account on this host."
+  echo "  This is not your Claude account password and not the GitHub PAT."
+  echo
+  exec sudo -p "[sudo] Current-host password: " bash "$installer" "${args[@]+"${args[@]}"}"
+}
+
+start_repo() {
+  local slug="${1:-}"
+  case "$slug" in
+    --help|-h)
+      echo "usage: fieldwork start <repo-slug>"
+      return 0
+      ;;
+  esac
+  [ -n "$slug" ] || { echo "usage: fieldwork start <repo-slug>" >&2; return 2; }
+  [ $# -eq 1 ] || { echo "fieldwork start accepts exactly one <repo-slug>" >&2; return 2; }
+  valid_slug "$slug" || { echo "invalid repo slug: $slug" >&2; return 2; }
+
+  local agents
+  agents="$(remote_agents_value)"
+  phase_section "Remote session"
+  info_row "repo" "$slug"
+  info_row "agents" "$agents"
+  local claude_started=0
+  if agents_include "$agents" claude; then
+    info_row "service" "fieldwork-agent@$slug"
+    info_row "session" "vps-$slug"
+    if progress_run "starting remote Claude session" "remote Claude session is active" \
+      ssh "$FIELDWORK_SSH_HOST" "systemctl --user start 'fieldwork-agent@$slug' && systemctl --user is-active --quiet 'fieldwork-agent@$slug'"; then
+      claude_started=1
+    else
+      echo
+      label_line "Next action"
+      echo "  fieldwork status $slug"
+      return 1
+    fi
+  fi
+
+  if agents_include "$agents" codex; then
+    echo
+    label_line "Codex Desktop"
+    codex_connection_hint "$slug" | sed 's/^/  /'
+  fi
+
+  if [ "$claude_started" = "1" ]; then
+    echo
+    label_line "Next action"
+    if agents_include "$agents" codex; then
+      echo "  Claude: open mobile session vps-$slug"
+      echo "  Codex: open $FIELDWORK_PROJECTS_DIR/$slug in Codex Desktop"
+      echo "  Important: do not use Claude and Codex concurrently in this checkout."
+    else
+      echo "  open Claude mobile and use session vps-$slug"
+    fi
+  elif agents_include "$agents" codex; then
+    echo
+    label_line "Next action"
+    echo "  open $FIELDWORK_PROJECTS_DIR/$slug in Codex Desktop"
+  else
+    echo "[fieldwork start] no supported agents configured in ~/.fieldwork/agents" >&2
+    return 1
+  fi
+}
+
+refresh_repo() {
+  local slug="${1:-}"
+  case "$slug" in
+    --help|-h)
+      cat <<'EOF'
+usage: fieldwork refresh <repo-slug>
+
+Refresh the VPS checkout after a PR merges. Claude-configured hosts restart the
+matching fieldwork-agent@<repo> service; Codex-configured hosts do not restart
+anything because Codex Desktop owns its SSH connection state.
+EOF
+      return 0
+      ;;
+  esac
+  [ -n "$slug" ] || { echo "usage: fieldwork refresh <repo-slug>" >&2; return 2; }
+  [ $# -eq 1 ] || { echo "fieldwork refresh accepts exactly one <repo-slug>" >&2; return 2; }
+  valid_slug "$slug" || { echo "invalid repo slug: $slug" >&2; return 2; }
+
+  local repo_path="$FIELDWORK_PROJECTS_DIR/$slug"
+  local remote_script
+  IFS= read -r -d '' remote_script <<'REMOTE_EOF' || true
+set -euo pipefail
+
+repo_path="$1"
+slug="$2"
+fallback_default_branch="$3"
+agents="$4"
+
+cd "$repo_path" || {
+  echo "[fieldwork refresh] checkout missing: $repo_path" >&2
+  exit 1
+}
+test -f .fieldwork/expected-origin || {
+  echo "[fieldwork refresh] missing .fieldwork/expected-origin; is this repo onboarded?" >&2
+  exit 1
+}
+
+dirty="$(git status --short)"
+if [ -n "$dirty" ]; then
+  echo "[fieldwork refresh] checkout has uncommitted changes; refusing to overwrite them" >&2
+  printf '%s\n' "$dirty" >&2
+  exit 1
+fi
+
+default_branch="$(cat .fieldwork/default-branch 2>/dev/null || printf '%s' "$fallback_default_branch")"
+case "$default_branch" in
+  [A-Za-z0-9]*) ;;
+  *)
+    echo "[fieldwork refresh] unsupported default branch: $default_branch" >&2
+    exit 1
+    ;;
+esac
+case "$default_branch" in
+  *[!A-Za-z0-9._/-]*)
+    echo "[fieldwork refresh] unsupported default branch: $default_branch" >&2
+    exit 1
+    ;;
+esac
+
+git fetch --prune origin
+current_branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+if [ "$current_branch" != "$default_branch" ]; then
+  git checkout "$default_branch"
+fi
+git pull --ff-only origin "$default_branch" || git pull --ff-only
+case ",$agents," in
+  *,claude,*)
+    systemctl --user stop "fieldwork-agent@$slug" || true
+    claude_project_key="$(printf '%s' "$repo_path" | sed 's#[^A-Za-z0-9]#-#g')"
+    claude_bridge="$HOME/.claude/projects/$claude_project_key/bridge-pointer.json"
+    if [ -f "$claude_bridge" ]; then
+      stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+      mv "$claude_bridge" "$claude_bridge.fieldwork-refresh-$stamp"
+    fi
+    systemctl --user start "fieldwork-agent@$slug"
+    systemctl --user is-active --quiet "fieldwork-agent@$slug"
+    ;;
+esac
+REMOTE_EOF
+
+  refresh_remote() {
+    printf '%s' "$remote_script" | ssh "$FIELDWORK_SSH_HOST" bash -s -- "$repo_path" "$slug" "$FIELDWORK_DEFAULT_BRANCH" "$agents"
+  }
+
+  phase_section "Refresh VPS checkout"
+  info_row "repo" "$slug"
+  info_row "checkout" "$repo_path"
+  local agents
+  agents="$(remote_agents_value)"
+  info_row "agents" "$agents"
+  if agents_include "$agents" claude; then
+    info_row "service" "fieldwork-agent@$slug"
+    info_row "session" "vps-$slug"
+  fi
+  local refresh_done="VPS checkout refreshed"
+  agents_include "$agents" claude && refresh_done="VPS checkout refreshed and Claude session restarted"
+  if progress_run "refreshing VPS checkout" "$refresh_done" refresh_remote; then
+    echo
+    label_line "Next action"
+    if agents_include "$agents" codex; then
+      echo "  open or continue $repo_path in Codex Desktop or mobile"
+    else
+      echo "  open Claude mobile and use session vps-$slug"
+      echo "  older manually named sessions are unmanaged consent runs; use vps-$slug for Fieldwork"
+    fi
+  else
+    echo
+    label_line "Next action"
+    echo "  inspect the output above, then run fieldwork status $slug"
+    return 1
+  fi
+}
+
+status_repo() {
+  local slug=""
+  local verbose=0
+  local queue=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --help|-h)
+        cat <<'EOF'
+usage: fieldwork status [repo-slug]
+       fieldwork status <repo-slug> [--verbose]
+       fieldwork status [repo-slug] --queue
+
+Show the remote agent status.
+
+Without --verbose, prints a clean summary of configured agent readiness.
+With --verbose (alias: --systemd), prints raw Claude systemd / journal output
+when Claude is configured.
+With --queue, prints only the Mobile -> PR approval queue; pass a repo slug to
+filter it to that repo. --queue cannot be combined with --verbose.
+EOF
+        return 0
+        ;;
+      --verbose|--systemd) verbose=1; shift ;;
+      --queue) queue=1; shift ;;
+      --*) echo "unknown status argument: $1" >&2; return 2 ;;
+      *)
+        [ -z "$slug" ] || { echo "fieldwork status accepts at most one repo slug" >&2; return 2; }
+        slug="$1"
+        shift
+        ;;
+    esac
+  done
+
+  if [ "$queue" = "1" ] && [ "$verbose" = "1" ]; then
+    echo "fieldwork status --queue cannot be combined with --verbose" >&2
+    return 2
+  fi
+
+  if [ "$queue" = "1" ]; then
+    if [ -n "$slug" ]; then
+      valid_slug "$slug" || { echo "invalid repo slug: $slug" >&2; return 2; }
+    fi
+    queue_render "$(fieldwork_bot_snapshot)" "$slug"
+    return 0
+  fi
+
+  if [ -z "$slug" ] && [ "$verbose" = "1" ]; then
+    echo "fieldwork status --verbose requires a repo slug" >&2
+    return 2
+  fi
+
+  if [ -z "$slug" ]; then
+    phase_section "Remote sessions"
+    local agents
+    agents="$(remote_agents_value)"
+    info_row "agents" "$agents"
+    echo
+    if agents_include "$agents" claude; then
+      info_row "listing" "fieldwork-agent@*.service"
+      ssh "$FIELDWORK_SSH_HOST" "systemctl --user list-units 'fieldwork-agent@*.service' --no-pager || true"
+    else
+      echo "  Claude session services are not configured."
+    fi
+    if agents_include "$agents" codex; then
+      echo
+      echo "  Codex Desktop live connection state is owned by Codex Desktop on your device."
+    fi
+    echo
+    queue_render "$(fieldwork_bot_snapshot)"
+    echo
+    label_line "Next action"
+    echo "  fieldwork status <repo-slug>"
+    return 0
+  fi
+
+  valid_slug "$slug" || { echo "invalid repo slug: $slug" >&2; return 2; }
+  local unit="fieldwork-agent@${slug}.service"
+  local agents
+  agents="$(remote_agents_value)"
+
+  if [ "$verbose" = "1" ] && agents_include "$agents" claude; then
+    phase_section "Remote session (verbose)"
+    info_row "repo" "$slug"
+    info_row "service" "$unit"
+    echo
+    label_line "systemctl --user status"
+    ssh "$FIELDWORK_SSH_HOST" "systemctl --user status '$unit' --no-pager || true"
+    echo
+    label_line "journalctl -n 20"
+    ssh "$FIELDWORK_SSH_HOST" "journalctl --user -u '$unit' -n 20 --no-pager || true"
+    return 0
+  fi
+
+  status_field() {
+    local label="$1"
+    local mark="$2"
+    local value="$3"
+    local mark_str
+    if [ "$mark" = "none" ]; then
+      printf '  %-11s%s\n' "$label" "$value"
+      return
+    fi
+    if [ -t 1 ] && supports_utf8; then
+      case "$mark" in
+        ok)   mark_str="$(green '✓')" ;;
+        bad)  mark_str="$(red '✗')" ;;
+        warn) mark_str="$(yellow '!')" ;;
+        *)    mark_str=' ' ;;
+      esac
+      printf '  %-11s%s %s\n' "$label" "$mark_str" "$value"
+    else
+      case "$mark" in
+        ok)   mark_str='ok' ;;
+        bad)  mark_str='no' ;;
+        warn) mark_str='! ' ;;
+        *)    mark_str='  ' ;;
+      esac
+      printf '  %-11s%s %s\n' "$label" "$mark_str" "$value"
+    fi
+  }
+
+  print_codex_readiness() {
+    local repo_path="$FIELDWORK_PROJECTS_DIR/$slug"
+    local snapshot
+    snapshot="$(ssh "$FIELDWORK_SSH_HOST" "repo_path=$(shell_quote "$repo_path") bash -s" <<'REMOTE_CODEX_STATUS' 2>/dev/null || true
+set -eu
+repo_path="${repo_path:?}"
+uid="$(id -u)"
+runtime="${XDG_RUNTIME_DIR:-/run/user/$uid}"
+cfg="$HOME/.codex/config.toml"
+check() {
+  label="$1"
+  shift
+  if "$@" >/dev/null 2>&1; then
+    printf '%s=ok\n' "$label"
+  else
+    printf '%s=bad\n' "$label"
+  fi
+}
+export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
+check CODEX_CLI sh -c 'command -v codex >/dev/null 2>&1 && codex --version >/dev/null 2>&1'
+check LOGIN_MARKER test -f "$HOME/.fieldwork/state/codex-login-confirmed"
+check DELIVERY_CLIENTS sh -c 'command -v fieldwork-verify >/dev/null 2>&1 && command -v fieldwork-pr-prepare >/dev/null 2>&1 && command -v fieldwork-pr-submit >/dev/null 2>&1'
+check SANDBOX_HELPER command -v fieldwork-codex-sandbox
+check XDG_RUNTIME test -d "$runtime"
+check RUNNER_SOCKETS sh -c "test -S '$runtime/fieldwork-verify.sock' && test -S '$runtime/fieldwork-pr-prepare.sock'"
+check BROKER_SOCKET sh -c 'test -S /run/fieldwork-pr-broker/fieldwork-pr.sock && test -w /run/fieldwork-pr-broker/fieldwork-pr.sock'
+check EXPECTED_ORIGIN test -f "$repo_path/.fieldwork/expected-origin"
+check ALLOWLIST sh -c "grep -Fq 'default_permissions = \"fieldwork\"' '$cfg' && grep -Fq '[permissions.fieldwork.network]' '$cfg' && grep -Fq 'enabled = true' '$cfg' && grep -Fq 'mode = \"limited\"' '$cfg' && grep -Fq '[permissions.fieldwork.network.unix_sockets]' '$cfg' && grep -Fq '\"/run/fieldwork-pr-broker/fieldwork-pr.sock\" = \"allow\"' '$cfg' && grep -Fq '\"$runtime/fieldwork-verify.sock\" = \"allow\"' '$cfg' && grep -Fq '\"$runtime/fieldwork-pr-prepare.sock\" = \"allow\"' '$cfg'"
+if command -v fieldwork-codex-sandbox >/dev/null 2>&1; then
+  if fieldwork-codex-sandbox run -- python3 - /run/fieldwork-pr-broker/fieldwork-pr.sock "$runtime/fieldwork-verify.sock" "$runtime/fieldwork-pr-prepare.sock" <<'PY' >/dev/null 2>&1
+import socket
+import sys
+
+for path in sys.argv[1:]:
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(2)
+    try:
+        sock.connect(path)
+    finally:
+        sock.close()
+PY
+  then
+    printf 'SANDBOX_SOCKET_PROBE=ok\n'
+  else
+    printf 'SANDBOX_SOCKET_PROBE=bad\n'
+  fi
+else
+  printf 'SANDBOX_SOCKET_PROBE=bad\n'
+fi
+REMOTE_CODEX_STATUS
+)"
+    local codex_cli="bad" login_marker="bad" delivery_clients="bad" xdg_runtime="bad"
+    local sandbox_helper="bad" runner_sockets="bad" broker_socket="bad" expected_origin="bad" allowlist="bad" sandbox_probe="bad"
+    while IFS='=' read -r key value; do
+      case "$key" in
+        CODEX_CLI) codex_cli="$value" ;;
+        LOGIN_MARKER) login_marker="$value" ;;
+        DELIVERY_CLIENTS) delivery_clients="$value" ;;
+        SANDBOX_HELPER) sandbox_helper="$value" ;;
+        XDG_RUNTIME) xdg_runtime="$value" ;;
+        RUNNER_SOCKETS) runner_sockets="$value" ;;
+        BROKER_SOCKET) broker_socket="$value" ;;
+        EXPECTED_ORIGIN) expected_origin="$value" ;;
+        ALLOWLIST) allowlist="$value" ;;
+        SANDBOX_SOCKET_PROBE) sandbox_probe="$value" ;;
+      esac
+    done <<<"$snapshot"
+
+    status_field Codex "$codex_cli" "CLI on SSH PATH"
+    status_field Login "$login_marker" "login marker"
+    status_field Clients "$delivery_clients" "delivery commands on PATH"
+    if [ "$sandbox_helper" = "ok" ]; then
+      status_field Helper "$sandbox_helper" "sandbox helper on SSH PATH"
+    else
+      status_field Helper "$sandbox_helper" "sandbox helper missing — run fieldwork sync-vps --force-install"
+    fi
+    status_field Runtime "$xdg_runtime" "XDG runtime dir"
+    status_field Runners "$runner_sockets" "verify/prepare sockets"
+    status_field Broker "$broker_socket" "submit socket"
+    status_field Origin "$expected_origin" ".fieldwork/expected-origin"
+    status_field Allowlist "$allowlist" "Codex Unix-socket allowlist"
+    status_field Sandbox "$sandbox_probe" "socket probe inside Codex sandbox"
+    echo
+    label_line "Codex Desktop"
+    echo "  live connection state is owned by Codex Desktop on your device"
+  }
+
+  fmt_duration() {
+    local s="${1:-0}"
+    local d h m
+    case "$s" in ''|*[!0-9]*) echo "0s"; return ;; esac
+    [ "$s" -gt 0 ] || { echo "0s"; return; }
+    d=$((s / 86400)); s=$((s % 86400))
+    h=$((s / 3600)); s=$((s % 3600))
+    m=$((s / 60))
+    if [ "$d" -gt 0 ]; then printf '%dd %dh\n' "$d" "$h"
+    elif [ "$h" -gt 0 ]; then printf '%dh %dm\n' "$h" "$m"
+    elif [ "$m" -gt 0 ]; then printf '%dm\n' "$m"
+    else printf '%ds\n' "$s"
+    fi
+  }
+
+  fmt_memory() {
+    local b="${1:-}"
+    case "$b" in ''|*[!0-9]*) echo ""; return ;; esac
+    [ "$b" -gt 0 ] || { echo ""; return; }
+    if [ "$b" -ge 1073741824 ]; then
+      awk -v b="$b" 'BEGIN{printf "%.1f GB\n", b/1073741824}'
+    elif [ "$b" -ge 1048576 ]; then
+      printf '%d MB\n' $((b / 1048576))
+    else
+      printf '%d KB\n' $((b / 1024))
+    fi
+  }
+
+  if ! agents_include "$agents" claude; then
+    if [ "$verbose" = "1" ]; then
+      phase_section "Codex status (verbose)"
+      info_row "repo" "$slug"
+      info_row "agents" "$agents"
+    else
+      phase_section "$slug"
+      info_row "agents" "$agents"
+    fi
+    echo
+    print_codex_readiness
+    echo
+    label_line "Next"
+    codex_connection_hint "$slug" | sed 's/^/  /'
+    return 0
+  fi
+
+  local remote_script
+  IFS= read -r -d '' remote_script <<'REMOTE_EOF' || true
+slug="$1"
+unit="fieldwork-agent@${slug}.service"
+get() { systemctl --user show "$unit" -p "$1" --value 2>/dev/null; }
+load_state=$(get LoadState)
+active_state=$(get ActiveState)
+sub_state=$(get SubState)
+exec_start=$(get ExecStart)
+main_pid=$(get MainPID)
+mem_bytes=$(get MemoryCurrent)
+enter_mono=$(get ActiveEnterTimestampMonotonic)
+adapter="$HOME/.fieldwork/infra/agents/claude-remote-control"
+
+cmdline=""
+if [ -n "$main_pid" ] && [ "$main_pid" != "0" ] && [ -r "/proc/$main_pid/cmdline" ]; then
+  cmdline="$(tr '\000' ' ' < "/proc/$main_pid/cmdline" 2>/dev/null || true)"
+fi
+
+session_name="$(printf '%s\n' "$cmdline" | awk '
+  {
+    for (i = 1; i <= NF; i++) {
+      if ($i == "--name" && i < NF) { print $(i + 1); exit }
+      if ($i ~ /^--name=/) { sub(/^--name=/, "", $i); print $i; exit }
+    }
+  }
+')"
+session_name_source="process"
+if [ -z "$session_name" ] && [ -f "$adapter" ] && grep -Eq -- '--name[ =]"?vps-\$slug' "$adapter"; then
+  session_name="vps-$slug"
+  session_name_source="adapter"
+fi
+
+now_mono=$(awk '{printf "%d", $1*1000000}' /proc/uptime 2>/dev/null)
+elapsed_s=0
+if [ -n "$enter_mono" ] && [ "$enter_mono" != "0" ] && [ -n "$now_mono" ]; then
+  if [ "$now_mono" -gt "$enter_mono" ]; then
+    elapsed_s=$(( (now_mono - enter_mono) / 1000000 ))
+  fi
+fi
+
+sandbox=off
+case "$cmdline $exec_start" in *"--sandbox"*) sandbox=on ;; esac
+[ "$sandbox" = "on" ] || { [ -f "$adapter" ] && grep -q -- '--sandbox' "$adapter" && sandbox=on; }
+worktree=shared
+case "$cmdline $exec_start" in *"--spawn=worktree"*|*"--spawn worktree"*) worktree=isolated ;; esac
+[ "$worktree" = "isolated" ] || { [ -f "$adapter" ] && grep -q -- '--spawn=worktree' "$adapter" && worktree=isolated; }
+
+url=""
+capacity=""
+if [ "$active_state" = "active" ]; then
+  log=$(journalctl --user -u "$unit" -n 200 --no-pager 2>/dev/null || true)
+  url=$(printf '%s\n' "$log" | grep -Eo 'https://claude\.ai/code[^[:space:]]+' | tail -1)
+  capacity=$(printf '%s\n' "$log" | grep -Eo 'Capacity:[[:space:]]*[0-9]+/[0-9]+' | tail -1 | awk '{print $NF}')
+fi
+
+printf 'LOAD_STATE=%s\n' "$load_state"
+printf 'ACTIVE_STATE=%s\n' "$active_state"
+printf 'SUB_STATE=%s\n' "$sub_state"
+printf 'SESSION_NAME=%s\n' "$session_name"
+printf 'SESSION_NAME_SOURCE=%s\n' "$session_name_source"
+printf 'SANDBOX=%s\n' "$sandbox"
+printf 'WORKTREE=%s\n' "$worktree"
+printf 'ELAPSED_SECONDS=%s\n' "$elapsed_s"
+printf 'MEMORY_BYTES=%s\n' "$mem_bytes"
+printf 'CAPACITY=%s\n' "$capacity"
+printf 'URL=%s\n' "$url"
+REMOTE_EOF
+
+  local snapshot
+  snapshot="$(printf '%s' "$remote_script" | ssh "$FIELDWORK_SSH_HOST" bash -s "$slug" 2>/dev/null || true)"
+
+  local load_state="" active_state="" sub_state="" session_name="" session_name_source="" sandbox="" worktree=""
+  local elapsed_seconds="0" memory_bytes="" capacity="" url=""
+  while IFS='=' read -r key value; do
+    case "$key" in
+      LOAD_STATE) load_state="$value" ;;
+      ACTIVE_STATE) active_state="$value" ;;
+      SUB_STATE) sub_state="$value" ;;
+      SESSION_NAME) session_name="$value" ;;
+      SESSION_NAME_SOURCE) session_name_source="$value" ;;
+      SANDBOX) sandbox="$value" ;;
+      WORKTREE) worktree="$value" ;;
+      ELAPSED_SECONDS) elapsed_seconds="$value" ;;
+      MEMORY_BYTES) memory_bytes="$value" ;;
+      CAPACITY) capacity="$value" ;;
+      URL) url="$value" ;;
+    esac
+  done <<<"$snapshot"
+
+  phase_section "$slug"
+  echo
+
+  if [ -z "$load_state" ]; then
+    status_field Agent bad "could not reach VPS"
+    echo
+    label_line "Debug"
+    echo "  fieldwork status $slug --verbose"
+    echo "  fieldwork doctor --remote"
+    return 1
+  fi
+
+  if [ "$load_state" = "not-found" ]; then
+    status_field Agent bad "service not installed"
+    echo
+    label_line "Onboard it"
+    echo "  fieldwork onboard <owner>/<repo>"
+    echo
+    label_line "Debug"
+    echo "  fieldwork status $slug --verbose"
+    return 1
+  fi
+
+  if [ "$active_state" = "active" ]; then
+    local uptime; uptime="$(fmt_duration "$elapsed_seconds")"
+    status_field Agent ok "running for $uptime"
+    if [ "$session_name" = "vps-$slug" ]; then
+      if [ "$session_name_source" = "adapter" ]; then
+        status_field Session ok "$session_name (configured)"
+      else
+        status_field Session ok "$session_name"
+      fi
+    elif [ -n "$session_name" ]; then
+      status_field Session warn "expected vps-$slug, saw $session_name"
+    else
+      status_field Session warn "expected vps-$slug"
+    fi
+    if [ -n "$url" ]; then
+      status_field Mobile ok "ready"
+    else
+      status_field Mobile warn "no session URL in recent logs"
+    fi
+    if [ "$sandbox" = "on" ]; then
+      status_field Sandbox ok "enabled"
+    else
+      status_field Sandbox warn "disabled"
+    fi
+    if [ "$worktree" = "isolated" ]; then
+      status_field Worktree ok "isolated"
+    else
+      status_field Worktree warn "shared"
+    fi
+    if [ -n "$capacity" ]; then
+      status_field Capacity none "$capacity"
+    fi
+    local mem_h; mem_h="$(fmt_memory "$memory_bytes")"
+    if [ -n "$mem_h" ]; then
+      status_field Memory none "$mem_h"
+    fi
+    local status_needs_fix=0
+    local bot_snapshot bot_service_state="" bot_broker_status="" bot_broker_detail=""
+    local bot_approve_status="" bot_approve_detail="" bot_token_status="" bot_chat_status=""
+    local bot_poll_age="" bot_poll_error="" bot_health_present=""
+    local bot_health_config_loaded="" bot_health_chat_configured=""
+    local bot_dir_pending_count="" bot_health_pending_count="" bot_pending_count=""
+    bot_snapshot="$(fieldwork_bot_snapshot)"
+    if [ -n "$bot_snapshot" ]; then
+      while IFS='=' read -r key value; do
+        case "$key" in
+          SERVICE_STATE) bot_service_state="$value" ;;
+          BROKER_SUBMIT_STATUS) bot_broker_status="$value" ;;
+          BROKER_SUBMIT_DETAIL) bot_broker_detail="$value" ;;
+          APPROVE_SOCKET_STATUS) bot_approve_status="$value" ;;
+          APPROVE_SOCKET_DETAIL) bot_approve_detail="$value" ;;
+          TOKEN_CONFIG_STATUS) bot_token_status="$value" ;;
+          CHAT_BINDING_STATUS) bot_chat_status="$value" ;;
+          HEALTH_PRESENT) bot_health_present="$value" ;;
+          HEALTH_LAST_POLL_OK_AGE_SECONDS) bot_poll_age="$value" ;;
+          HEALTH_LAST_POLL_ERROR) bot_poll_error="$value" ;;
+          HEALTH_CONFIG_LOADED) bot_health_config_loaded="$value" ;;
+          HEALTH_CHAT_BINDING_CONFIGURED) bot_health_chat_configured="$value" ;;
+          DIR_PENDING_COUNT) bot_dir_pending_count="$value" ;;
+          HEALTH_PENDING_COUNT) bot_health_pending_count="$value" ;;
+        esac
+      done <<<"$bot_snapshot"
+      bot_pending_count="$bot_dir_pending_count"
+      [ -n "$bot_pending_count" ] || bot_pending_count="$bot_health_pending_count"
+
+      if [ "$bot_broker_status" = "ok" ]; then
+        status_field Broker ok "reachable"
+      else
+        status_field Broker warn "${bot_broker_detail:-unreachable}"
+        status_needs_fix=1
+      fi
+
+      local approvals_mark="warn"
+      local approvals_value="bot health unknown"
+      if [ "$bot_service_state" != "active" ]; then
+        approvals_value="bot not running · $(fieldwork_pending_label "$bot_pending_count")"
+      elif [ "$bot_token_status" = "bad" ] && [ "$bot_health_config_loaded" != "1" ]; then
+        approvals_value="bot running, but token config missing"
+      elif [ "$bot_chat_status" = "bad" ] && [ "$bot_health_chat_configured" != "1" ]; then
+        approvals_value="bot running, but chat binding missing"
+      elif ! bot_polling_healthy "$bot_service_state" "$bot_poll_age" "$bot_poll_error"; then
+        if [ "$bot_health_present" != "1" ]; then
+          approvals_value="bot running, but health file missing"
+        elif [ -n "$bot_poll_error" ]; then
+          approvals_value="bot running, but Telegram polling failing"
+        else
+          approvals_value="bot running, but Telegram polling stale"
+        fi
+      elif [ "$bot_approve_status" = "ok" ]; then
+        approvals_mark="ok"
+        approvals_value="bot active · $(fieldwork_pending_label "$bot_pending_count")"
+      elif [ "$bot_approve_status" = "unknown" ]; then
+        approvals_value="bot running, approve socket unknown"
+      else
+        approvals_value="bot running, but approve socket unreachable"
+      fi
+      [ "$approvals_mark" = "ok" ] || status_needs_fix=1
+      status_field Approvals "$approvals_mark" "$approvals_value"
+    else
+      status_field Broker warn "unknown"
+      status_field Approvals warn "bot health unavailable"
+      status_needs_fix=1
+    fi
+    local pr_audit
+    if pr_audit="$(fieldwork_pr_audit_fetch)"; then
+      status_field "Last PR" none "$(printf '%s' "$pr_audit" | pr_audit_row "$slug")"
+    else
+      status_field "Last PR" none "unavailable (needs broker sudo on the VPS)"
+    fi
+    if [ -n "$url" ]; then
+      echo
+      label_line "Open"
+      echo "  $url"
+    fi
+    if agents_include "$agents" codex; then
+      echo
+      label_line "Codex readiness"
+      print_codex_readiness
+      echo
+      label_line "Important"
+      echo "  Do not use Claude and Codex concurrently in this checkout."
+    fi
+    echo
+    if [ "$status_needs_fix" = "1" ]; then
+      label_line "Fix"
+      echo "  fieldwork bot-status"
+      echo "  fieldwork doctor --remote"
+    else
+      label_line "Next"
+      echo "  fieldwork start $slug"
+    fi
+    echo
+    label_line "Debug"
+    echo "  fieldwork status $slug --verbose"
+    return 0
+  fi
+
+  local fail_label="not running"
+  [ "$active_state" = "failed" ] && fail_label="failed"
+  status_field Agent bad "$fail_label"
+  status_field Mobile none "unavailable"
+  status_field Sandbox none "unknown"
+  status_field Worktree none "unknown"
+  if agents_include "$agents" codex; then
+    echo
+    label_line "Codex readiness"
+    print_codex_readiness
+  fi
+  echo
+  label_line "Start it"
+  echo "  fieldwork start $slug"
+  echo
+  label_line "Debug"
+  echo "  fieldwork status $slug --verbose"
+  return 1
+}
+
+bot_status() {
+  case "${1:-}" in
+    --help|-h)
+      cat <<'EOF'
+usage: fieldwork bot-status
+
+Show the Telegram approval bot pipeline health: service state, last successful
+poll, pending approval queue, broker submit socket, approve socket, and bot
+configuration shape.
+EOF
+      return 0
+      ;;
+    "") ;;
+    *) echo "unknown bot-status argument: $1" >&2; return 2 ;;
+  esac
+
+  bot_status_field() {
+    local label="$1"
+    local mark="$2"
+    local value="$3"
+    local mark_str
+    if [ "$mark" = "none" ]; then
+      printf '  %-16s%s\n' "$label" "$value"
+      return
+    fi
+    if [ -t 1 ] && supports_utf8; then
+      case "$mark" in
+        ok)      mark_str="$(green '✓')" ;;
+        bad)     mark_str="$(red '✗')" ;;
+        warn)    mark_str="$(yellow '!')" ;;
+        unknown) mark_str='-' ;;
+        *)       mark_str=' ' ;;
+      esac
+      printf '  %-16s%s %s\n' "$label" "$mark_str" "$value"
+    else
+      case "$mark" in
+        ok)      mark_str='ok' ;;
+        bad)     mark_str='no' ;;
+        warn)    mark_str='! ' ;;
+        unknown) mark_str='-' ;;
+        *)       mark_str='  ' ;;
+      esac
+      printf '  %-16s%s %s\n' "$label" "$mark_str" "$value"
+    fi
+  }
+
+  local snapshot
+  snapshot="$(fieldwork_bot_snapshot)"
+
+  phase_section "Telegram approval bot"
+  echo
+
+  if [ -z "$snapshot" ]; then
+    bot_status_field "Service" bad "could not reach VPS"
+    echo
+    label_line "Fix"
+    echo "  fieldwork doctor --remote"
+    return 1
+  fi
+
+  local service_state="" broker_submit_status="" broker_submit_detail=""
+  local approve_socket_status="" approve_socket_detail=""
+  local token_config_status="" chat_binding_status=""
+  local health_present="" health_last_poll_ok_age="" health_last_poll_error=""
+  local health_pending_count="" health_oldest_pending_age=""
+  local health_config_loaded="" health_allowed_chat_count="" health_chat_binding_configured=""
+  local dir_pending_count="" dir_oldest_pending_age="" dir_pending_source=""
+  local -a dir_pending_items=()
+  local -a health_pending_items=()
+
+  while IFS='=' read -r key value; do
+    case "$key" in
+      SERVICE_STATE) service_state="$value" ;;
+      BROKER_SUBMIT_STATUS) broker_submit_status="$value" ;;
+      BROKER_SUBMIT_DETAIL) broker_submit_detail="$value" ;;
+      APPROVE_SOCKET_STATUS) approve_socket_status="$value" ;;
+      APPROVE_SOCKET_DETAIL) approve_socket_detail="$value" ;;
+      TOKEN_CONFIG_STATUS) token_config_status="$value" ;;
+      CHAT_BINDING_STATUS) chat_binding_status="$value" ;;
+      HEALTH_PRESENT) health_present="$value" ;;
+      HEALTH_LAST_POLL_OK_AGE_SECONDS) health_last_poll_ok_age="$value" ;;
+      HEALTH_LAST_POLL_ERROR) health_last_poll_error="$value" ;;
+      HEALTH_PENDING_COUNT) health_pending_count="$value" ;;
+      HEALTH_OLDEST_PENDING_AGE_SECONDS) health_oldest_pending_age="$value" ;;
+      HEALTH_CONFIG_LOADED) health_config_loaded="$value" ;;
+      HEALTH_ALLOWED_CHAT_COUNT) health_allowed_chat_count="$value" ;;
+      HEALTH_CHAT_BINDING_CONFIGURED) health_chat_binding_configured="$value" ;;
+      DIR_PENDING_COUNT) dir_pending_count="$value" ;;
+      DIR_OLDEST_PENDING_AGE_SECONDS) dir_oldest_pending_age="$value" ;;
+      DIR_PENDING_SOURCE) dir_pending_source="$value" ;;
+      DIR_PENDING_ITEM) dir_pending_items+=("$value") ;;
+      HEALTH_PENDING_ITEM) health_pending_items+=("$value") ;;
+    esac
+  done <<<"$snapshot"
+
+  local pending_count="$dir_pending_count"
+  local oldest_pending_age="$dir_oldest_pending_age"
+  local -a pending_items=("${dir_pending_items[@]+"${dir_pending_items[@]}"}")
+  if [ -z "$pending_count" ]; then
+    pending_count="$health_pending_count"
+    oldest_pending_age="$health_oldest_pending_age"
+    pending_items=("${health_pending_items[@]+"${health_pending_items[@]}"}")
+  fi
+
+  local broken=0
+  case "$service_state" in
+    active) bot_status_field "Service" ok "running" ;;
+    inactive|failed|"") bot_status_field "Service" bad "not running"; broken=1 ;;
+    *) bot_status_field "Service" warn "$service_state"; broken=1 ;;
+  esac
+
+  if bot_polling_healthy "$service_state" "$health_last_poll_ok_age" "$health_last_poll_error"; then
+    bot_status_field "Polling" ok "healthy"
+  elif [ "$health_present" != "1" ]; then
+    bot_status_field "Polling" unknown "unknown"
+    broken=1
+  elif [ -n "$health_last_poll_error" ]; then
+    bot_status_field "Polling" warn "failing"
+    broken=1
+  elif [ -n "$health_last_poll_ok_age" ]; then
+    bot_status_field "Polling" warn "stale"
+    broken=1
+  else
+    bot_status_field "Polling" unknown "unknown"
+    broken=1
+  fi
+  bot_status_field "Last poll" none "$(fieldwork_age_label "$health_last_poll_ok_age")"
+  bot_status_field "Pending" none "$(fieldwork_request_count_label "$pending_count")"
+  local oldest_pending_label
+  if [ "${pending_count:-}" = "0" ]; then
+    oldest_pending_label="none"
+  else
+    oldest_pending_label="$(fieldwork_fmt_duration "$oldest_pending_age")"
+  fi
+  bot_status_field "Oldest pending" none "$oldest_pending_label"
+
+  if [ "$broker_submit_status" = "ok" ]; then
+    bot_status_field "Broker submit" ok "reachable"
+  else
+    bot_status_field "Broker submit" bad "${broker_submit_detail:-unreachable}"
+    broken=1
+  fi
+
+  case "$approve_socket_status" in
+    ok) bot_status_field "Approve socket" ok "reachable" ;;
+    unknown) bot_status_field "Approve socket" warn "${approve_socket_detail:-unknown}"; broken=1 ;;
+    *) bot_status_field "Approve socket" bad "${approve_socket_detail:-unreachable}"; broken=1 ;;
+  esac
+
+  if [ "$token_config_status" = "ok" ] || [ "$health_config_loaded" = "1" ]; then
+    bot_status_field "Token config" ok "present"
+  elif [ "$token_config_status" = "unknown" ]; then
+    bot_status_field "Token config" unknown "unknown"
+    broken=1
+  else
+    bot_status_field "Token config" bad "missing"
+    broken=1
+  fi
+
+  if [ "$chat_binding_status" = "ok" ] || [ "$health_chat_binding_configured" = "1" ]; then
+    bot_status_field "Chat binding" ok "configured"
+  elif [ "$chat_binding_status" = "unknown" ] && [ "$health_allowed_chat_count" != "0" ] && [ -n "$health_allowed_chat_count" ]; then
+    bot_status_field "Chat binding" ok "configured"
+  elif [ "$chat_binding_status" = "unknown" ]; then
+    bot_status_field "Chat binding" unknown "unknown"
+    broken=1
+  else
+    bot_status_field "Chat binding" bad "missing"
+    broken=1
+  fi
+
+  case "$pending_count" in
+    ''|0|*[!0-9]*) ;;
+    *)
+      if [ "${#pending_items[@]}" -gt 0 ]; then
+        echo
+        label_line "Pending requests"
+        local i=1 item repo branch age request_id pending_slug
+        for item in "${pending_items[@]}"; do
+          IFS=$'\t' read -r repo branch age request_id pending_slug <<<"$item"
+          printf '  %d. %s · %s · %s\n' "$i" "${repo:-unknown}" "${branch:-?}" "$(fieldwork_age_label "$age")"
+          i=$((i + 1))
+        done
+      elif [ "$dir_pending_source" = "unavailable" ]; then
+        echo
+        info_note "Pending request details need sudo access to the bot-readable pending dir."
+      fi
+      ;;
+  esac
+
+  echo
+  if [ "$broken" = "1" ]; then
+    label_line "Fix"
+    if [ "$service_state" != "active" ]; then
+      echo "  $(remote_sudo_ssh_command "systemctl restart fieldwork-bot.service")"
+    fi
+    if [ "$token_config_status" = "bad" ] || [ "$chat_binding_status" = "bad" ]; then
+      echo "  fieldwork setup-notify --telegram-bot"
+    fi
+    echo "  fieldwork doctor --remote"
+    return 1
+  fi
+
+  label_line "Next"
+  case "${pending_count:-0}" in
+    ''|0|*[!0-9]*) echo "  none; approval bot pipeline looks healthy" ;;
+    *) echo "  open Telegram and approve/deny pending requests" ;;
+  esac
+  return 0
+}
+
+report_fieldwork() {
+  local slug=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --help)
+        cat <<'EOF'
+usage: fieldwork report [repo-slug]
+
+Prints a read-only, secret-redacted support report for developer preview issues.
+Pass a repo slug to include onboarding/checkout status for that repo.
+EOF
+        return 0
+        ;;
+      --*) echo "unknown report argument: $1" >&2; return 2 ;;
+      *)
+        [ -z "$slug" ] || { echo "fieldwork report accepts at most one repo slug" >&2; return 2; }
+        slug="$1"
+        shift
+        ;;
+    esac
+  done
+
+  if [ -n "$slug" ]; then
+    valid_slug "$slug" || { echo "invalid repo slug: $slug" >&2; return 2; }
+  fi
+
+  local next_action=""
+  set_report_next() {
+    [ -n "$next_action" ] || next_action="$1"
+  }
+  report_row() {
+    local status="$1"
+    local label="$2"
+    if [ "$status" = "ok" ]; then
+      status_ok_line "$label"
+    else
+      printf '  %-7s %s\n' "$status" "$label"
+    fi
+  }
+  report_check() {
+    local label="$1"
+    local cmd="$2"
+    if eval "$cmd" >/dev/null 2>&1; then
+      report_row "ok" "$label"
+      return 0
+    fi
+    report_row "missing" "$label"
+    return 1
+  }
+  remote_check() {
+    local label="$1"
+    local remote_cmd="$2"
+    if ssh "$FIELDWORK_SSH_HOST" "$remote_cmd" >/dev/null 2>&1; then
+      report_row "ok" "$label"
+      return 0
+    fi
+    report_row "missing" "$label"
+    set_report_next "fieldwork doctor --remote --explain"
+    return 1
+  }
+
+  echo "Fieldwork report"
+  echo "Generated: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "Secrets: omitted"
+  echo
+
+  phase_section "Local"
+  echo "  fieldwork_root: $(display_local_path "$FIELDWORK_ROOT")"
+  echo "  cli_path: $(display_local_path "$0")"
+  echo "  profile: $FIELDWORK_PROFILE"
+  echo "  forge: $FIELDWORK_FORGE"
+  echo "  ssh_host: $FIELDWORK_SSH_HOST"
+  echo "  remote_user: $FIELDWORK_REMOTE_USER"
+  echo "  projects_dir: $FIELDWORK_PROJECTS_DIR"
+  echo "  default_branch: $FIELDWORK_DEFAULT_BRANCH"
+  echo "  notify_provider: $FIELDWORK_NOTIFY_PROVIDER"
+
+  local cmd
+  for cmd in bash git jq ssh scp sed grep rsync; do
+    report_check "$cmd found" "command -v '$cmd'"
+  done
+  if ! command -v jq >/dev/null 2>&1; then
+    set_report_next "install jq, then rerun fieldwork report"
+  fi
+  [ -x "$FIELDWORK_ROOT/lib/scripts/fieldwork-onboard" ] \
+    && report_row "ok" "fieldwork-onboard executable" \
+    || { report_row "missing" "fieldwork-onboard executable"; set_report_next "run from a complete Fieldwork checkout"; }
+  [ -f "$FIELDWORK_ROOT/lib/broker/server.py" ] \
+    && report_row "ok" "broker server present" \
+    || { report_row "missing" "broker server present"; set_report_next "run from a complete Fieldwork checkout"; }
+  [ -f "$HOME/.fieldwork/notify.env" ] \
+    && report_row "ok" "local notification config present" \
+    || report_row "missing" "local notification config present"
+
+  phase_section "SSH"
+  local ssh_config resolved_host resolved_user remote_ok
+  ssh_config="$(ssh -G "$FIELDWORK_SSH_HOST" 2>/dev/null || true)"
+  if [ -n "$ssh_config" ]; then
+    resolved_host="$(printf '%s\n' "$ssh_config" | awk '$1 == "hostname" { print $2; exit }')"
+    resolved_user="$(printf '%s\n' "$ssh_config" | awk '$1 == "user" { print $2; exit }')"
+    report_row "ok" "SSH alias resolves"
+    echo "  resolved_host: ${resolved_host:-unknown}"
+    echo "  resolved_user: ${resolved_user:-unknown}"
+  else
+    report_row "missing" "SSH alias resolves"
+    set_report_next "add Host $FIELDWORK_SSH_HOST to ~/.ssh/config, then rerun fieldwork setup"
+  fi
+
+  remote_ok=0
+  if ssh -o BatchMode=yes -o ConnectTimeout=5 "$FIELDWORK_SSH_HOST" "true" >/dev/null 2>&1; then
+    remote_ok=1
+    report_row "ok" "VPS reachable over SSH"
+  else
+    report_row "blocked" "VPS reachable over SSH"
+    set_report_next "fieldwork setup"
+  fi
+
+  phase_section "Remote"
+  if [ "$remote_ok" = "1" ]; then
+    local projects_dir_q
+    projects_dir_q="$(shell_quote "$FIELDWORK_PROJECTS_DIR")"
+    remote_check "remote Claude Code CLI installed" "export PATH=\"\$HOME/.local/bin:\$PATH\"; command -v claude >/dev/null 2>&1" || true
+    remote_check "remote GitHub CLI installed" "export PATH=\"\$HOME/.local/bin:\$PATH\"; command -v gh >/dev/null 2>&1" || true
+    remote_check "remote GitHub CLI authenticated" "export PATH=\"\$HOME/.local/bin:\$PATH\"; gh auth status >/dev/null 2>&1" || true
+    remote_check "remote projects dir exists" "test -d $projects_dir_q" || true
+    remote_check "remote notification config present" "test -s ~/.fieldwork/notify.env" || true
+    remote_check "remote Claude session systemd unit installed" "test -f ~/.config/systemd/user/fieldwork-agent@.service" || true
+    remote_check "broker socket writable" "test -S /run/fieldwork-pr-broker/fieldwork-pr.sock && test -w /run/fieldwork-pr-broker/fieldwork-pr.sock" || true
+  else
+    report_row "skipped" "remote checks skipped because SSH is blocked"
+  fi
+
+  if [ -n "$slug" ]; then
+    phase_section "Repo"
+    echo "  slug: $slug"
+    local repo_path="$FIELDWORK_PROJECTS_DIR/$slug"
+    echo "  repo_path: $repo_path"
+    if [ "$remote_ok" = "1" ]; then
+      local repo_path_q state_file_q
+      repo_path_q="$(shell_quote "$repo_path")"
+      remote_check "repo checkout exists" "test -d $repo_path_q/.git" || true
+      remote_check "repo expected-origin exists" "test -f $repo_path_q/.fieldwork/expected-origin" || true
+      remote_check "repo worktree clean" "cd $repo_path_q && test -z \"\$(git status --short)\"" || true
+
+      local state_json state_file
+      state_file="$repo_path/.fieldwork/local/fieldwork-onboard-state.json"
+      state_file_q="$(shell_quote "$state_file")"
+      state_json="$(ssh "$FIELDWORK_SSH_HOST" "test -f $state_file_q && cat $state_file_q" 2>/dev/null || true)"
+      if [ -n "$state_json" ] && printf '%s' "$state_json" | jq -e '.version == 1 and (.completed_steps | type == "array")' >/dev/null 2>&1; then
+        report_row "ok" "onboarding checkpoint readable"
+        printf '  branch: %s\n' "$(printf '%s' "$state_json" | jq -r '.branch // "unknown"')"
+        printf '  workflows_included: %s\n' "$(printf '%s' "$state_json" | jq -r 'if has("workflows_included") then (.workflows_included | tostring) else "unknown" end')"
+        printf '  completed_steps: %s\n' "$(printf '%s' "$state_json" | jq -r '.completed_steps | join(", ")')"
+        printf '  updated_at: %s\n' "$(printf '%s' "$state_json" | jq -r '.updated_at // "unknown"')"
+      elif [ -n "$state_json" ]; then
+        report_row "warn" "onboarding checkpoint present but unreadable"
+        set_report_next "fieldwork onboard <owner>/$slug --reset-state"
+      else
+        report_row "missing" "onboarding checkpoint present"
+        set_report_next "fieldwork onboard <owner>/$slug"
+      fi
+    else
+      report_row "skipped" "repo checks skipped because SSH is blocked"
+    fi
+  fi
+
+  echo
+  label_line "Next action"
+  if [ -n "$next_action" ]; then
+    echo "  $next_action"
+  elif [ -n "$slug" ]; then
+    echo "  fieldwork smoke <owner>/$slug"
+  else
+    echo "  fieldwork setup"
+  fi
+}
+
+smoke_repo() {
+  local owner_repo=""
+  local yes=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --yes) yes=1; shift ;;
+      --help)
+        cat <<'EOF'
+usage: fieldwork smoke <owner/repo> [--yes]
+
+Creates a tiny smoke-test branch and PR through the Fieldwork broker from an
+already-onboarded VPS checkout. This does not use Claude; it proves the broker
+socket, PAT, push, and GitHub PR path.
+EOF
+        return 0
+        ;;
+      --*) echo "unknown smoke argument: $1" >&2; return 2 ;;
+      *)
+        [ -z "$owner_repo" ] || { echo "fieldwork smoke accepts exactly one <owner/repo>" >&2; return 2; }
+        owner_repo="$1"
+        shift
+        ;;
+    esac
+  done
+
+  [ -n "$owner_repo" ] || { echo "usage: fieldwork smoke <owner/repo> [--yes]" >&2; return 2; }
+  valid_owner_repo "$owner_repo" || { echo "invalid GitHub owner/repo: $owner_repo" >&2; return 2; }
+
+  local repo_name="${owner_repo#*/}"
+  local slug="$repo_name"
+  valid_slug "$slug" || { echo "invalid repo slug: $slug" >&2; return 2; }
+
+  local stamp branch repo_path remote_script local_script
+  stamp="$(date -u +%Y%m%d%H%M%S)"
+  branch="fieldwork/smoke-$stamp"
+  repo_path="$FIELDWORK_PROJECTS_DIR/$slug"
+  remote_script="/tmp/fieldwork-smoke-$slug-$stamp.sh"
+
+  phase_section "Smoke test"
+  info_row "repo" "$owner_repo"
+  info_row "VPS checkout" "$repo_path"
+  info_row "branch" "$branch"
+  info_row "Purpose" "create a tiny PR through the broker without Claude"
+
+  if ! confirm "[fieldwork smoke] Create a smoke-test PR now?" "$yes"; then
+    echo "[fieldwork smoke] cancelled"
+    return 0
+  fi
+
+  phase_section "Broker PR"
+  local_script="$(mktemp "${TMPDIR:-/tmp}/fieldwork-smoke.XXXXXX")"
+  cat >"$local_script" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+repo_path="$repo_path"
+owner_repo="$owner_repo"
+branch="$branch"
+stamp="$stamp"
+
+cd "\$repo_path"
+test -f .fieldwork/expected-origin
+test -S /run/fieldwork-pr-broker/fieldwork-pr.sock
+test -w /run/fieldwork-pr-broker/fieldwork-pr.sock
+
+[ -z "\$(git status --short)" ] || {
+  echo "[fieldwork smoke] worktree is dirty; commit or clean it before smoke testing" >&2
+  exit 1
+}
+
+git fetch --prune origin
+default_branch="\$(cat .fieldwork/default-branch 2>/dev/null || printf '%s' "$FIELDWORK_DEFAULT_BRANCH")"
+git checkout "\$default_branch"
+git pull --ff-only origin "\$default_branch" || git pull --ff-only
+
+if git show-ref --verify --quiet "refs/heads/\$branch"; then
+  git branch -D "\$branch"
+fi
+git checkout -b "\$branch"
+
+mkdir -p .fieldwork .fieldwork/local
+smoke_file=".fieldwork/smoke-\$stamp.md"
+created_at="\$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+cat >"\$smoke_file" <<SMOKE
+# Fieldwork Smoke Test
+
+This file was created by 'fieldwork smoke' to verify the broker-owned PR path.
+
+Created at: \$created_at
+SMOKE
+
+git add "\$smoke_file"
+git -c user.email=fieldwork@vps -c user.name="Fieldwork VPS" commit -m "chore(fieldwork): smoke test broker path"
+
+request_id="\$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen)"
+cat > .fieldwork/local/pr-request.json <<JSON
+{
+  "request_id": "\$request_id",
+  "created_at": "\$created_at",
+  "repo_path": "$repo_path",
+  "branch": "$branch",
+  "title": "chore(fieldwork): smoke test broker path",
+  "body": "Summary:\\n- Verify Fieldwork broker can push a fieldwork/... branch and open a PR without Claude.\\n\\nTests:\\n- fieldwork smoke"
+}
+JSON
+
+~/.local/bin/fieldwork-pr-submit .fieldwork/local/pr-request.json
+EOF
+
+  if ! progress_run "uploading smoke script to VPS" "smoke script uploaded" \
+      scp -q "$local_script" "$FIELDWORK_SSH_HOST:$remote_script"; then
+    rm -f "$local_script"
+    echo
+    label_line "Next action"
+    echo "  fieldwork doctor --remote --explain"
+    return 1
+  fi
+  rm -f "$local_script"
+
+  local response_log smoke_status response broker_json pr_url queued expires_at broker_error
+  response_log="$(mktemp "${TMPDIR:-/tmp}/fieldwork-smoke-response.XXXXXX")"
+  smoke_status=0
+  fieldwork_status_start "creating commit and submitting through broker"
+  set +e
+  ssh "$FIELDWORK_SSH_HOST" "bash '$remote_script'; status=\$?; rm -f '$remote_script'; exit \$status" >"$response_log" 2>&1
+  smoke_status=$?
+  set -e
+  if [ "$smoke_status" = "0" ]; then
+    fieldwork_status_succeed ""
+  else
+    fieldwork_status_fail ""
+  fi
+
+  response="$(cat "$response_log")"
+  broker_json=""
+  pr_url=""
+  queued=""
+  expires_at=""
+  broker_error=""
+  if [ -s "$response_log" ]; then
+    broker_json="$(printf '%s' "$response" | tail -20 | grep -E '^[[:space:]]*\{' | tail -1 || true)"
+    pr_url="$(printf '%s' "$broker_json" | jq -r 'if (.ok // false) == true then (.url // empty) else empty end' 2>/dev/null || true)"
+    queued="$(printf '%s' "$broker_json" | jq -r 'if (.ok // false) == true and (.queued // false) == true then "1" else "" end' 2>/dev/null || true)"
+    expires_at="$(printf '%s' "$broker_json" | jq -r '.expires_at // empty' 2>/dev/null || true)"
+    broker_error="$(printf '%s' "$broker_json" | jq -r '.error // empty' 2>/dev/null || true)"
+  fi
+
+  if [ "$smoke_status" = "0" ] && [ "$queued" = "1" ]; then
+    status_ok_line "smoke commit created and broker queued the PR for approval"
+    rm -f "$response_log"
+
+    phase_section "Result"
+    status_ok_line "broker queued smoke PR for Telegram approval"
+    [ -n "$expires_at" ] && info_row "expires" "$expires_at"
+    echo
+    label_line "Next action"
+    echo "  approve the queued smoke request in Telegram; then review and close or merge the PR"
+    return 0
+  fi
+
+  if [ "$smoke_status" != "0" ] || [ -z "$pr_url" ]; then
+    status_failed_line "smoke PR was not opened"
+    echo "  Last output:"
+    tail -20 "$response_log" | sed 's/^/    /'
+    rm -f "$response_log"
+    echo
+    label_line "Next action"
+    if [ -n "$broker_error" ]; then
+      echo "  broker error: $broker_error"
+    fi
+    echo "  inspect the output above, then run fieldwork doctor --remote --explain"
+    [ "$smoke_status" = "0" ] && return 1
+    return "$smoke_status"
+  fi
+  status_ok_line "smoke commit created and broker opened the PR"
+  rm -f "$response_log"
+
+  phase_section "Result"
+  status_ok_line "broker opened smoke PR"
+  info_row "PR" "$pr_url"
+  echo
+  label_line "Next action"
+  echo "  review and close or merge the smoke PR"
+}
+
+cmd="${1:---help}"
+fieldwork_help_requested=0
+for fieldwork_arg in "$@"; do
+  case "$fieldwork_arg" in
+    --help|-h)
+      fieldwork_help_requested=1
+      break
+      ;;
+  esac
+done
+case "$cmd" in
+  --help|-h|help) ;;
+  *)
+    [ "$fieldwork_help_requested" = "1" ] || validate_runtime_config
+    ;;
+esac
+
+case "$cmd" in
+  --help|-h|help) usage ;;
+  setup) shift; setup_fieldwork "$@" ;;
+  uninstall) shift; uninstall_fieldwork "$@" ;;
+  health) shift; health "$@" ;;
+  doctor) shift; doctor "$@" ;;
+  setup-notify) shift; setup_notify "$@" ;;
+  sync-vps) shift; sync_vps "$@" ;;
+  verify-security) shift; verify_security "$@" ;;
+  report) shift; report_fieldwork "$@" ;;
+  smoke) shift; smoke_repo "$@" ;;
+  refresh) shift; refresh_repo "$@" ;;
+  eval) shift; fieldwork_eval "$@" ;;
+  log) shift; fieldwork_log "$@" ;;
+  adapter) shift; fieldwork_adapter "$@" ;;
+  bootstrap-vps) shift; bootstrap_vps "$@" ;;
+  install-broker) shift; install_broker "$@" ;;
+  onboard) shift; onboard "$@" ;;
+  provision) shift; provision "$@" ;;
+  start) shift; start_repo "$@" ;;
+  status) shift; status_repo "$@" ;;
+  bot-status) shift; bot_status "$@" ;;
+  *) echo "unknown command: $cmd" >&2; usage >&2; exit 2 ;;
+esac

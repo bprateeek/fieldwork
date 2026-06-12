@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+# /usr/local/sbin/rotate-pat — quarterly PAT rotation. Root-owned, mode 700.
+#
+# Reads a new GitHub fine-grained PAT from stdin, atomically replaces
+# the broker token file, restarts the broker. The agent is never involved.
+#
+# Usage:
+#   sudo -p "[sudo] VPS Linux password for $USER: " rotate-pat <<<'github_pat_NEW_TOKEN_HERE'
+# Or interactively:
+#   sudo -p "[sudo] VPS Linux password for $USER: " env FIELDWORK_ROTATE_PAT_TTY=1 rotate-pat
+#   paste the token when prompted; input is hidden
+
+set -euo pipefail
+
+# Validate a PAT against the GitHub API before we ever store it, so a typo'd,
+# expired, revoked, or wrong-repo token cannot replace a working one and restart
+# the broker with a dead credential. Side-effect-free; the caller decides what to
+# do with the exit code:
+#   0  token is live (and, if a repo was named, reachable with write access)
+#   1  GitHub definitively rejected it -> abort, keep the existing token
+#   2  could not reach the API at all  -> warn and proceed (don't brick setup on
+#      a network/outage when we cannot prove the token is bad)
+# Fine-grained PATs do not expose their granted permissions via any API, so this
+# checks liveness always and, when FIELDWORK_PAT_PROBE_REPO is set, repo
+# reachability plus the `permissions.push` write proxy. GitHub.com only.
+fieldwork_validate_pat() {
+  local token="$1"
+  local forge="${FIELDWORK_FORGE:-github}"
+  case "$forge" in
+    github|"") ;;
+    *) return 0 ;;
+  esac
+  local api="${FIELDWORK_GITHUB_API:-https://api.github.com}"
+  local hdr_accept="Accept: application/vnd.github+json"
+  local hdr_ver="X-GitHub-Api-Version: 2022-11-28"
+
+  local code
+  code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 \
+    -H "Authorization: Bearer $token" -H "$hdr_accept" -H "$hdr_ver" \
+    "$api/rate_limit" 2>/dev/null)" || code="000"
+  case "$code" in
+    200) ;;
+    401|403) echo "[rotate-pat] GitHub rejected the token (HTTP $code): expired, revoked, or mistyped." >&2; return 1 ;;
+    000) echo "[rotate-pat] could not reach $api (network)." >&2; return 2 ;;
+    *) echo "[rotate-pat] unexpected response from $api (HTTP $code); could not validate." >&2; return 2 ;;
+  esac
+
+  local repo="${FIELDWORK_PAT_PROBE_REPO:-}"
+  [ -n "$repo" ] || return 0
+
+  local resp rcode body
+  resp="$(curl -sS -w $'\n%{http_code}' --max-time 10 \
+    -H "Authorization: Bearer $token" -H "$hdr_accept" -H "$hdr_ver" \
+    "$api/repos/$repo" 2>/dev/null)" || { echo "[rotate-pat] could not reach $api for the $repo check." >&2; return 2; }
+  rcode="${resp##*$'\n'}"
+  body="${resp%$'\n'*}"
+  case "$rcode" in
+    200) ;;
+    404) echo "[rotate-pat] the token cannot see $repo (HTTP 404): add it to the PAT's selected repositories." >&2; return 1 ;;
+    403) echo "[rotate-pat] the token lacks access to $repo (HTTP 403): grant Metadata: Read." >&2; return 1 ;;
+    000) echo "[rotate-pat] could not reach $api for the $repo check." >&2; return 2 ;;
+    *) echo "[rotate-pat] unexpected response for $repo (HTTP $rcode); could not validate." >&2; return 2 ;;
+  esac
+  if printf '%s' "$body" | grep -q '"push"[[:space:]]*:[[:space:]]*true'; then
+    return 0
+  fi
+  echo "[rotate-pat] the token can read $repo but lacks write access (Contents: Read and write required)." >&2
+  return 1
+}
+
+if [ "${FIELDWORK_ROTATE_PAT_SOURCE_ONLY:-0}" = "1" ]; then
+  return 0 2>/dev/null || exit 0
+fi
+
+[ "$(id -u)" -eq 0 ] || { echo "must run as root" >&2; exit 1; }
+
+# Identities and paths default to the neutral Fieldwork layout but can be
+# overridden to match a non-default broker install.
+BROKER_USER="${FIELDWORK_BROKER_USER:-fieldwork-pr-broker}"
+BROKER_SERVICE="${FIELDWORK_BROKER_SERVICE:-fieldwork-pr-broker}"
+AGENT_USER="${FIELDWORK_REMOTE_USER:-fieldwork}"
+TOKEN_PATH="${FIELDWORK_BROKER_TOKEN_PATH:-/etc/fieldwork-pr-broker/gh-token}"
+TOKEN_DIR="$(dirname "$TOKEN_PATH")"
+
+TOKEN=""
+TTY_STATE=""
+restore_tty() {
+  if [ -n "$TTY_STATE" ]; then
+    stty "$TTY_STATE" </dev/tty 2>/dev/null || stty "$TTY_STATE" 2>/dev/null || true
+    TTY_STATE=""
+  fi
+}
+trap 'restore_tty' EXIT
+
+if [ -t 0 ]; then
+  TTY_STATE="$(stty -g)"
+  printf 'Paste GitHub PAT (input hidden), then press Enter: ' >&2
+  stty -echo
+  IFS= read -r TOKEN || true
+  restore_tty
+  printf '\n' >&2
+elif [ "${FIELDWORK_ROTATE_PAT_TTY:-0}" = "1" ] && [ -r /dev/tty ] && [ -w /dev/tty ]; then
+  TTY_STATE="$(stty -g </dev/tty)"
+  printf 'Paste GitHub PAT (input hidden), then press Enter: ' >/dev/tty
+  stty -echo </dev/tty
+  IFS= read -r TOKEN </dev/tty || true
+  restore_tty
+  printf '\n' >/dev/tty
+else
+  TOKEN="$(cat)"
+  TOKEN="${TOKEN%$'\n'}"  # strip trailing newline only
+fi
+
+[ -n "$TOKEN" ] || { echo "empty token on stdin" >&2; exit 1; }
+
+# Sanity-check shape (fine-grained PATs start with github_pat_).
+case "$TOKEN" in
+  github_pat_*|ghp_*) ;;
+  *) echo "token doesn't look like a GitHub PAT (expected github_pat_… or ghp_…)" >&2; exit 1;;
+esac
+
+set +e
+fieldwork_validate_pat "$TOKEN"
+pat_valid=$?
+set -e
+case "$pat_valid" in
+  0) ;;
+  2) echo "[rotate-pat] warning: could not validate the token (API unreachable); storing it anyway." >&2 ;;
+  *) echo "[rotate-pat] token validation failed; keeping the existing token unchanged." >&2; exit 1 ;;
+esac
+
+DEST="$TOKEN_PATH"
+TMP="$(mktemp "$TOKEN_DIR/.gh-token.XXXXXX")"
+trap 'rm -f "$TMP"' EXIT
+
+printf '%s\n' "$TOKEN" > "$TMP"
+chown "$BROKER_USER:$BROKER_USER" "$TMP"
+chmod 600 "$TMP"
+mv -f "$TMP" "$DEST"
+trap - EXIT
+
+systemctl restart "$BROKER_SERVICE"
+if id "$AGENT_USER" >/dev/null 2>&1; then
+  agent_home="$(getent passwd "$AGENT_USER" | cut -d: -f6)"
+  if [ -n "$agent_home" ]; then
+    install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 700 "$agent_home/.fieldwork/state"
+    : > "$agent_home/.fieldwork/state/broker-pat-confirmed"
+    chown "$AGENT_USER:$AGENT_USER" "$agent_home/.fieldwork/state/broker-pat-confirmed"
+    chmod 600 "$agent_home/.fieldwork/state/broker-pat-confirmed"
+  fi
+fi
+echo "[rotate-pat] token replaced; broker restarted"

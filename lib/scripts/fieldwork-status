@@ -1,0 +1,330 @@
+#!/usr/bin/env bash
+# Shared Fieldwork terminal status helper.
+#
+# Public API:
+#   fieldwork_status_start "message"
+#   fieldwork_status_update "message"
+#   fieldwork_status_succeed "message"
+#   fieldwork_status_fail "message"
+#   fieldwork_status_note_line "message"
+#   fieldwork_status_register_cleanup_file "/tmp/file"
+#   fieldwork_status_forget_cleanup_file "/tmp/file"
+#   fieldwork_status_cleanup
+#
+# TTY detection intentionally uses only [ -t 1 ]. It does not trust $TERM or
+# CI-style environment variables because those often lie in piped or sandboxed
+# execution.
+#
+# Nested calls are suppressed, not stacked: if start() is called while another
+# status is active, it increments a nested counter and leaves the outer status
+# unchanged. The matching succeed()/fail() only decrements that counter. This
+# keeps helper functions from erasing a caller's in-flight status line.
+#
+# The renderer starts after FIELDWORK_STATUS_DELAY_SECONDS (default 0.2s), so
+# genuinely fast operations print only their final result and never flash a
+# spinner. Once visible, long operations update with elapsed time after three
+# seconds and then keep refreshing.
+#
+# FIELDWORK_STATUS_QUIET=1 suppresses starts, success lines, and informational
+# notes. Failure lines still print so quiet command paths do not hide errors.
+# Cleanup-file registration is for mktemp artifacts owned by callers; registered
+# files are removed by fieldwork_status_cleanup, including on Ctrl+C via the
+# top-level Fieldwork trap.
+
+FIELDWORK_STATUS_ACTIVE="${FIELDWORK_STATUS_ACTIVE:-0}"
+FIELDWORK_STATUS_NESTED="${FIELDWORK_STATUS_NESTED:-0}"
+FIELDWORK_STATUS_PID="${FIELDWORK_STATUS_PID:-}"
+FIELDWORK_STATUS_MESSAGE_FILE="${FIELDWORK_STATUS_MESSAGE_FILE:-}"
+FIELDWORK_STATUS_RENDERED_FILE="${FIELDWORK_STATUS_RENDERED_FILE:-}"
+FIELDWORK_STATUS_CURSOR_HIDDEN="${FIELDWORK_STATUS_CURSOR_HIDDEN:-0}"
+FIELDWORK_STATUS_DELAY_SECONDS="${FIELDWORK_STATUS_DELAY_SECONDS:-0.2}"
+FIELDWORK_STATUS_LONG_SECONDS="${FIELDWORK_STATUS_LONG_SECONDS:-3}"
+FIELDWORK_STATUS_QUIET="${FIELDWORK_STATUS_QUIET:-0}"
+FIELDWORK_STATUS_CLEANUP_FILES="${FIELDWORK_STATUS_CLEANUP_FILES:-}"
+
+fieldwork_status_supports_utf8() {
+  case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
+    *UTF-8*|*utf8*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+fieldwork_status_use_color() {
+  [ -t 1 ] && [ -z "${NO_COLOR:-}" ]
+}
+
+fieldwork_status_green() {
+  if fieldwork_status_use_color; then
+    printf '\033[32m%s\033[0m' "$1"
+  else
+    printf '%s' "$1"
+  fi
+}
+
+fieldwork_status_red() {
+  if fieldwork_status_use_color; then
+    printf '\033[31m%s\033[0m' "$1"
+  else
+    printf '%s' "$1"
+  fi
+}
+
+fieldwork_status_mark() {
+  local frame="${1:-0}"
+  if [ -t 1 ] && fieldwork_status_supports_utf8; then
+    if [ $((frame % 2)) -eq 0 ]; then
+      printf '*'
+    else
+      printf '**'
+    fi
+  else
+    if [ $((frame % 2)) -eq 0 ]; then
+      printf '.'
+    else
+      printf '..'
+    fi
+  fi
+}
+
+fieldwork_status_ready_line() {
+  local message="$1"
+  [ -n "$message" ] || return 0
+  [ "${FIELDWORK_STATUS_QUIET:-0}" = "1" ] && return 0
+  if declare -F status_ok_line >/dev/null 2>&1; then
+    status_ok_line "$message"
+  elif declare -F ok >/dev/null 2>&1; then
+    ok "$message"
+  elif [ -t 1 ] && fieldwork_status_supports_utf8; then
+    printf '  %s  %s\n' "$(fieldwork_status_green "ready")" "$message"
+  else
+    printf '  [ready] %s\n' "$message"
+  fi
+}
+
+fieldwork_status_fail_line() {
+  local message="$1"
+  [ -n "$message" ] || return 0
+  if declare -F status_failed_line >/dev/null 2>&1; then
+    status_failed_line "$message"
+  elif declare -F status_fail_line >/dev/null 2>&1; then
+    status_fail_line "$message"
+  elif declare -F fail >/dev/null 2>&1; then
+    fail "$message"
+  elif [ -t 1 ] && fieldwork_status_supports_utf8; then
+    printf '  %s  %s\n' "$(fieldwork_status_red "blocked")" "$message" >&2
+  else
+    printf '  [blocked] %s\n' "$message" >&2
+  fi
+}
+
+fieldwork_status_note_line() {
+  local message="$1"
+  [ -n "$message" ] || return 0
+  [ "${FIELDWORK_STATUS_QUIET:-0}" = "1" ] && return 0
+  if declare -F status_info_line >/dev/null 2>&1; then
+    status_info_line "$message"
+  elif declare -F note >/dev/null 2>&1; then
+    note "$message"
+  else
+    printf '  [info] %s\n' "$message"
+  fi
+}
+
+fieldwork_status_clear_line() {
+  [ -t 1 ] || return 0
+  printf '\r\033[K'
+}
+
+fieldwork_status_show_cursor() {
+  [ "$FIELDWORK_STATUS_CURSOR_HIDDEN" = "1" ] || return 0
+  printf '\033[?25h'
+  FIELDWORK_STATUS_CURSOR_HIDDEN=0
+}
+
+fieldwork_status_register_cleanup_file() {
+  local path="$1"
+  [ -n "$path" ] || return 0
+  case "
+$FIELDWORK_STATUS_CLEANUP_FILES
+" in
+    *"
+$path
+"*) return 0 ;;
+  esac
+  if [ -n "$FIELDWORK_STATUS_CLEANUP_FILES" ]; then
+    FIELDWORK_STATUS_CLEANUP_FILES="$FIELDWORK_STATUS_CLEANUP_FILES
+$path"
+  else
+    FIELDWORK_STATUS_CLEANUP_FILES="$path"
+  fi
+}
+
+fieldwork_status_forget_cleanup_file() {
+  local path="$1"
+  local file next=""
+  [ -n "$path" ] || return 0
+  while IFS= read -r file; do
+    [ -n "$file" ] || continue
+    [ "$file" = "$path" ] && continue
+    if [ -n "$next" ]; then
+      next="$next
+$file"
+    else
+      next="$file"
+    fi
+  done <<EOF
+$FIELDWORK_STATUS_CLEANUP_FILES
+EOF
+  FIELDWORK_STATUS_CLEANUP_FILES="$next"
+}
+
+fieldwork_status_cleanup_registered_files() {
+  local file
+  while IFS= read -r file; do
+    [ -n "$file" ] || continue
+    rm -f -- "$file"
+  done <<EOF
+$FIELDWORK_STATUS_CLEANUP_FILES
+EOF
+  FIELDWORK_STATUS_CLEANUP_FILES=""
+}
+
+fieldwork_status_renderer() {
+  local message_file="$1"
+  local rendered_file="$2"
+  local delay="$3"
+  local long_after="$4"
+  local mode="$5"
+  local frame=0
+  local start now elapsed message mark
+
+  sleep "$delay" 2>/dev/null || sleep 1
+  : >"$rendered_file"
+  start="$(date +%s)"
+
+  if [ "$mode" = "tty" ]; then
+    printf '\033[?25l'
+    while :; do
+      message="$(cat "$message_file" 2>/dev/null || true)"
+      [ -n "$message" ] || message="Working"
+      now="$(date +%s)"
+      elapsed=$((now - start))
+      mark="$(fieldwork_status_mark "$frame")"
+      printf '\r\033[K'
+      if [ "$elapsed" -ge "$long_after" ]; then
+        printf '  %-2s %s still running... %ss' "$mark" "$message" "$elapsed"
+      else
+        printf '  %-2s %s' "$mark" "$message"
+      fi
+      frame=$((frame + 1))
+      sleep 0.4
+    done
+  fi
+
+  message="$(cat "$message_file" 2>/dev/null || true)"
+  [ -n "$message" ] || message="Working"
+  printf '  [info] %s ...\n' "$message"
+  while :; do
+    sleep "$long_after" 2>/dev/null || sleep 3
+    message="$(cat "$message_file" 2>/dev/null || true)"
+    [ -n "$message" ] || message="Working"
+    now="$(date +%s)"
+    elapsed=$((now - start))
+    printf '  [info] %s still running... %ss\n' "$message" "$elapsed"
+  done
+}
+
+fieldwork_status_start() {
+  local message="$1"
+  [ "${FIELDWORK_STATUS_QUIET:-0}" = "1" ] && return 0
+  if [ "$FIELDWORK_STATUS_ACTIVE" = "1" ]; then
+    FIELDWORK_STATUS_NESTED=$((FIELDWORK_STATUS_NESTED + 1))
+    return 0
+  fi
+
+  FIELDWORK_STATUS_ACTIVE=1
+  FIELDWORK_STATUS_NESTED=0
+  FIELDWORK_STATUS_MESSAGE_FILE="$(mktemp "${TMPDIR:-/tmp}/fieldwork-status-message.XXXXXX")"
+  FIELDWORK_STATUS_RENDERED_FILE="$(mktemp "${TMPDIR:-/tmp}/fieldwork-status-rendered.XXXXXX")"
+  rm -f "$FIELDWORK_STATUS_RENDERED_FILE"
+  printf '%s\n' "$message" >"$FIELDWORK_STATUS_MESSAGE_FILE"
+
+  local mode="plain"
+  [ -t 1 ] && mode="tty"
+  fieldwork_status_renderer \
+    "$FIELDWORK_STATUS_MESSAGE_FILE" \
+    "$FIELDWORK_STATUS_RENDERED_FILE" \
+    "$FIELDWORK_STATUS_DELAY_SECONDS" \
+    "$FIELDWORK_STATUS_LONG_SECONDS" \
+    "$mode" &
+  FIELDWORK_STATUS_PID=$!
+}
+
+fieldwork_status_update() {
+  local message="$1"
+  if [ "$FIELDWORK_STATUS_ACTIVE" = "1" ] && [ -n "$FIELDWORK_STATUS_MESSAGE_FILE" ]; then
+    printf '%s\n' "$message" >"$FIELDWORK_STATUS_MESSAGE_FILE"
+  fi
+}
+
+fieldwork_status_stop_renderer() {
+  if [ -n "${FIELDWORK_STATUS_PID:-}" ]; then
+    kill "$FIELDWORK_STATUS_PID" 2>/dev/null || true
+    wait "$FIELDWORK_STATUS_PID" 2>/dev/null || true
+  fi
+  FIELDWORK_STATUS_PID=""
+  if [ -f "${FIELDWORK_STATUS_RENDERED_FILE:-}" ]; then
+    fieldwork_status_clear_line
+    [ -t 1 ] && printf '\033[?25h'
+    FIELDWORK_STATUS_CURSOR_HIDDEN=0
+  fi
+  rm -f "${FIELDWORK_STATUS_MESSAGE_FILE:-}" "${FIELDWORK_STATUS_RENDERED_FILE:-}"
+  FIELDWORK_STATUS_MESSAGE_FILE=""
+  FIELDWORK_STATUS_RENDERED_FILE=""
+  FIELDWORK_STATUS_ACTIVE=0
+  FIELDWORK_STATUS_NESTED=0
+}
+
+fieldwork_status_succeed() {
+  local message="${1:-}"
+  if [ "$FIELDWORK_STATUS_NESTED" -gt 0 ]; then
+    FIELDWORK_STATUS_NESTED=$((FIELDWORK_STATUS_NESTED - 1))
+    return 0
+  fi
+  fieldwork_status_stop_renderer
+  [ "${FIELDWORK_STATUS_QUIET:-0}" = "1" ] && return 0
+  fieldwork_status_ready_line "$message"
+}
+
+fieldwork_status_fail() {
+  local message="${1:-}"
+  if [ "$FIELDWORK_STATUS_NESTED" -gt 0 ]; then
+    FIELDWORK_STATUS_NESTED=$((FIELDWORK_STATUS_NESTED - 1))
+    return 0
+  fi
+  fieldwork_status_stop_renderer
+  fieldwork_status_fail_line "$message"
+}
+
+fieldwork_status_cleanup() {
+  fieldwork_status_stop_renderer
+  fieldwork_status_show_cursor
+  fieldwork_status_cleanup_registered_files
+}
+
+fieldwork_status_check() {
+  local message="$1"
+  shift
+  local status
+  fieldwork_status_start "$message"
+  set +e
+  "$@" >/dev/null 2>&1
+  status=$?
+  set -e
+  if [ "$status" -eq 0 ]; then
+    fieldwork_status_succeed ""
+  else
+    fieldwork_status_fail ""
+  fi
+  return "$status"
+}

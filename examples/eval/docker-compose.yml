@@ -1,0 +1,21 @@
+services:
+  fieldwork-eval:
+    build:
+      context: ../..
+      dockerfile: examples/eval/Dockerfile
+    working_dir: /workspace
+    environment:
+      FIELDWORK_BROKER_PROJECTS_ROOT: /workspace/.eval/projects
+      FIELDWORK_BROKER_LEDGER_DIR: /workspace/.eval/state/requests
+      FIELDWORK_BROKER_PENDING_DIR: /workspace/.eval/state/pending
+      FIELDWORK_BROKER_AUDIT_LOG_PATH: /workspace/.eval/state/audit.jsonl
+      FIELDWORK_BROKER_TOKEN_PATH: /workspace/.eval/state/fake-token
+      FIELDWORK_BROKER_ASKPASS_PATH: /workspace/lib/broker/git-askpass
+      FIELDWORK_BROKER_COMMAND_PATH: /workspace/examples/eval:/usr/bin:/bin
+    volumes:
+      - ../..:/workspace
+      - fieldwork-eval-state:/workspace/.eval
+    command: ["bash", "-lc", "mkdir -p /workspace/.eval/state /workspace/.eval/projects && printf 'github_pat_eval\\n' > /workspace/.eval/state/fake-token && tail -f /dev/null"]
+
+volumes:
+  fieldwork-eval-state:

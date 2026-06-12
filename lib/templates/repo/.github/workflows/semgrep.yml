@@ -1,0 +1,31 @@
+name: semgrep
+
+# SAST. Pinned to a specific Semgrep version, not @latest, so a Semgrep update
+# can't silently change CI behaviour. Stack rule packs added/removed by fieldwork-init.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  semgrep:
+    runs-on: ubuntu-latest
+    container:
+      image: returntocorp/semgrep:1.86.0  # pinned; bump deliberately via Dependabot
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          semgrep ci \
+            --config=p/owasp-top-ten \
+            --config=p/typescript \
+            --config=p/react \
+            --config=p/golang \
+            --config=p/rust \
+            --config=p/bash \
+            --error

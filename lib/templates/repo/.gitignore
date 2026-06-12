@@ -1,0 +1,22 @@
+.fieldwork/local/*
+!.fieldwork/local/.gitkeep
+# Claude Code per-conversation worktrees (each carries its own .git, so the
+# host repo sees them as embedded git repos with "modified content" and trips
+# broker/onboard tree-clean checks).
+.claude/worktrees/
+.mcp.local.json
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# Common secret files
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/

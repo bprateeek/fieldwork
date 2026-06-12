@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+case "$*" in
+  repo\ view*)
+    printf '%s\n' '{"nameWithOwner":"eval/throwaway","defaultBranchRef":{"name":"main"},"visibility":"PRIVATE"}'
+    ;;
+  pr\ create*)
+    printf '%s\n' 'https://github.local/eval/throwaway/pull/1'
+    ;;
+  pr\ edit*)
+    exit 0
+    ;;
+  *)
+    echo "fake-gh: unsupported command: $*" >&2
+    exit 1
+    ;;
+esac

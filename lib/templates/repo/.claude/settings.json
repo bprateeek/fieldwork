@@ -1,0 +1,37 @@
+{
+  "sandbox": {
+    "filesystem": { "allowRead": ["."] },
+    "network": {
+      "enabled": true,
+      "allowedDomains": [
+        "api.anthropic.com",
+        "github.com", "api.github.com", "objects.githubusercontent.com", "ghcr.io",
+        "registry.npmjs.org",
+        "pypi.org", "files.pythonhosted.org",
+        "proxy.golang.org", "sum.golang.org",
+        "crates.io", "index.crates.io", "static.crates.io"
+      ]
+    }
+  },
+  "hooks": {
+    "SessionStart": [{
+      "hooks": [{ "type": "command", "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/resume-context.sh\"" }]
+    }],
+    "PreToolUse": [{
+      "matcher": "Bash",
+      "hooks": [{ "type": "command", "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/guard-bash.sh\"" }]
+    }],
+    "Stop": [{
+      "hooks": [
+        { "type": "command", "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/journal.sh\"" },
+        { "type": "command", "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/notify-wrapper.sh\" stop" }
+      ]
+    }],
+    "Notification": [{
+      "hooks": [{ "type": "command", "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/notify-wrapper.sh\" notify" }]
+    }],
+    "StopFailure": [{
+      "hooks": [{ "type": "command", "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/notify-wrapper.sh\" failure" }]
+    }]
+  }
+}

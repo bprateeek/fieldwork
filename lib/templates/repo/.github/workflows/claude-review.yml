@@ -1,0 +1,62 @@
+name: claude-review
+
+# PR-time security review. Hint, not a gate — branch protection requires the
+# deterministic checks (semgrep, codeql, audit). Print mode with bounded budget.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: claude-review-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+    steps:
+      - name: Skip when Claude API key is not configured
+        if: ${{ env.ANTHROPIC_API_KEY == '' }}
+        run: echo "ANTHROPIC_API_KEY is not configured; skipping Claude review."
+
+      - uses: actions/checkout@v4
+        if: ${{ env.ANTHROPIC_API_KEY != '' }}
+        with:
+          fetch-depth: 0  # need history for `git diff main...HEAD`
+
+      - name: Run /security-review
+        if: ${{ env.ANTHROPIC_API_KEY != '' }}
+        run: |
+          set -euo pipefail
+          curl -fsSL https://claude.ai/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.local/bin:$PATH"
+
+          claude -p "/security-review" \
+            --max-turns 5 \
+            --max-budget-usd 2 \
+            --output-format json \
+            --no-session-persistence \
+            > review.json
+
+      - name: Post review as PR comment
+        if: ${{ env.ANTHROPIC_API_KEY != '' }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const review = JSON.parse(fs.readFileSync('review.json', 'utf8'));
+            const body = review.result || review.text || '(no findings)';
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body: `## /security-review\n\n${body}\n\n_Hint, not a gate. See REVIEW.md for the checklist._`,
+            });

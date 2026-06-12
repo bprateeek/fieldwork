@@ -1,0 +1,13 @@
+[Unit]
+Description=Fieldwork PR approve socket (bot decisions)
+
+[Socket]
+ListenStream=/run/fieldwork-pr-broker/fieldwork-pr-approve.sock
+SocketUser=fieldwork-pr-broker
+SocketGroup=fieldwork-bot
+SocketMode=0660
+RuntimeDirectory=fieldwork-pr-broker
+Service=fieldwork-pr-broker.service
+
+[Install]
+WantedBy=sockets.target

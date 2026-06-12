@@ -1,0 +1,28 @@
+{
+  "name": "go-hardened",
+  "build": { "dockerfile": "Dockerfile" },
+  "remoteUser": "vscode",
+  "containerUser": "vscode",
+  "workspaceFolder": "/workspace",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind",
+  "runArgs": [
+    "--cap-drop=ALL",
+    "--security-opt=no-new-privileges",
+    "--memory=2g",
+    "--cpus=2",
+    "--pids-limit=512"
+  ],
+  "mounts": [],
+  "containerEnv": {
+    "GOFLAGS": "-mod=readonly"
+  },
+  "remoteEnv": {
+    "SSH_AUTH_SOCK": ""
+  },
+  "postCreateCommand": "/etc/devcontainer/healthcheck.sh && go mod download",
+  "customizations": {
+    "vscode": {
+      "extensions": ["golang.go"]
+    }
+  }
+}

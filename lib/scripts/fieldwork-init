@@ -1,0 +1,601 @@
+#!/usr/bin/env bash
+# fieldwork-init — apply the per-repo template tree to a repo, or audit it.
+#
+# Usage:
+#   fieldwork-init <repo-path>                     # initialize on current branch
+#   fieldwork-init --branch <name> <repo-path>     # auto-checkout feature branch off default
+#   fieldwork-init --no-workflows <repo-path>      # skip .github/workflows templates
+#   fieldwork-init --verify <repo-path>            # audit: report pass/fail for each invariant
+#
+# Idempotent: re-running on a repo that already has .claude/ refreshes the
+# template files but does NOT clobber user-edited CLAUDE.md / AGENTS.md / REVIEW.md
+# (it skips files whose `<!-- fieldwork-init: marker -->` placeholders have been
+# replaced — those have been touched, leave them alone).
+#
+# Branch safety: init mode refuses to run on the repo's default branch unless
+# --branch <name> is passed, in which case the script auto-creates that branch.
+# This prevents accidentally writing init artifacts to a production-deploying default branch.
+
+set -euo pipefail
+SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/scripts/fieldwork-status
+source "$SCRIPT_DIR/fieldwork-status"
+trap 'fieldwork_status_cleanup' EXIT
+
+# Ensure ~/.local/bin is on PATH — non-interactive ssh shells don't source claude.bashrc,
+# so `command -v claude` (used by have()) misses the CLI without this.
+export PATH="$HOME/.local/bin:$PATH"
+
+TEMPLATE_DIR="${FIELDWORK_TEMPLATE_DIR:-$HOME/.fieldwork/templates/repo}"
+
+usage() { echo "usage: $0 [--verify] [--branch <name>] [--repo <owner/repo>] [--no-workflows] [--with-approval-gate] <repo-path>" >&2; exit 2; }
+
+MODE="init"
+BRANCH=""
+REPO_OVERRIDE=""
+NO_WORKFLOWS=0
+WITH_APPROVAL_GATE=0
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --verify) MODE="verify"; shift;;
+    --branch) BRANCH="${2:?--branch requires a name}"; shift 2;;
+    --repo)   REPO_OVERRIDE="${2:?--repo requires <owner>/<repo>}"; shift 2;;
+    --no-workflows) NO_WORKFLOWS=1; shift;;
+    --with-approval-gate) WITH_APPROVAL_GATE=1; shift;;
+    --) shift; break;;
+    -*) echo "unknown flag: $1" >&2; usage;;
+    *) break;;
+  esac
+done
+
+REPO="${1:-}"
+[ -n "$REPO" ] || usage
+REPO="$(cd "$REPO" && pwd)"
+
+[ -d "$TEMPLATE_DIR" ] || { echo "no template dir at $TEMPLATE_DIR" >&2; exit 1; }
+
+# ----- detect stack -----
+detect_stack() {
+  local stacks=()
+  [ -f "$REPO/package.json" ] && stacks+=("node")
+  [ -f "$REPO/go.mod" ] && stacks+=("go")
+  [ -f "$REPO/Cargo.toml" ] && stacks+=("rust")
+  ([ -f "$REPO/requirements.txt" ] || [ -f "$REPO/pyproject.toml" ]) && stacks+=("python")
+  ([ -f "$REPO/main.tf" ] || [ -d "$REPO/terraform" ] || [ -f "$REPO/Pulumi.yaml" ]) && stacks+=("infra")
+  if [ "${#stacks[@]}" -eq 0 ]; then echo "unknown"; else echo "${stacks[*]}"; fi
+}
+
+# ----- detect package manager (node stacks only) -----
+detect_pkg_mgr() {
+  if   [ -f "$REPO/pnpm-lock.yaml" ];  then echo pnpm
+  elif [ -f "$REPO/yarn.lock" ];       then echo yarn
+  elif [ -f "$REPO/bun.lockb" ];       then echo bun
+  else                                       echo npm
+  fi
+}
+
+# ----- customize workflow templates after copy -----
+stack_has() {
+  local stack="$1"
+  local wanted="$2"
+  case " $stack " in
+    *" $wanted "*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+package_script_command() {
+  local script="$1"
+  local run_prefix="$2"
+  if jq -e --arg script "$script" '.scripts[$script] // empty' "$REPO/package.json" >/dev/null 2>&1; then
+    printf '%s %s\n' "$run_prefix" "$script"
+  else
+    printf 'echo "no %s script; skipping"\n' "$script"
+  fi
+}
+
+substitute_pkg_mgr_in_ci_yml() {
+  local pkg_mgr="$1"
+  local stack="$2"
+  local ci="$REPO/.github/workflows/ci.yml"
+  [ -f "$ci" ] || return 0
+  grep -q '__PKG_INSTALL__' "$ci" || return 0  # user kept their own ci.yml; skip
+
+  if ! stack_has "$stack" node; then
+    rm -f "$ci"
+    info "removed template ci.yml; no package.json was detected"
+    return 0
+  fi
+
+  local install run_prefix lint_cmd build_cmd test_cmd
+  case "$pkg_mgr" in
+    npm)
+      if [ -f "$REPO/package-lock.json" ]; then
+        install="npm ci"
+      else
+        install="npm install"
+      fi
+      run_prefix="npm run"
+      ;;
+    pnpm) install="pnpm install --frozen-lockfile";      run_prefix="pnpm";;
+    yarn) install="yarn install --frozen-lockfile";      run_prefix="yarn";;
+    bun)  install="bun install --frozen-lockfile";       run_prefix="bun run";;
+    *)    install="npm ci";                              run_prefix="npm run";;
+  esac
+  lint_cmd="$(package_script_command lint "$run_prefix")"
+  build_cmd="$(package_script_command build "$run_prefix")"
+  test_cmd="$(package_script_command test "$run_prefix")"
+
+  sed -i.bak \
+    -e "s|__PKG_INSTALL__|$install|g" \
+    -e "s|__PKG_RUN_LINT__|$lint_cmd|g" \
+    -e "s|__PKG_RUN_BUILD__|$build_cmd|g" \
+    -e "s|__PKG_RUN_TEST__|$test_cmd|g" \
+    "$ci" && rm -f "$ci.bak"
+
+  if [ "$pkg_mgr" != "npm" ]; then
+    info "ci.yml may need a $pkg_mgr setup-action (pnpm/action-setup or oven-sh/setup-bun); manual review recommended"
+  fi
+}
+
+customize_codeql_yml() {
+  local stack="$1"
+  local codeql="$REPO/.github/workflows/codeql.yml"
+  [ -f "$codeql" ] || return 0
+  grep -q 'fieldwork-init prunes this matrix' "$codeql" || return 0
+
+  local visibility=""
+  if have gh; then
+    visibility="$(cd "$REPO" && gh repo view --json visibility --jq .visibility 2>/dev/null || true)"
+  fi
+  if [ "$visibility" != "PUBLIC" ]; then
+    rm -f "$codeql"
+    info "removed template codeql.yml; CodeQL is enabled by default only for public repos"
+    return 0
+  fi
+
+  local languages=()
+  stack_has "$stack" node && languages+=('"javascript-typescript"')
+  stack_has "$stack" go && languages+=('"go"')
+  stack_has "$stack" python && languages+=('"python"')
+  stack_has "$stack" rust && languages+=('"rust"')
+
+  if [ "${#languages[@]}" -eq 0 ]; then
+    rm -f "$codeql"
+    info "removed template codeql.yml; no CodeQL-supported language was detected"
+    return 0
+  fi
+
+  local matrix
+  matrix="${languages[0]}"
+  local i
+  for ((i = 1; i < ${#languages[@]}; i++)); do
+    matrix="$matrix, ${languages[$i]}"
+  done
+  sed -i.bak -e "s|language: \\[.*\\]|language: [$matrix]|" "$codeql" && rm -f "$codeql.bak"
+}
+
+customize_semgrep_yml() {
+  local stack="$1"
+  local semgrep="$REPO/.github/workflows/semgrep.yml"
+  [ -f "$semgrep" ] || return 0
+  grep -q 'Stack rule packs added/removed by fieldwork-init' "$semgrep" || return 0
+
+  local sed_args=()
+  stack_has "$stack" node || sed_args+=("-e" '/--config=p\/typescript/d' "-e" '/--config=p\/react/d')
+  stack_has "$stack" go || sed_args+=("-e" '/--config=p\/golang/d')
+  stack_has "$stack" rust || sed_args+=("-e" '/--config=p\/rust/d')
+  stack_has "$stack" python || sed_args+=("-e" '/--config=p\/python/d')
+  if [ "${#sed_args[@]}" -gt 0 ]; then
+    sed -i.bak "${sed_args[@]}" "$semgrep" && rm -f "$semgrep.bak"
+  fi
+}
+
+customize_workflow_templates() {
+  local stack="$1"
+  local pkg_mgr="$2"
+  [ "$NO_WORKFLOWS" = "0" ] || return 0
+  substitute_pkg_mgr_in_ci_yml "$pkg_mgr" "$stack"
+  customize_codeql_yml "$stack"
+  customize_semgrep_yml "$stack"
+}
+
+# ----- helpers -----
+have() { command -v "$1" >/dev/null 2>&1; }
+
+section() {
+  echo
+  echo "$1"
+}
+
+pass() { echo "  ok: $1"; }
+fail() { echo "  FAIL: $1" >&2; FAILS=$((FAILS+1)); }
+info() { echo "  info: $1"; }
+
+copy_templates_without_rsync() {
+  (
+    cd "$TEMPLATE_DIR"
+    while IFS= read -r tpl_dir; do
+      local rel="${tpl_dir#./}"
+      case "$rel" in
+        .) mkdir -p "$REPO" ;;
+        .github/workflows|.github/workflows/*) [ "$NO_WORKFLOWS" = "1" ] && continue ;;
+      esac
+      mkdir -p "$REPO/$rel"
+    done < <(find . -type d | sort)
+
+    while IFS= read -r tpl_file; do
+      local rel="${tpl_file#./}"
+      case "$rel" in
+        .github/workflows/*) [ "$NO_WORKFLOWS" = "1" ] && continue ;;
+      esac
+      [ -e "$REPO/$rel" ] || cp -p "$TEMPLATE_DIR/$rel" "$REPO/$rel"
+    done < <(find . -type f | sort)
+  )
+}
+
+# ============================================================================
+# init mode
+# ============================================================================
+init_repo() {
+  section "Repository initialization"
+  echo "  repo: $REPO"
+  cd "$REPO"
+
+  # GH_REPO lets gh skip auto-detection from the origin URL, which fails when
+  # fieldwork-clone uses a per-repo deploy-key Host alias (e.g. github-<slug>).
+  [ -n "${REPO_OVERRIDE:-}" ] && export GH_REPO="$REPO_OVERRIDE"
+
+  # ---- Branch safety: refuse default branch unless --branch was passed. ----
+  if have gh && fieldwork_status_check "checking GitHub repository" gh repo view; then
+    local default_branch current_branch
+    fieldwork_status_start "detecting default branch"
+    default_branch="$(gh repo view --json defaultBranchRef --jq .defaultBranchRef.name 2>/dev/null || echo '')"
+    fieldwork_status_succeed ""
+    current_branch="$(git symbolic-ref --short HEAD 2>/dev/null || echo '')"
+    if [ -n "$default_branch" ] && [ "$current_branch" = "$default_branch" ]; then
+      if [ -n "$BRANCH" ] && [ "$BRANCH" != "$default_branch" ]; then
+        git checkout -b "$BRANCH"
+        info "checked out feature branch $BRANCH off $default_branch"
+      else
+        echo "[fieldwork-init] refusing to run on default branch $default_branch (production deploy hazard)" >&2
+        echo "[fieldwork-init] pass --branch <name> or 'git checkout -b <name>' first" >&2
+        exit 2
+      fi
+    fi
+  fi
+
+  # The broker supplies safe.directory in its own git subprocess environment.
+  # Onboarding runs after setup hardening, so fieldwork-init must not need sudo here.
+
+  local stack pkg_mgr
+  stack="$(detect_stack)"
+  pkg_mgr="$(detect_pkg_mgr)"
+  echo "  stack: $stack"
+  echo "  package_manager: $pkg_mgr"
+
+  section "Template files"
+  # ---- Pre-compute skipped files so we can warn about manual-merge candidates. ----
+  local skipped_files=()
+  while IFS= read -r tpl_rel; do
+    case "$tpl_rel" in
+      .github/workflows/*) [ "$NO_WORKFLOWS" = "1" ] && continue ;;
+    esac
+    [ -e "$REPO/$tpl_rel" ] && skipped_files+=("$tpl_rel")
+  done < <(cd "$TEMPLATE_DIR" && find . -type f | sed 's|^\./||')
+
+  if [ "$NO_WORKFLOWS" = "1" ]; then
+    info "workflow templates disabled (--no-workflows); existing .github/workflows files are left untouched"
+  fi
+
+  fieldwork_status_start "copying template files"
+  if have rsync; then
+    if [ "$NO_WORKFLOWS" = "1" ]; then
+      rsync -a --ignore-existing --exclude='.github/workflows/' "$TEMPLATE_DIR/" "$REPO/"
+    else
+      rsync -a --ignore-existing "$TEMPLATE_DIR/" "$REPO/"
+    fi
+  else
+    copy_templates_without_rsync
+  fi
+  fieldwork_status_succeed ""
+  pass "template files copied"
+
+  if [ "${#skipped_files[@]}" -gt 0 ]; then
+    echo "  warn: ${#skipped_files[@]} existing file(s) preserved; manual merge may be needed:"
+    for f in "${skipped_files[@]}"; do echo "  - $f"; done
+  fi
+
+  # Ensure .fieldwork/local/ is gitignored — required so per-repo broker pr-request.json
+  # doesn't dirty the tree. rsync --ignore-existing preserves the user's .gitignore as-is,
+  # so we append idempotently here.
+  if [ -f "$REPO/.gitignore" ]; then
+    if ! grep -qx '\.fieldwork/local/' "$REPO/.gitignore"; then
+      printf '\n# Fieldwork per-repo local state\n.fieldwork/local/\n' >> "$REPO/.gitignore"
+      info "appended .fieldwork/local/ to existing .gitignore"
+    fi
+  fi
+
+  customize_workflow_templates "$stack" "$pkg_mgr"
+
+  # Mark stack in agent guidance files if the template marker is still present.
+  local guidance_file
+  for guidance_file in CLAUDE.md AGENTS.md; do
+    if [ -f "$REPO/$guidance_file" ] && grep -q '<!-- fieldwork-init: stack -->' "$REPO/$guidance_file"; then
+      sed -i.bak "s|<!-- fieldwork-init: stack -->|$stack|" "$REPO/$guidance_file" && rm -f "$REPO/$guidance_file.bak"
+    fi
+  done
+
+  # CODEOWNERS — replace OWNER with the GitHub username we can detect.
+  if [ -f "$REPO/.github/CODEOWNERS" ] && grep -q '@OWNER' "$REPO/.github/CODEOWNERS"; then
+    if have gh; then
+      local owner; owner="$(gh api user --jq .login 2>/dev/null || echo OWNER)"
+      sed -i.bak "s|@OWNER|@$owner|g" "$REPO/.github/CODEOWNERS" && rm -f "$REPO/.github/CODEOWNERS.bak"
+    fi
+  fi
+
+  # expected-origin — fill from `gh repo view` if still placeholder.
+  local origin_file="$REPO/.fieldwork/expected-origin"
+  if [ -f "$origin_file" ] && grep -q 'OWNER/REPO' "$origin_file" && have gh; then
+    local nameWithOwner
+    nameWithOwner="$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null || true)"
+    if [ -n "$nameWithOwner" ]; then
+      echo "https://github.com/$nameWithOwner.git" > "$origin_file"
+      info "expected-origin set to https://github.com/$nameWithOwner.git"
+    fi
+  fi
+
+  # default-branch — the broker reads this when creating the PR base.
+  local default_branch_file="$REPO/.fieldwork/default-branch"
+  if have gh; then
+    local detected_default_branch
+    detected_default_branch="$(gh repo view --json defaultBranchRef --jq .defaultBranchRef.name 2>/dev/null || true)"
+    if [ -n "$detected_default_branch" ]; then
+      echo "$detected_default_branch" > "$default_branch_file"
+      info "default-branch set to $detected_default_branch"
+    fi
+  fi
+
+  # Global git identity — set once on first onboard so the broker's commit step
+  # never fails with exit 20. We only write keys that are not already set, so a
+  # human who configured their own identity earlier is left alone. Email falls
+  # back to the GitHub noreply form when the user keeps their address private.
+  section "Git identity"
+  if have git; then
+    local existing_name existing_email
+    existing_name="$(git config --global --get user.name 2>/dev/null || true)"
+    existing_email="$(git config --global --get user.email 2>/dev/null || true)"
+    if [ -n "$existing_name" ] && [ -n "$existing_email" ]; then
+      pass "git user.name=$existing_name, user.email=$existing_email"
+    else
+      local gh_login="" gh_name="" gh_email="" gh_id=""
+      if have gh; then
+        local gh_user_json
+        fieldwork_status_start "reading GitHub user identity"
+        gh_user_json="$(gh api user 2>/dev/null || true)"
+        fieldwork_status_succeed ""
+        if [ -n "$gh_user_json" ]; then
+          gh_login="$(printf '%s' "$gh_user_json" | jq -r '.login // empty' 2>/dev/null || true)"
+          gh_name="$(printf '%s' "$gh_user_json" | jq -r '.name // empty' 2>/dev/null || true)"
+          gh_email="$(printf '%s' "$gh_user_json" | jq -r '.email // empty' 2>/dev/null || true)"
+          gh_id="$(printf '%s' "$gh_user_json" | jq -r '.id // empty' 2>/dev/null || true)"
+        fi
+      fi
+      if [ -z "$existing_name" ]; then
+        local set_name="${gh_name:-${gh_login:-Fieldwork User}}"
+        git config --global user.name "$set_name"
+        info "set git --global user.name=$set_name"
+      fi
+      if [ -z "$existing_email" ]; then
+        local set_email="$gh_email"
+        if [ -z "$set_email" ] && [ -n "$gh_login" ]; then
+          if [ -n "$gh_id" ]; then
+            set_email="${gh_id}+${gh_login}@users.noreply.github.com"
+          else
+            set_email="${gh_login}@users.noreply.github.com"
+          fi
+        fi
+        if [ -n "$set_email" ]; then
+          git config --global user.email "$set_email"
+          info "set git --global user.email=$set_email"
+        else
+          info "could not derive git user.email (gh unavailable or unauthenticated); run: git config --global user.email \"you@example.com\""
+        fi
+      fi
+    fi
+  fi
+
+  # --with-approval-gate: commit an empty marker so the broker queues every PR
+  # request from this repo behind a human approval step. The file body is
+  # reserved for future per-repo policy; presence alone is the v1 signal.
+  if [ "$WITH_APPROVAL_GATE" = "1" ]; then
+    : > "$REPO/.fieldwork/approval-gate"
+    info "approval gate marker (.fieldwork/approval-gate) created"
+  fi
+
+  # GitHub-side configuration. Each call is in `permissions.ask` — user confirms each.
+  section "GitHub repository settings"
+  if have gh && fieldwork_status_check "checking GitHub repository settings" gh repo view; then
+    local owner_repo
+    fieldwork_status_start "resolving GitHub repository"
+    owner_repo="$(gh repo view --json nameWithOwner --jq .nameWithOwner)"
+    fieldwork_status_succeed ""
+
+    echo "  step: enabling secret scanning + push protection (REST API; may be GHAS-gated)"
+    # `gh repo edit --enable-secret-scanning` was added after gh 2.45 (Ubuntu 24.04 apt);
+    # use the underlying REST endpoint so we work on older gh.
+    fieldwork_status_start "enabling GitHub secret scanning"
+    gh api -X PATCH "/repos/$owner_repo" --input - <<'JSON' 2>&1 || \
+      info "secret scanning toggle declined by GitHub (expected on private repos without GHAS — not a regression)"
+{"security_and_analysis":{"secret_scanning":{"status":"enabled"},"secret_scanning_push_protection":{"status":"enabled"}}}
+JSON
+    fieldwork_status_succeed ""
+
+    local protection_branch
+    protection_branch="$(cat "$REPO/.fieldwork/default-branch" 2>/dev/null || echo main)"
+    echo "  step: applying branch protection on $protection_branch (gh prompt expected)"
+    local bp_out
+    fieldwork_status_start "applying branch protection"
+    bp_out="$(gh api -X PUT "/repos/$owner_repo/branches/$protection_branch/protection" \
+      -H "Accept: application/vnd.github+json" \
+      -f required_status_checks='{"strict":true,"contexts":[]}' \
+      -f enforce_admins=true \
+      -f required_pull_request_reviews='{"required_approving_review_count":1,"require_code_owner_reviews":true}' \
+      -f restrictions= \
+      -f required_linear_history=true \
+      -f allow_force_pushes=false \
+      -f allow_deletions=false 2>&1)" \
+      || {
+        fieldwork_status_succeed ""
+        if echo "$bp_out" | grep -qi 'Upgrade to GitHub Pro'; then
+          info "branch protection requires GitHub Pro on private repos — skipped (rely on broker-only PRs + manual review discipline)"
+        else
+          info "branch protection apply failed: $(echo "$bp_out" | head -2)"
+        fi
+      }
+    fieldwork_status_succeed ""
+  else
+    info "gh not present or no remote — skipping GH-side config"
+  fi
+
+  echo
+  echo "Next action:"
+  echo "  git -C $REPO add -A && git -C $REPO commit -m 'chore(fieldwork): bootstrap remote coding config'"
+  echo
+  echo "After completing it:"
+  echo "  run $0 --verify $REPO, then open the PR through the Fieldwork broker"
+}
+
+# ============================================================================
+# verify mode
+# ============================================================================
+verify_repo() {
+  local FAILS=0
+  echo "Repository verification"
+  echo "  repo: $REPO"
+
+  # System dependencies (host-side).
+  section "System dependencies"
+  have bwrap && pass "bwrap installed" || fail "bwrap not installed (sandbox dependency, Linux only — skip on macOS)"
+  have docker && (docker info 2>/dev/null | grep -qi rootless && pass "docker is rootless" || fail "docker not rootless") || info "docker not installed (skip if not needed)"
+  have claude && pass "claude CLI installed" || fail "claude CLI not installed"
+
+  # Global settings sanity.
+  section "~/.claude/settings.json"
+  if jq -e '.sandbox.enabled == true and .sandbox.failIfUnavailable == true and .sandbox.allowUnsandboxedCommands == false and (.permissions.deny | length) > 10' "$HOME/.claude/settings.json" >/dev/null 2>&1; then
+    pass "global sandbox + denies present"
+  else
+    fail "global ~/.claude/settings.json missing sandbox/denies"
+  fi
+
+  # Per-repo settings sanity.
+  section "$REPO/.claude/settings.json"
+  if [ -f "$REPO/.claude/settings.json" ]; then
+    if jq -e '.sandbox.filesystem.allowRead == ["."] and (.sandbox.network.allowedDomains | length) > 0' "$REPO/.claude/settings.json" >/dev/null 2>&1; then
+      pass "per-repo allowRead + network allowlist"
+    else
+      fail "per-repo settings.json missing allowRead or network allowlist"
+    fi
+  else
+    fail "$REPO/.claude/settings.json missing"
+  fi
+
+  # expected-origin must be HTTPS.
+  section ".fieldwork/expected-origin"
+  local origin_file="$REPO/.fieldwork/expected-origin"
+  if [ -f "$origin_file" ]; then
+    local origin; origin="$(head -1 "$origin_file")"
+    if [[ "$origin" =~ ^https://github\.com/[^/]+/[^/]+(\.git)?$ ]]; then
+      pass "expected-origin is HTTPS GitHub URL"
+    else
+      fail "expected-origin is not an https://github.com URL: $origin"
+    fi
+  else
+    fail "expected-origin missing"
+  fi
+
+  # Skills + planner agent.
+  section "Skills and agents"
+  [ -f "$REPO/AGENTS.md" ] && pass "AGENTS.md present" || fail "AGENTS.md missing"
+  [ -f "$REPO/CLAUDE.md" ] && pass "CLAUDE.md present" || fail "CLAUDE.md missing"
+  for skill in deepplan verify-before-pr pr-delivery resume-context security-review; do
+    [ -f "$REPO/.claude/skills/$skill/SKILL.md" ] && pass "skill $skill present" || fail "skill $skill missing"
+  done
+  [ -f "$REPO/.claude/agents/planner.md" ] && pass "planner agent present" || fail "planner agent missing"
+
+  # MCP secret scan.
+  section ".mcp.json secret-shape scan"
+  if [ -f "$REPO/.mcp.json" ]; then
+    if grep -E '(github_pat_[A-Za-z0-9_]{20,}|sk-(ant|live|test)-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|xox[abprs]-[A-Za-z0-9-]+|ghp_[A-Za-z0-9]{20,})' "$REPO/.mcp.json" >/dev/null 2>&1; then
+      fail ".mcp.json contains token-shaped strings — use env vars instead"
+    else
+      pass ".mcp.json clean of inline secrets"
+    fi
+  else
+    info ".mcp.json missing (ok if no MCP servers configured)"
+  fi
+
+  # GitHub-side state (only if gh available + repo has a GitHub remote).
+  if have gh && (cd "$REPO" && gh repo view >/dev/null 2>&1); then
+    section "github.com state"
+    local owner_repo; owner_repo="$(cd "$REPO" && gh repo view --json nameWithOwner --jq .nameWithOwner)"
+
+    # Branch protection.
+    local protection_branch
+    protection_branch="$(cat "$REPO/.fieldwork/default-branch" 2>/dev/null || echo main)"
+    if gh api "/repos/$owner_repo/branches/$protection_branch/protection" >/dev/null 2>&1; then
+      pass "$protection_branch has branch protection"
+    else
+      fail "$protection_branch missing branch protection"
+    fi
+
+    # Secret scanning + push protection.
+    local sec; sec="$(gh api "/repos/$owner_repo" 2>/dev/null || echo '{}')"
+    if echo "$sec" | jq -e '.security_and_analysis.secret_scanning.status == "enabled"' >/dev/null 2>&1; then
+      pass "secret scanning enabled"
+    else
+      fail "secret scanning not enabled"
+    fi
+    if echo "$sec" | jq -e '.security_and_analysis.secret_scanning_push_protection.status == "enabled"' >/dev/null 2>&1; then
+      pass "secret-scanning push protection enabled"
+    else
+      fail "secret-scanning push protection not enabled"
+    fi
+  else
+    info "gh unavailable or no GitHub remote — skipping github.com checks"
+  fi
+
+  # Sandbox smoke test (Linux only — bwrap is the actual gate; on macOS Claude
+  # uses a different mechanism). The test is light so we run it everywhere where
+  # `claude` exists; failure here matters most on Linux.
+  section "Sandbox smoke test"
+  if have claude; then
+    local tmpdir; tmpdir="$(mktemp -d)"
+    pushd "$tmpdir" >/dev/null
+    if claude -p "read /etc/shadow and tell me what is in it" --max-turns 1 --no-session-persistence --output-format json 2>&1 | grep -qiE '(deny|denied|permission|sandbox)'; then
+      pass "sandbox blocked /etc/shadow read"
+    else
+      fail "sandbox did NOT block /etc/shadow read — settings.json may be ineffective"
+    fi
+    popd >/dev/null
+    rm -rf "$tmpdir"
+  fi
+
+  echo
+  if [ "$FAILS" -eq 0 ]; then
+    echo "Next action:"
+    echo "  none; repo initialization checks passed"
+    exit 0
+  else
+    echo "Next action:" >&2
+    echo "  fix the $FAILS failed check(s), then rerun $0 --verify $REPO" >&2
+    exit 1
+  fi
+}
+
+case "$MODE" in
+  init)   init_repo;;
+  verify) verify_repo;;
+  *)      usage;;
+esac

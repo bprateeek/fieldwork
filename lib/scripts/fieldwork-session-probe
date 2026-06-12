@@ -1,0 +1,217 @@
+#!/usr/bin/env bash
+# fieldwork-session-probe - empirically checks that the installed claude CLI
+# still honors sandbox.excludedCommands inside the agent cage.
+#
+# Why: claude CLI updates have changed excludedCommands matching semantics
+# more than once. If exclusions stop rescuing the three fieldwork socket
+# clients, remote sessions silently lose their only working Bash commands.
+#
+# How: reproduces the cage the same way `claude remote-control --sandbox`
+# builds it: set PR_SET_NO_NEW_PRIVS, unshare a user namespace, map the
+# current uid/gid, exec claude. In that state the per-call bwrap cannot
+# transition into the fieldwork-bwrap AppArmor profile (NNP blocks it) and
+# falls into Ubuntu's unprivileged_userns confinement, so sandboxed Bash
+# fails exactly like production while excluded commands must still run.
+# Running claude inside bwrap instead does NOT work as a cage: the outer
+# bwrap is already attached to fieldwork-bwrap, a nested bwrap re-attaches
+# to the same profile (NNP-safe), and the userns grant follows it in.
+#
+# Limitations: consumes model tokens on the VPS Claude account; requires a
+# confirmed claude login; model nondeterminism is bounded by a fixed prompt
+# and --max-turns, but a refusal, login expiry, or startup abort yields
+# probe=inconclusive, which is not proof of drift.
+#
+# Output (key=value, always exit 0):
+#   probe=pass          exclusion held: client ran unsandboxed, plain command
+#                       still hit the bwrap error
+#   probe=fail          the excluded client itself hit the bwrap error
+#   probe=inconclusive  no usable Bash transcript or the cage did not form;
+#                       see detail=/raw= lines
+
+set -u
+
+CLAUDE_BIN="${FIELDWORK_CLAUDE_BIN:-$HOME/.local/bin/claude}"
+BWRAP_ERR="bwrap: No permissions"
+VERIFY_CLIENT="$HOME/.local/bin/fieldwork-verify"
+
+emit_raw_excerpt() {
+  printf '%s\n' "$1" | head -8 | while IFS= read -r line; do
+    printf 'raw=%s\n' "$line"
+  done
+}
+
+excerpt() {
+  printf '%s' "$1" | tr '\n\r' '  ' | cut -c1-160
+}
+
+inconclusive() {
+  echo "probe=inconclusive"
+  echo "detail=$1"
+}
+
+if [ ! -x "$CLAUDE_BIN" ]; then
+  inconclusive "claude CLI not found at $CLAUDE_BIN"
+  exit 0
+fi
+if ! command -v python3 >/dev/null 2>&1; then
+  inconclusive "python3 not installed; cannot build the probe cage"
+  exit 0
+fi
+
+cage_py="$(mktemp)"
+err_file="$(mktemp)"
+trap 'rm -f "$cage_py" "$err_file"' EXIT
+
+cat > "$cage_py" <<'PY'
+import ctypes, os, signal, sys
+
+PR_SET_PDEATHSIG = 1
+PR_SET_NO_NEW_PRIVS = 38
+CLONE_NEWUSER = 0x10000000
+
+libc = ctypes.CDLL(None, use_errno=True)
+uid, gid = os.getuid(), os.getgid()
+
+# The creator of the user namespace lands in Ubuntu's unprivileged_userns
+# confinement and can no longer write its own id maps. The maps must be
+# written by this parent, which stays outside the namespace (it owns the
+# child's namespace, so it keeps full capabilities over it).
+unshared_r, unshared_w = os.pipe()
+mapped_r, mapped_w = os.pipe()
+
+pid = os.fork()
+if pid == 0:
+    os.close(unshared_r)
+    os.close(mapped_w)
+    libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0)
+    if libc.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0:
+        print("cage: prctl(NO_NEW_PRIVS) failed", file=sys.stderr)
+        os._exit(97)
+    if libc.unshare(CLONE_NEWUSER) != 0:
+        err = ctypes.get_errno()
+        print("cage: unshare(CLONE_NEWUSER) failed: %s" % os.strerror(err), file=sys.stderr)
+        os._exit(97)
+    os.write(unshared_w, b"u")
+    os.close(unshared_w)
+    if os.read(mapped_r, 1) != b"m":
+        os._exit(97)
+    os.close(mapped_r)
+    try:
+        os.execvp(sys.argv[1], sys.argv[1:])
+    except OSError as exc:
+        print("cage: exec failed: %s" % exc, file=sys.stderr)
+        os._exit(97)
+
+os.close(unshared_w)
+os.close(mapped_r)
+if os.read(unshared_r, 1) != b"u":
+    _, status = os.waitpid(pid, 0)
+    sys.exit(os.waitstatus_to_exitcode(status) if status else 97)
+os.close(unshared_r)
+try:
+    with open("/proc/%d/setgroups" % pid, "w") as f:
+        f.write("deny")
+    with open("/proc/%d/gid_map" % pid, "w") as f:
+        f.write("%d %d 1" % (gid, gid))
+    with open("/proc/%d/uid_map" % pid, "w") as f:
+        f.write("%d %d 1" % (uid, uid))
+except OSError as exc:
+    print("cage: id map write failed: %s" % exc, file=sys.stderr)
+    os.kill(pid, signal.SIGKILL)
+    os.waitpid(pid, 0)
+    sys.exit(97)
+os.write(mapped_w, b"m")
+os.close(mapped_w)
+_, status = os.waitpid(pid, 0)
+sys.exit(os.waitstatus_to_exitcode(status))
+PY
+
+cage() {
+  python3 "$cage_py" "$@"
+}
+
+# The cage must form, and must reproduce the production property: bwrap
+# inside it cannot create its namespace. If bwrap still works in the cage,
+# this host does not restrict the agent's inner bwrap and the probe cannot
+# discriminate excluded from sandboxed commands.
+if ! cage /bin/true 2>"$err_file"; then
+  inconclusive "cannot create the probe cage: NoNewPrivs + user namespace setup failed"
+  emit_raw_excerpt "$(cat "$err_file")"
+  exit 0
+fi
+if command -v bwrap >/dev/null 2>&1 \
+  && cage bwrap --unshare-user --ro-bind / / -- /bin/true >/dev/null 2>&1; then
+  inconclusive "bwrap unexpectedly works inside a NoNewPrivs userns on this host, so the cage cannot reproduce the agent's sandbox failure"
+  exit 0
+fi
+
+prompt="Run exactly these two Bash commands, one tool call each, in order, then stop. Do not retry failures and do not run anything else: 1) $VERIFY_CLIENT /nonexistent-fieldwork-probe 2) echo fieldwork-plain-probe"
+
+out="$(cd "$HOME" && timeout 180 python3 "$cage_py" \
+  "$CLAUDE_BIN" -p --verbose --output-format stream-json \
+  --max-turns 6 --dangerously-skip-permissions \
+  "$prompt" 2>"$err_file")" || true
+
+json="$(printf '%s\n' "$out" | grep '^{' || true)"
+if [ -z "$json" ]; then
+  inconclusive "no stream-json output from claude inside the cage (startup abort or login expiry?)"
+  emit_raw_excerpt "$out"
+  emit_raw_excerpt "$(cat "$err_file")"
+  exit 0
+fi
+
+# Pairs each Bash tool_use with its tool_result by id and returns the result
+# text for the first command matching the prefix; empty when never invoked.
+result_for_prefix() {
+  printf '%s\n' "$json" | jq -rs --arg pfx "$1" '
+    [ .[] | .message.content? // [] | .[]? ] as $items
+    | ($items
+       | map(select(.type == "tool_use" and .name == "Bash"
+                    and ((.input.command // "") | startswith($pfx))))
+       | first) as $u
+    | if $u == null then "" else
+        (($items | map(select(.type == "tool_result" and .tool_use_id == $u.id)) | first) as $r
+         | if $r == null then ""
+           else (($r.content // "")
+                 | if type == "array" then (map(.text? // "") | join(" ")) else tostring end)
+           end)
+      end' 2>/dev/null || true
+}
+
+verify_res="$(result_for_prefix "$VERIFY_CLIENT ")"
+plain_res="$(result_for_prefix "echo fieldwork-plain-probe")"
+
+if [ -z "$verify_res" ]; then
+  inconclusive "the excluded client was never invoked in the probe transcript"
+  emit_raw_excerpt "$out"
+  exit 0
+fi
+
+case "$verify_res" in
+  *"$BWRAP_ERR"*)
+    echo "probe=fail"
+    echo "detail=excluded client hit the bwrap error: sandbox.excludedCommands no longer rescue it on this claude version"
+    echo "detail_verify=$(excerpt "$verify_res")"
+    exit 0
+    ;;
+esac
+
+if [ -z "$plain_res" ]; then
+  inconclusive "the plain command was never invoked in the probe transcript"
+  echo "detail_verify=$(excerpt "$verify_res")"
+  emit_raw_excerpt "$out"
+  exit 0
+fi
+
+case "$plain_res" in
+  *"$BWRAP_ERR"*)
+    echo "probe=pass"
+    echo "detail=excluded client ran unsandboxed; plain command still sandbox-fails as designed"
+    ;;
+  *)
+    inconclusive "excluded client ran, but the plain command did not hit the bwrap error inside the cage"
+    echo "detail_verify=$(excerpt "$verify_res")"
+    echo "detail_plain=$(excerpt "$plain_res")"
+    ;;
+esac
+exit 0

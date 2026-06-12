@@ -1,0 +1,3 @@
+# Default owner for everything. fieldwork-init replaces OWNER with your GitHub user.
+# Required by branch protection (CODEOWNERS review check).
+* @OWNER

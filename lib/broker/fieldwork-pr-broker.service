@@ -1,0 +1,30 @@
+[Unit]
+Description=Fieldwork PR broker
+Requires=fieldwork-pr-broker.socket
+After=fieldwork-pr-broker.socket fieldwork-pr-approve.socket network-online.target
+
+[Service]
+User=fieldwork-pr-broker
+Group=fieldwork-pr-broker
+Sockets=fieldwork-pr-broker.socket fieldwork-pr-approve.socket
+ExecStart=/usr/bin/python3 /usr/local/lib/fieldwork-pr-broker/server.py
+Restart=on-failure
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+# read-only, NOT true: the broker MUST read /home/fieldwork/projects/<repo>
+# to git-push from it. ProtectHome=true would hide all of /home and break the broker.
+ProtectHome=read-only
+ReadOnlyPaths=/home/fieldwork/projects /etc/fieldwork-pr-broker
+ReadWritePaths=/tmp /run/fieldwork-pr-broker /var/log /var/lib/fieldwork-pr-broker
+StateDirectory=fieldwork-pr-broker
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

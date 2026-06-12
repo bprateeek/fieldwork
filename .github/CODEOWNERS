@@ -1,0 +1,11 @@
+# Code ownership for review routing. The owner is requested automatically on
+# pull requests that touch matching paths.
+
+* @bprateeek
+
+# Security-critical surfaces — do not merge changes here without owner review.
+/lib/broker/            @bprateeek
+/lib/apparmor/          @bprateeek
+/schema/                @bprateeek
+/docs/threat-model.md   @bprateeek
+/SECURITY.md            @bprateeek

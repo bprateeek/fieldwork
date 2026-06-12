@@ -1,0 +1,186 @@
+#!/usr/bin/env python3
+"""fieldwork-pr-prepare — unix-socket client for the PR-prepare runner.
+
+Forwards a single prepare request to fieldwork-pr-prepare-runner.socket
+(systemd user socket), demultiplexes the tagged response stream, and
+exits with the runner's exit code.
+
+This client is what the agent's /pr-delivery skill invokes via the
+absolute path /home/fieldwork/.local/bin/fieldwork-pr-prepare. It's
+listed in the agent's sandbox excludedCommands, so it runs unwrapped — but
+because the agent process itself has PR_SET_NO_NEW_PRIVS and lives in
+a user namespace, this process inherits both. We therefore cannot run
+git directly from here either (hooks/filters/credential-helpers could
+exec inside the cage). The runner, started via systemd --user, lives
+outside that confinement and is the one that actually runs git.
+
+The wire protocol is identical in shape to fieldwork-verify's:
+    client  → server:  one JSON object terminated by '\\n' (the full request)
+    server  → client:  O\\t<line> / E\\t<line> / X\\t<exit>  framed lines
+
+See lib/scripts/fieldwork-pr-prepare-runner for the runner side.
+
+Usage:
+    fieldwork-pr-prepare <request-file>
+
+The <request-file> must:
+    - live under <repo>/.fieldwork/local/
+    - be a regular file, not a symlink
+    - be <= 32 KiB
+    - conform to schema/pr-prepare-request.schema.json
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+
+
+SOCKET_NAME = "fieldwork-pr-prepare.sock"
+MAX_REQUEST_BYTES = 32 * 1024
+REQUIRED_FIELDS = ("request_id", "created_at", "repo_path", "branch", "paths", "message")
+
+
+def runtime_dir() -> str:
+    rd = os.environ.get("XDG_RUNTIME_DIR")
+    if rd:
+        return rd
+    return f"/run/user/{os.getuid()}"
+
+
+def fail_closed(message: str, code: int = 20) -> None:
+    sys.stderr.write(f"[fieldwork-pr-prepare] {message}\n")
+    sys.exit(code)
+
+
+def repo_root_of(start: str) -> str:
+    try:
+        result = subprocess.run(
+            ["git", "-C", start, "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except FileNotFoundError:
+        fail_closed("git is not installed on the client host")
+    except subprocess.TimeoutExpired:
+        fail_closed("git rev-parse timed out")
+    if result.returncode != 0 or not result.stdout.strip():
+        fail_closed(f"not a git repo (cwd: {start})")
+    return result.stdout.strip()
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) != 2:
+        fail_closed("usage: fieldwork-pr-prepare <request-file>")
+    req_arg = argv[1]
+    if not req_arg:
+        fail_closed("request-file must not be empty")
+
+    # Path safety: real path, regular file, not a symlink, under <repo>/.fieldwork/local/.
+    if os.path.islink(req_arg):
+        fail_closed("request file must be a regular file, not a symlink")
+    try:
+        req_real = os.path.realpath(req_arg, strict=True)
+    except OSError:
+        fail_closed(f"request file missing: {req_arg}")
+    if not os.path.isfile(req_real):
+        fail_closed("request file must be a regular file")
+
+    repo_root = repo_root_of(os.path.dirname(req_real) or ".")
+    allowed_prefix = os.path.join(repo_root, ".fieldwork", "local") + os.sep
+    if not (req_real == allowed_prefix.rstrip(os.sep) or req_real.startswith(allowed_prefix)):
+        fail_closed("request must live under <repo>/.fieldwork/local/")
+
+    # Size cap.
+    try:
+        size = os.path.getsize(req_real)
+    except OSError as exc:
+        fail_closed(f"cannot stat request file: {exc}")
+    if size > MAX_REQUEST_BYTES:
+        fail_closed(f"request >32KiB ({size} bytes)")
+
+    # Shape preflight (the runner re-validates with the full schema).
+    try:
+        with open(req_real, "rb") as f:
+            raw = f.read()
+    except OSError as exc:
+        fail_closed(f"cannot read request file: {exc}")
+    if b"\x00" in raw:
+        fail_closed("request file contains NUL bytes")
+    try:
+        request = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        fail_closed(f"request file is not valid UTF-8 JSON: {exc}")
+    if not isinstance(request, dict):
+        fail_closed("request must be a JSON object")
+    missing = [f for f in REQUIRED_FIELDS if f not in request]
+    if missing:
+        fail_closed(f"request JSON missing required fields: {', '.join(missing)}")
+
+    # Socket lookup. The runner socket is socket-activated by systemd --user,
+    # so it should exist as long as the unit is enabled.
+    sock_path = os.path.join(runtime_dir(), SOCKET_NAME)
+    if not os.path.exists(sock_path):
+        fail_closed(
+            f"runner socket not available at {sock_path}\n"
+            "  Enable the runner with:\n"
+            "    systemctl --user daemon-reload\n"
+            "    systemctl --user enable --now fieldwork-pr-prepare-runner.socket"
+        )
+
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.connect(sock_path)
+    except OSError as exc:
+        fail_closed(f"runner socket connect failed ({sock_path}): {exc}")
+
+    # Send the request as one line; the runner reads exactly one line.
+    # raw already passed JSON parse, but the file might contain newlines
+    # (pretty-printed JSON). Re-serialize compactly to guarantee one line.
+    line = (json.dumps(request, separators=(",", ":")) + "\n").encode("utf-8")
+    try:
+        sock.sendall(line)
+        sock.shutdown(socket.SHUT_WR)
+    except OSError as exc:
+        fail_closed(f"runner request write failed: {exc}")
+
+    exit_code: int | None = None
+    buffer = b""
+    while True:
+        try:
+            chunk = sock.recv(8192)
+        except OSError as exc:
+            fail_closed(f"runner read failed mid-stream: {exc}")
+        if not chunk:
+            break
+        buffer += chunk
+        while b"\n" in buffer:
+            raw_line, buffer = buffer.split(b"\n", 1)
+            if b"\t" not in raw_line:
+                sys.stderr.buffer.write(b"[fieldwork-pr-prepare] malformed frame: " + raw_line + b"\n")
+                continue
+            tag, payload = raw_line.split(b"\t", 1)
+            if tag == b"O":
+                sys.stdout.buffer.write(payload + b"\n")
+                sys.stdout.flush()
+            elif tag == b"E":
+                sys.stderr.buffer.write(payload + b"\n")
+                sys.stderr.flush()
+            elif tag == b"X":
+                try:
+                    exit_code = int(payload.decode("ascii"))
+                except ValueError:
+                    fail_closed(f"runner sent non-integer exit frame: {payload!r}")
+            else:
+                sys.stderr.buffer.write(b"[fieldwork-pr-prepare] unknown frame tag: " + tag + b"\n")
+
+    if exit_code is None:
+        fail_closed("runner closed connection without emitting an exit frame")
+    return exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

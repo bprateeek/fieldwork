@@ -1,0 +1,210 @@
+# Architecture
+
+Fieldwork turns a phone instruction into a reviewable GitHub pull request while keeping the GitHub write token out of the coding agent's environment.
+
+## System Flow
+
+```text
+mobile agent entry, one of:
+  Claude mobile
+    -> fieldwork-agent@<slug>.service
+       runs Claude Code remote-control
+       boundary: claude remote-control --sandbox (NNP + user namespace)
+  Codex Desktop
+    -> SSH login as fieldwork
+       runs real codex CLI/app server
+       boundary: Codex task sandbox + Fieldwork Unix-socket allowlist
+
+both have: repo checkout, read-only deploy key
+both do not have: GitHub write PAT
+  |
+  | Claude: /verify-before-pr and /pr-delivery
+  | Codex: AGENTS.md delivery instructions
+  v
+fieldwork-verify
+  -> $XDG_RUNTIME_DIR/fieldwork-verify.sock
+  -> fieldwork-verify-runner@<conn>.service
+  -> fieldwork-verify-pipeline
+       lint, typecheck, tests, gitleaks, semgrep
+       each inner step network-off and sandboxed
+  |
+  | /pr-delivery
+  v
+fieldwork-pr-prepare
+  -> $XDG_RUNTIME_DIR/fieldwork-pr-prepare.sock
+  -> fieldwork-pr-prepare-runner@<conn>.service
+  -> fieldwork-pr-prepare-impl
+       create fieldwork/... branch
+       stage exact requested paths
+       commit with core.hooksPath=/dev/null
+  |
+  v
+fieldwork-pr-submit
+  tokenless client
+  -> /run/fieldwork-pr-broker/fieldwork-pr.sock
+  |
+  v
+fieldwork-pr-broker
+  user: fieldwork-pr-broker
+  has: GitHub write PAT
+  validates request and repo state
+  |
+  | if .fieldwork/approval-gate exists
+  v
+pending approval queue
+  -> fieldwork-bot sends Telegram Approve/Deny
+  -> /run/fieldwork-pr-broker/fieldwork-pr-approve.sock
+  -> broker revalidates
+  |
+  v
+GitHub branch + pull request
+```
+
+## Components
+
+| Component                     |                  Runtime identity | Job                                                                           |
+| ----------------------------- | --------------------------------: | ----------------------------------------------------------------------------- |
+| `bin/fieldwork`               |                        local user | Setup, doctor, sync, onboarding, status, reports, smoke tests.                |
+| `fieldwork-agent@.service`    |                       `fieldwork` | One Claude Code remote session per repo.                                      |
+| Codex Desktop SSH session     |                       `fieldwork` | Codex preview path; process lifecycle and remote-project list owned by Codex Desktop. |
+| `fieldwork-verify`            |                       `fieldwork` | Thin client from the agent to the verify runner socket.                       |
+| `fieldwork-verify-runner`     | `fieldwork`, systemd user manager | Runs the verify pipeline outside the agent's NNP/userns cage.                 |
+| `fieldwork-pr-prepare`        |                       `fieldwork` | Thin client from the agent to the prepare runner socket.                      |
+| `fieldwork-pr-prepare-runner` | `fieldwork`, systemd user manager | Runs branch/stage/commit outside the agent's cage.                            |
+| `fieldwork-pr-submit`         |                       `fieldwork` | Tokenless broker client.                                                      |
+| `fieldwork-pr-broker`         |             `fieldwork-pr-broker` | Owns GitHub PAT, validates requests, pushes, creates PRs.                     |
+| `fieldwork-bot`               |                   `fieldwork-bot` | Owns Telegram token, prompts for approval, posts decisions to approve socket. |
+| `lib/templates/repo`          |        committed into target repo | AGENTS.md, Claude guidance/hooks/skills, review templates, optional workflows.|
+
+## Agent Session
+
+The agent session is a user systemd service:
+
+```text
+fieldwork-agent@<slug>.service
+WorkingDirectory=%h/projects/<slug>
+ExecStart=%h/.fieldwork/scripts/fieldwork-agent-session <slug>
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+```
+
+`fieldwork-agent-session` selects the Fieldwork-launched agent adapter. The default adapter is Claude Code remote control. The service intentionally does not inject notification tokens, GitHub tokens, or broker secrets into the agent environment.
+
+Codex does not use this service in the current milestone. Codex Desktop connects over SSH as `fieldwork` and starts the real `codex` CLI/app server through the remote login shell. Fieldwork provisions PATH, linger, runner sockets, `XDG_RUNTIME_DIR`, and the Codex sandbox socket allowlist, then leaves live connection and remote-project folder state to Codex Desktop.
+
+## Runner Layer
+
+Claude's sandbox gives the agent useful host-secret protection, but it also means children inherit `PR_SET_NO_NEW_PRIVS` and a user namespace. Codex has its own task sandbox. Both paths need to reach Fieldwork delivery sockets, and Claude additionally blocks or complicates two things Fieldwork needs:
+
+- `bwrap` for sandboxed verification.
+- predictable `git checkout/add/commit` behavior for PR preparation.
+
+Fieldwork solves this with two socket-activated runners under `systemd --user`. The clients are listed in Claude's `sandbox.excludedCommands`, and Codex setup writes a Codex sandbox Unix-socket allowlist for the broker, verify, and pr-prepare sockets. The clients only connect to private sockets. The runner processes are spawned by the user manager outside the agent sandbox and do the real work.
+
+Runner sockets are `0600` under `$XDG_RUNTIME_DIR`. The runners do not hold broker, bot, deploy-key, or notification credentials. See [runner-architecture.md](runner-architecture.md).
+
+## Broker Boundary
+
+The broker is the GitHub write boundary.
+
+The agent submits JSON to:
+
+```text
+/run/fieldwork-pr-broker/fieldwork-pr.sock
+```
+
+At install time, the broker installer rewrites the checked-in socket template so the submit socket group defaults to the agent user's primary group. This is intentional: Claude's sandbox user namespace strips supplementary groups, but preserves the primary group. A hard-coded supplementary group can make the socket look correct on disk and still fail from inside the sandbox.
+
+The broker:
+
+- validates request schema and field patterns
+- checks repo path under the configured projects root
+- reads `.fieldwork/expected-origin`
+- checks the current `origin` matches that expected GitHub repo
+- refuses dirty worktrees
+- refuses non-`fieldwork/...` branches
+- scans PR body text with gitleaks
+- enforces replay protection by `request_id`
+- rate-limits by repo
+- pushes with `GIT_ASKPASS`
+- opens the PR with `gh pr create`
+
+The broker pushes to a URL derived from `.fieldwork/expected-origin`; it does not trust `origin` for push authentication.
+
+The broker also appends redacted lifecycle events to its audit JSONL log:
+request receipt, rejection, queue, approve/deny, expiry, push attempt, and PR
+open. Query it with `fieldwork log`.
+
+## Approval Gate
+
+Approval is repo-scoped. A committed `.fieldwork/approval-gate` marker tells the broker to queue each validated PR request instead of pushing immediately.
+
+```text
+/pr request
+  -> validate
+  -> reserve request_id
+  -> write /var/lib/fieldwork-pr-broker/pending/<request_id>.json
+  -> bot sends Telegram prompt
+  -> bot posts approve or deny to approve socket
+  -> broker revalidates drift-sensitive repo state
+  -> approve pushes and opens PR, deny deletes pending request
+```
+
+The bot cannot submit PR requests because it is not in the submit socket group. The agent cannot approve requests because it is not in the approve socket group. The bot and agent do not hold the GitHub PAT.
+
+See [approval-gate.md](approval-gate.md).
+
+## Repo Templates And Skills
+
+Onboarding applies `lib/templates/repo` to the target repository. Important pieces:
+
+- `.claude/skills/verify-before-pr/SKILL.md`: tells Claude to run `fieldwork-verify`.
+- `.claude/skills/pr-delivery/SKILL.md`: tells Claude to verify, prepare, write the broker request, and submit.
+- `.claude/hooks/`: resume context, bash guard, journal, and notification hooks.
+- `AGENTS.md`: tells Codex the same verify, prepare, submit, approval-gate, no-direct-push, and `fieldwork/...` branch rules.
+- `.fieldwork/expected-origin`: broker origin pin.
+- `.fieldwork/default-branch`: default branch captured during onboarding.
+- `.fieldwork/approval-gate`: optional marker for gated PRs.
+- `.github/`: optional workflows, CODEOWNERS, PR template, dependabot.
+
+Onboarded repos receive copies. After Fieldwork upgrades, refresh templates with:
+
+```sh
+fieldwork onboard <owner>/<repo> --reseed-templates
+```
+
+## Infrastructure Baseline
+
+The developer preview is tested on:
+
+- Ubuntu 24.04 VPS.
+- Normal SSH (transport-agnostic: public, DNS, or a private-network name like Tailscale/WireGuard if you set it up yourself).
+- Claude Code remote control.
+- Codex Desktop + SSH preview path.
+- GitHub.
+- ntfy for basic mobile notifications.
+- Telegram for approval-gate prompts.
+
+The broker is the most reusable component. Advanced operators can install it standalone for other agents; see [broker-standalone.md](broker-standalone.md) and [agent-adapters.md](agent-adapters.md).
+
+## Control Adapters
+
+Claude Code remote control is the current full control adapter: it is how Claude mobile instructions reach the long-running Fieldwork-managed agent session. Codex support intentionally bypasses adapters because Codex Desktop owns the SSH-launched process lifecycle and remote-project picker.
+
+Optional approval transports are intentionally narrow control surfaces. They may present Approve/Deny actions for approval-gated PRs, but they do not hold the GitHub PAT and do not inject free text into the agent session. The broker remains the component that validates requests and performs GitHub operations.
+
+## Current Constraints
+
+- GitHub only.
+- Claude Code is the supported Fieldwork-launched agent adapter.
+- Codex Desktop + SSH is supported as a developer-preview path, with no Fieldwork Codex service.
+- Codex works in the canonical checkout; concurrent Codex tasks or simultaneous Claude+Codex work on that checkout are unsupported.
+- ChatGPT mobile may show only the signed-in Mac/Windows Codex host; it is not guaranteed to show a separate VPS session like Claude's `vps-<slug>`.
+- Default branch is detected during onboarding and stored in `.fieldwork/default-branch`.
+- Repo slug must match `^[a-z0-9][a-z0-9-]{0,30}$`.
+- Default project root is `/home/fieldwork/projects`.
+- The approval gate is single-approver: any allowlisted Telegram chat can approve.
+
+These are implementation constraints for the developer preview, not
+architectural requirements forever.

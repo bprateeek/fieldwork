@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# fieldwork-agent-session — systemd-invoked launcher for one per-repo agent
+# session. It selects an agent adapter and execs it.
+#
+# Usage: fieldwork-agent-session <repo-slug>
+#
+# Invoked by the fieldwork-agent@<slug>.service systemd unit. This wrapper is
+# the seam that lets Fieldwork run agents other than Claude Code without
+# touching the systemd unit, onboarding, or the broker: only the adapter
+# changes. The adapter is chosen by FIELDWORK_AGENT_ADAPTER (default
+# claude-remote-control) and resolved from ~/.fieldwork/infra/agents/<name>.
+
+set -euo pipefail
+
+slug="${1:-}"
+[ -n "$slug" ] || { echo "usage: fieldwork-agent-session <repo-slug>" >&2; exit 2; }
+
+# Allowlist regex: lowercase alphanum + hyphens, 1–31 chars (matches the broker
+# and onboarding slug contract).
+[[ "$slug" =~ ^[a-z0-9][a-z0-9-]{0,30}$ ]] || {
+  echo "[fieldwork-agent-session] invalid repo slug: $slug" >&2
+  echo "[fieldwork-agent-session] must match ^[a-z0-9][a-z0-9-]{0,30}\$" >&2
+  exit 2
+}
+
+repo_dir="$HOME/projects/$slug"
+[ -d "$repo_dir/.git" ] || {
+  echo "[fieldwork-agent-session] no git repo at $repo_dir" >&2
+  exit 1
+}
+
+# Branch prefix the agent commits under; the broker enforces the same prefix.
+export FIELDWORK_BRANCH_PREFIX="${FIELDWORK_BRANCH_PREFIX:-fieldwork}"
+
+# While the checkout sits on the onboarding init branch the init PR has not
+# been merged: serving sessions here would dirty the main checkout and base
+# PRs on the init branch. Exit 0 so Restart=on-failure does not crash-loop;
+# `fieldwork refresh` returns the checkout to the default branch and restarts
+# this unit, which lifts the gate.
+init_branch="$FIELDWORK_BRANCH_PREFIX/init"
+current_branch="$(git -C "$repo_dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")"
+if [ "$current_branch" = "$init_branch" ]; then
+  echo "[fieldwork-agent-session] $slug checkout is on $init_branch (init PR not merged)" >&2
+  echo "[fieldwork-agent-session] refusing to serve sessions from the init branch" >&2
+  echo "[fieldwork-agent-session] merge the init PR, then run: fieldwork refresh $slug" >&2
+  exit 0
+fi
+
+adapter_name="${FIELDWORK_AGENT_ADAPTER:-claude-remote-control}"
+case "$adapter_name" in
+  */*|*..*|"")
+    echo "[fieldwork-agent-session] invalid adapter name: $adapter_name" >&2
+    exit 2
+    ;;
+esac
+adapter="$HOME/.fieldwork/infra/agents/$adapter_name"
+[ -x "$adapter" ] || {
+  echo "[fieldwork-agent-session] agent adapter not found or not executable: $adapter" >&2
+  echo "[fieldwork-agent-session] available adapters:" >&2
+  ls -1 "$HOME/.fieldwork/infra/agents" 2>/dev/null | sed 's/^/  /' >&2 || true
+  exit 1
+}
+
+exec "$adapter" "$slug" "$repo_dir"

@@ -1,0 +1,21 @@
+[Unit]
+Description=Fieldwork verify runner socket
+# Listening socket for fieldwork-verify. The client (~/.local/bin/fieldwork-verify)
+# connects here; systemd spawns one fieldwork-verify-runner@<conn>.service per
+# connection. The runner deliberately runs OUTSIDE the agent's user namespace
+# and without PR_SET_NO_NEW_PRIVS, so its bwrap-confined inner steps work
+# even when the agent that invoked verify is itself sandboxed.
+
+[Socket]
+# %t resolves to $XDG_RUNTIME_DIR (typically /run/user/<uid>) for user units.
+# Mode 0600 keeps the socket private to the fieldwork user — same trust
+# boundary as the agent itself.
+ListenStream=%t/fieldwork-verify.sock
+SocketMode=0600
+Accept=yes
+# Cap per-instance concurrency. Verify pipelines are heavy (npm test, semgrep)
+# so two in flight is plenty for one agent host; a third connection waits.
+MaxConnections=2
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,32 @@
+[Unit]
+Description=Fieldwork Telegram approval-gate bot
+After=network-online.target fieldwork-pr-broker.service
+Wants=network-online.target
+
+[Service]
+User=fieldwork-bot
+Group=fieldwork-bot
+Environment=FIELDWORK_BOT_HEALTH_PATH=/var/lib/fieldwork-bot/bot-health.json
+ExecStart=/usr/local/bin/fieldwork-bot
+Restart=on-failure
+RestartSec=5
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+# The bot has no home it needs to read. /home is fully hidden.
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# Reads its config from /etc/fieldwork-bot (root-installed); writes only the
+# broker state dirs it shares with the broker over the fieldwork-bot group.
+ReadOnlyPaths=/etc/fieldwork-bot
+ReadWritePaths=/var/lib/fieldwork-pr-broker/pending /var/lib/fieldwork-pr-broker/notifications /var/lib/fieldwork-bot /var/log/fieldwork-bot.log
+
+[Install]
+WantedBy=multi-user.target

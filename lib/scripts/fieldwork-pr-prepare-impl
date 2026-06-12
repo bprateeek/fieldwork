@@ -1,0 +1,326 @@
+#!/usr/bin/env bash
+# fieldwork-pr-prepare-impl — the actual git work for a prepare request.
+#
+# Invoked by fieldwork-pr-prepare-runner with these env vars set:
+#   REQUEST_ID    UUID v4 (already shape-validated)
+#   CREATED_AT    UTC timestamp string (passed-through, not parsed here)
+#   REPO_PATH     /home/fieldwork/projects/<slug>
+#   BRANCH        fieldwork/<slug>
+#   MESSAGE_FILE  path to a file holding the commit message body
+#   PATHS_FILE    NUL-separated list of repo-relative paths to stage
+#
+# Outputs (stdout, on success):
+#   A single JSON line: {"head":"<sha>","branch":"<branch>","request_id":"<id>"}
+#
+# Exit codes:
+#   0   ok
+#  10   branch already exists
+#  11   worktree state mismatch
+#  12   git operation failed; rolled back
+#  13   path safety rejected
+#  20   bad input / unsupported state
+#  21   duplicate request_id (replay)
+#
+# Trust model: this script runs outside the agent's NNP+userns cage. The
+# socket's 0600 mode bounds who can call us; that's the load-bearing check.
+# Defence in depth here: all git invocations use `-c core.hooksPath=/dev/null`
+# so a repo-controlled hook cannot piggyback on this elevated context.
+
+set -uo pipefail
+
+# ---- Constants ---------------------------------------------------------------
+
+PROJECTS_ROOT="${FIELDWORK_PROJECTS_ROOT:-/home/fieldwork/projects}"
+BRANCH_PREFIX="${FIELDWORK_BRANCH_PREFIX:-fieldwork}"
+STATE_DIR="${FIELDWORK_PR_PREPARE_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/fieldwork-pr-prepare}"
+LEDGER_DIR="$STATE_DIR/ledger"
+
+GIT=(git -c core.hooksPath=/dev/null)
+
+# ---- Helpers ----------------------------------------------------------------
+
+die() {
+  # Print to stderr (will be tagged 'E' by the runner) and exit with the code.
+  local code="$1"; shift
+  printf '%s\n' "$*" >&2
+  exit "$code"
+}
+
+git_in_repo() {
+  "${GIT[@]}" -C "$REPO_PATH" "$@"
+}
+
+ledger_path() {
+  printf '%s/%s.json\n' "$LEDGER_DIR" "$REQUEST_ID"
+}
+
+reserve_request_id() {
+  mkdir -p "$LEDGER_DIR" || die 20 "cannot create ledger dir $LEDGER_DIR"
+  local path; path="$(ledger_path)"
+  # Atomic exclusive create. set -o noclobber + > would also work but is
+  # awkward with the trap interactions; use a small python helper instead so
+  # the failure mode is unambiguous.
+  python3 - "$path" <<'PY'
+import os, sys
+path = sys.argv[1]
+try:
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    os.close(fd)
+except FileExistsError:
+    sys.exit(21)
+except OSError as exc:
+    sys.stderr.write(f"ledger reserve failed: {exc}\n")
+    sys.exit(20)
+PY
+  case $? in
+    0) ;;
+    21) die 21 "duplicate request_id rejected (possible replay): $REQUEST_ID" ;;
+    *)  die 20 "ledger reserve failed for $REQUEST_ID" ;;
+  esac
+}
+
+commit_ledger_record() {
+  # Now that the operation has succeeded, persist the audit record.
+  local path; path="$(ledger_path)"
+  local head; head="$(git_in_repo rev-parse HEAD)"
+  python3 - "$path" "$REQUEST_ID" "$CREATED_AT" "$REPO_PATH" "$BRANCH" "$head" <<'PY'
+import json, os, sys
+path, request_id, created_at, repo_path, branch, head = sys.argv[1:7]
+record = {
+    "request_id": request_id,
+    "created_at": created_at,
+    "repo_path":  repo_path,
+    "branch":     branch,
+    "head":       head,
+}
+tmp = path + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(record, f, sort_keys=True)
+    f.write("\n")
+os.replace(tmp, path)
+PY
+}
+
+release_ledger_record() {
+  # Best-effort: remove the reservation so the user can retry with the same id.
+  # We only call this on early-failure paths (before we've taken any action
+  # that the request_id should record).
+  local path; path="$(ledger_path)"
+  rm -f -- "$path" 2>/dev/null || true
+}
+
+# ---- Input validation -------------------------------------------------------
+
+# Full regex checks (the runner did prefix-only checks).
+case "$REPO_PATH" in
+  "$PROJECTS_ROOT"/[a-z0-9]*) ;;
+  *) die 20 "repo_path outside projects root: $REPO_PATH" ;;
+esac
+# Slug regex: [a-z0-9][a-z0-9-]{0,30}
+slug="${REPO_PATH#"$PROJECTS_ROOT"/}"
+if [ -z "$slug" ] || ! [[ "$slug" =~ ^[a-z0-9][a-z0-9-]{0,30}$ ]]; then
+  die 20 "repo_path slug fails regex: $slug"
+fi
+
+# Branch regex: ^<prefix>/[a-z0-9][a-z0-9/_-]{1,80}$
+if ! [[ "$BRANCH" =~ ^${BRANCH_PREFIX}/[a-z0-9][a-z0-9/_-]{1,80}$ ]]; then
+  die 20 "branch fails regex: $BRANCH"
+fi
+
+# repo_path must be the realpath (no symlink shenanigans).
+real_repo="$(realpath -e "$REPO_PATH" 2>/dev/null)" || die 20 "repo_path does not exist: $REPO_PATH"
+if [ "$real_repo" != "$REPO_PATH" ]; then
+  die 20 "repo_path differs from realpath ($real_repo); reject symlinks in projects root"
+fi
+
+# repo_path must be a git work-tree.
+if [ ! -d "$REPO_PATH/.git" ] && [ ! -f "$REPO_PATH/.git" ]; then
+  die 20 "$REPO_PATH is not a git work-tree"
+fi
+
+# Load paths (newline-separated from PATHS_FILE). The runner schema-validated
+# that no path contains a newline byte, so this split is unambiguous.
+declare -a PATHS=()
+if [ ! -s "$PATHS_FILE" ]; then
+  die 20 "paths list is empty"
+fi
+mapfile -t PATHS < "$PATHS_FILE"
+# Drop trailing empty element from a possible final newline.
+if [ "${#PATHS[@]}" -gt 0 ] && [ -z "${PATHS[-1]}" ]; then
+  unset 'PATHS[-1]'
+fi
+if [ "${#PATHS[@]}" -eq 0 ]; then
+  die 20 "paths list parsed empty"
+fi
+if [ "${#PATHS[@]}" -gt 100 ]; then
+  die 20 "paths list >100 entries"
+fi
+
+# Per-path safety: non-empty, no leading slash, no '..' segments, no newline.
+# We don't reject NUL here because mapfile -d '' already split on NUL, so any
+# embedded NULs would have created spurious empty entries (handled above).
+for p in "${PATHS[@]}"; do
+  if [ -z "$p" ]; then
+    die 13 "path is empty"
+  fi
+  case "$p" in
+    /*)          die 13 "absolute path not allowed: $p" ;;
+    ..|*/..|../*|*/../*) die 13 "path contains '..' segment: $p" ;;
+    *$'\n'*)     die 13 "path contains newline: $p" ;;
+  esac
+done
+
+# realpath each path: must resolve under REPO_PATH.
+for p in "${PATHS[@]}"; do
+  resolved="$(realpath -m "$REPO_PATH/$p" 2>/dev/null)" || die 13 "cannot resolve path: $p"
+  case "$resolved" in
+    "$REPO_PATH"/*) ;;
+    *) die 13 "path escapes repo root: $p -> $resolved" ;;
+  esac
+done
+
+# ---- Reserve replay-protection ledger entry --------------------------------
+
+reserve_request_id
+
+# Any failure after this point must `release_ledger_record` (so a retry of
+# the same id can succeed) — UNLESS the failure is from a state change that
+# we actually rolled back. Per the design, we keep the entry only on success
+# (commit_ledger_record). So: release on every error path past this point.
+trap 'release_ledger_record' EXIT
+
+# ---- Pre-checks (no state changes yet) -------------------------------------
+
+# Branch must not already exist (anywhere — local refs).
+if git_in_repo show-ref --verify --quiet "refs/heads/$BRANCH"; then
+  die 10 "branch already exists: $BRANCH"
+fi
+
+# Worktree state must match the request: every dirty/untracked file MUST be
+# in PATHS, and every PATHS entry MUST be dirty (no empty stages).
+# `git status --porcelain=v1 -z` emits one record per entry, NUL-terminated.
+# Rename pairs are `R<src> NUL <dst>`; we treat both as dirty.
+declare -A request_set=()
+for p in "${PATHS[@]}"; do
+  request_set["$p"]=1
+done
+
+declare -A dirty_set=()
+declare -a porcelain=()
+mapfile -d '' porcelain < <(git_in_repo status --porcelain=v1 -z -uall 2>/dev/null || true)
+
+i=0
+while [ $i -lt ${#porcelain[@]} ]; do
+  entry="${porcelain[i]}"
+  i=$((i+1))
+  # Entry is "XY path" — first 2 bytes are status, then a space, then path.
+  if [ ${#entry} -lt 4 ]; then
+    continue
+  fi
+  status_xy="${entry:0:2}"
+  path_part="${entry:3}"
+  case "$status_xy" in
+    R*|C*)
+      # Rename/copy: next record is the source path; pull and discard.
+      if [ $i -lt ${#porcelain[@]} ]; then
+        src="${porcelain[i]}"
+        i=$((i+1))
+        dirty_set["$src"]=1
+      fi
+      dirty_set["$path_part"]=1
+      ;;
+    *)
+      dirty_set["$path_part"]=1
+      ;;
+  esac
+done
+
+unexpected=()
+for f in "${!dirty_set[@]}"; do
+  if [ -z "${request_set[$f]:-}" ]; then
+    unexpected+=("$f")
+  fi
+done
+missing=()
+for f in "${!request_set[@]}"; do
+  if [ -z "${dirty_set[$f]:-}" ]; then
+    missing+=("$f")
+  fi
+done
+if [ "${#unexpected[@]}" -gt 0 ]; then
+  printf 'unexpected modification: %s\n' "${unexpected[@]}" >&2
+  die 11 "worktree has dirty files not in request.paths"
+fi
+if [ "${#missing[@]}" -gt 0 ]; then
+  printf 'path declared but not modified: %s\n' "${missing[@]}" >&2
+  die 11 "request.paths includes files that aren't dirty in the worktree"
+fi
+
+# ---- Record original state for rollback ------------------------------------
+
+orig_head="$(git_in_repo rev-parse HEAD 2>/dev/null)" \
+  || die 20 "cannot read HEAD (is the repo empty?)"
+orig_branch="$(git_in_repo branch --show-current 2>/dev/null || true)"
+
+new_branch_created=0
+rollback() {
+  # Best-effort rollback. Errors here are logged but don't change the
+  # exit code we're about to use.
+  if [ "$new_branch_created" = "1" ]; then
+    if [ -n "$orig_branch" ]; then
+      git_in_repo checkout -q "$orig_branch" 2>/dev/null \
+        || git_in_repo checkout -q --detach "$orig_head" 2>/dev/null || true
+    else
+      git_in_repo checkout -q --detach "$orig_head" 2>/dev/null || true
+    fi
+    git_in_repo branch -D "$BRANCH" 2>/dev/null || true
+  fi
+  git_in_repo reset -q --hard "$orig_head" 2>/dev/null || true
+}
+
+# ---- Branch + stage + commit -----------------------------------------------
+
+if ! git_in_repo checkout -q -b "$BRANCH" 2>&1; then
+  rollback
+  die 12 "git checkout -b $BRANCH failed"
+fi
+new_branch_created=1
+
+if ! git_in_repo add -- "${PATHS[@]}" 2>&1; then
+  rollback
+  die 12 "git add failed"
+fi
+
+# Author/committer ident: rely on git config in the repo. If neither user.name
+# nor user.email is set, git commit will fail with a clear message; we treat
+# that as a 20 (setup problem), not a 12 (operation failed).
+if ! git_in_repo -c advice.statusHints=false commit --quiet -F "$MESSAGE_FILE" 2>&1; then
+  rollback
+  # Distinguish "config missing" from "real failure" by re-checking config.
+  if ! git_in_repo config user.email >/dev/null 2>&1 \
+     || ! git_in_repo config user.name >/dev/null 2>&1; then
+    die 20 "git user.name/user.email not configured in $REPO_PATH; fix on the VPS: git config --global user.email \"you@example.com\" && git config --global user.name \"Your Name\" (agents cannot run this themselves: Bash(git config*) is in permissions.ask)"
+  fi
+  die 12 "git commit failed"
+fi
+
+# Post-commit assertion: tree clean, HEAD moved.
+if ! git_in_repo diff --quiet 2>/dev/null \
+   || ! git_in_repo diff --cached --quiet 2>/dev/null; then
+  rollback
+  die 12 "post-commit tree not clean"
+fi
+new_head="$(git_in_repo rev-parse HEAD 2>/dev/null)" || { rollback; die 12 "cannot read new HEAD"; }
+if [ "$new_head" = "$orig_head" ]; then
+  rollback
+  die 12 "commit did not advance HEAD (empty commit?)"
+fi
+
+# ---- Success: persist ledger record, print result --------------------------
+
+commit_ledger_record
+# We've now successfully recorded the request_id; clear the rollback-on-exit trap.
+trap - EXIT
+
+printf '{"head":"%s","branch":"%s","request_id":"%s"}\n' "$new_head" "$BRANCH" "$REQUEST_ID"
+exit 0

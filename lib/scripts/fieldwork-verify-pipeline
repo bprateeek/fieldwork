@@ -1,0 +1,434 @@
+#!/usr/bin/env bash
+# fieldwork-verify-pipeline — backend that runs the actual verify steps.
+#
+# Not invoked directly by the agent. fieldwork-verify-runner reads a request
+# from the unix-socket client, then exec's this script with the validated
+# repo path. Running through the socket-activated runner is what gives this
+# script an execution context where bwrap can create user namespaces — the
+# agent process sets PR_SET_NO_NEW_PRIVS and lives in its own userns, which
+# blocks the AppArmor profile transition bwrap needs. The runner runs under
+# the user manager (systemd --user), outside that confinement.
+#
+# Each inner step is re-confined inside its own network-off bwrap sandbox
+# (fail-closed if bwrap cannot create the required namespaces), so a malicious
+# `package.json` `lint` script can't reach
+# /etc/fieldwork-pr-broker/gh-token or any other host secret.
+#
+# Direct invocation as the fieldwork user from a shell is supported for
+# debugging:  fieldwork-verify-pipeline /home/fieldwork/projects/<slug>
+#
+# Contract:
+#   Usage: fieldwork-verify-pipeline <repo-path>
+#   Exit codes:
+#     0   ok
+#     10  lint
+#     11  typecheck
+#     12  tests
+#     13  gitleaks
+#     14  semgrep
+#     20  abuse / sandbox-unavailable / path-escape
+#     30  deps-missing (run onboarding maintenance)
+
+set -euo pipefail
+
+PROJECTS_ROOT="${FIELDWORK_PROJECTS_ROOT:-/home/fieldwork/projects}"
+WORKTREES_ROOT="${FIELDWORK_WORKTREES_ROOT:-/home/fieldwork/worktrees}"
+
+# ---- Argument validation ----------------------------------------------------
+
+if [ "$#" -ne 1 ]; then
+  echo "fieldwork-verify: exactly one argument expected (repo-path)" >&2
+  exit 20
+fi
+
+repo_input="$1"
+
+if [ -z "$repo_input" ]; then
+  echo "fieldwork-verify: repo-path must not be empty" >&2
+  exit 20
+fi
+
+# ---- Path allowlist + symlink check -----------------------------------------
+#
+# `cd … && pwd -P` resolves symlinks and requires the path to exist as a
+# directory. After resolution we re-walk every segment and refuse any that is
+# itself a symlink, so a malicious agent can't smuggle a path that resolves
+# to an allowlisted prefix but traverses a tampered symlink at run time.
+
+if ! repo_path="$(cd -- "$repo_input" 2>/dev/null && pwd -P)"; then
+  echo "fieldwork-verify: repo-path does not resolve to a directory: $repo_input" >&2
+  exit 20
+fi
+
+case "$repo_path" in
+  "$PROJECTS_ROOT"/*|"$WORKTREES_ROOT"/*) ;;
+  *)
+    echo "fieldwork-verify: repo-path outside allowlist: $repo_path" >&2
+    echo "  allowed prefixes: $PROJECTS_ROOT/, $WORKTREES_ROOT/" >&2
+    exit 20
+    ;;
+esac
+
+# Walk every path segment, refuse symlinks. (`realpath -e` already resolved
+# them, but a TOCTOU swap between resolve and execve is closed by this check.)
+_seg="$repo_path"
+while [ "$_seg" != "/" ] && [ -n "$_seg" ]; do
+  if [ -L "$_seg" ]; then
+    echo "fieldwork-verify: refusing symlinked path component: $_seg" >&2
+    exit 20
+  fi
+  _seg="$(dirname -- "$_seg")"
+done
+unset _seg
+
+if [ ! -d "$repo_path/.git" ] && [ ! -f "$repo_path/.git" ]; then
+  echo "fieldwork-verify: $repo_path is not a git checkout" >&2
+  exit 20
+fi
+
+cd "$repo_path"
+
+# ---- Inner-sandbox probe ----------------------------------------------------
+#
+# Just checking for `bwrap` on PATH is not enough: on kernels with
+# `kernel.unprivileged_userns_clone=0` (some Ubuntu/Debian builds, including
+# the Fieldwork VPS at the time of writing) bwrap installs cleanly but every
+# invocation fails with `bwrap: No permissions to create new namespace`.
+# So we *exercise* bwrap before committing to it. Other runners are not
+# accepted here until they can prove equivalent isolation.
+#
+# The same probe shape lives in `fieldwork doctor --remote`; keep them in
+# sync so doctor's verdict matches what the wrapper does at runtime.
+
+BWRAP_INSTALLED=0
+
+probe_bwrap() {
+  command -v bwrap >/dev/null 2>&1 || return 1
+  BWRAP_INSTALLED=1
+  # Cheapest test that actually creates the namespaces bwrap will need.
+  bwrap --unshare-user --unshare-net --unshare-pid --unshare-uts --unshare-ipc \
+        --ro-bind / / --tmpfs /tmp --dev /dev --proc /proc \
+        -- /bin/true >/dev/null 2>&1
+}
+
+if probe_bwrap; then
+  :
+else
+  # Read both userns sysctls. Ubuntu 24.04+ adds
+  # kernel.apparmor_restrict_unprivileged_userns on top of
+  # kernel.unprivileged_userns_clone. We never recommend flipping the
+  # AppArmor restriction system-wide; instead, the fix is the narrow
+  # per-binary profile shipped at lib/apparmor/fieldwork-bwrap.
+  read_sysctl() {
+    local path="/proc/sys/kernel/$1"
+    if [ -r "$path" ]; then cat "$path"; else echo "?"; fi
+  }
+  userns_clone="$(read_sysctl unprivileged_userns_clone)"
+  userns_apparmor="$(read_sysctl apparmor_restrict_unprivileged_userns)"
+  {
+    echo "fieldwork-verify: inner-sandbox unavailable — verify steps refuse to run unsandboxed."
+    echo
+    if [ "$BWRAP_INSTALLED" = "1" ]; then
+      echo "  bwrap installed: yes — but probe failed."
+      echo "  kernel.unprivileged_userns_clone = $userns_clone"
+      echo "  kernel.apparmor_restrict_unprivileged_userns = $userns_apparmor"
+      echo
+      if [ "$userns_clone" != "1" ]; then
+        echo "  unprivileged user namespaces are disabled at the kernel level."
+        echo "  If this is deliberate hardening, fieldwork-verify cannot run on this host."
+        echo "  Fieldwork will not apply or suggest a global userns sysctl relaxation."
+        echo "  Use a host policy where bwrap can create unprivileged user namespaces."
+      elif [ "$userns_apparmor" = "1" ]; then
+        echo "  AppArmor is restricting bwrap from creating user namespaces."
+        echo "  Fix: install the narrow per-binary profile that grants \`userns\` to bwrap only."
+        echo "       Every other unprivileged-userns consumer stays restricted."
+        echo
+        echo "    sudo install -m 644 ~/fieldwork/lib/apparmor/fieldwork-bwrap \\"
+        echo "                       /etc/apparmor.d/fieldwork-bwrap"
+        echo "    sudo apparmor_parser -r /etc/apparmor.d/fieldwork-bwrap"
+        echo
+        echo "  Do NOT disable kernel.apparmor_restrict_unprivileged_userns globally"
+        echo "  unless you understand the host-wide implications."
+      else
+        echo "  Both userns sysctls look correct but bwrap still failed."
+        echo "  Inspect: bwrap --unshare-user --bind / / -- /bin/true"
+      fi
+    else
+      echo "  bwrap installed: no"
+      echo "  Install on the VPS, then retry:"
+      echo "    sudo apt-get install -y bubblewrap   # Debian/Ubuntu"
+    fi
+  } >&2
+  exit 20
+fi
+
+# ---- run_inner: run a command inside the chosen confinement ----------------
+#
+# Network unshared; root filesystem read-only; only $repo_path and /tmp are
+# writable. Working directory pinned to $repo_path.
+#
+# .claude/ is masked with an empty tmpfs inside the bwrap mount so verify
+# tools never walk Fieldwork's internal state. Without this, running verify
+# from the parent checkout (e.g. SSH probe `fieldwork-verify
+# /home/fieldwork/projects/<slug>`) makes ESLint / tsc / ruff / mypy /
+# semgrep report duplicate findings against `.claude/worktrees/<convo>/`
+# copies of source files. Each tool has its own ignore mechanism
+# (.eslintignore vs eslint.config.js `ignores` vs tsconfig `exclude` vs
+# pyproject `[tool.X]`), and we don't want verify-correctness to depend on
+# every user repo wiring all of them. Masking via bwrap covers them all in
+# one place. The real `.claude/` on disk is untouched — only the
+# per-verify-step namespace sees an empty dir.
+#
+# When verify is invoked against a per-conversation agent worktree (the
+# agent's actual path), `.claude/worktrees/` doesn't exist inside the
+# worktree (it's gitignored, never copied). The tmpfs masks an empty or
+# absent directory — safe.
+
+run_inner() {
+  bwrap \
+    --unshare-net --unshare-pid --unshare-uts --unshare-ipc \
+    --die-with-parent \
+    --ro-bind / / \
+    --bind "$repo_path" "$repo_path" \
+    --tmpfs "$repo_path/.claude" \
+    --tmpfs /tmp \
+    --dev /dev --proc /proc \
+    --chdir "$repo_path" \
+    -- "$@"
+}
+
+# ---- Stack detection (file probes only; never read .claude/*) --------------
+
+stack=""
+if   [ -f package.json ];           then stack="node"
+elif [ -f go.mod ];                 then stack="go"
+elif [ -f Cargo.toml ];             then stack="rust"
+elif [ -f pyproject.toml ] \
+  || [ -f requirements.txt ];       then stack="python"
+fi
+
+# ---- Deps pre-installed check (the wrapper does NOT install deps) -----------
+
+deps_missing_reason=""
+deps_missing_fix=""
+
+node_package_manager() {
+  if [ -f pnpm-lock.yaml ]; then
+    echo pnpm
+  elif [ -f yarn.lock ]; then
+    echo yarn
+  elif [ -f bun.lockb ] || [ -f bun.lock ]; then
+    echo bun
+  else
+    echo npm
+  fi
+}
+
+node_install_command() {
+  case "$1" in
+    pnpm) echo "pnpm install --frozen-lockfile" ;;
+    yarn) echo "yarn install --frozen-lockfile" ;;
+    bun)  echo "bun install --frozen-lockfile" ;;
+    *)    echo "npm ci" ;;
+  esac
+}
+
+deps_missing() {
+  case "$stack" in
+    node)
+      pkg_mgr="$(node_package_manager)"
+      install_cmd="$(node_install_command "$pkg_mgr")"
+      if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
+        deps_missing_reason="node toolchain not installed (need system-wide Node.js 22 + npm on PATH)"
+        deps_missing_fix="run Fieldwork bootstrap on the VPS: cd ~/fieldwork && ./bin/fieldwork bootstrap-vps"
+        return 0
+      fi
+      case "$pkg_mgr" in
+        pnpm|yarn|bun)
+          if ! command -v "$pkg_mgr" >/dev/null 2>&1; then
+            deps_missing_reason="$pkg_mgr package manager not installed (detected $pkg_mgr lockfile)"
+            deps_missing_fix="install or enable $pkg_mgr outside the agent session, then run \`$install_cmd\` in $repo_path"
+            return 0
+          fi
+          ;;
+      esac
+      if [ ! -d node_modules ]; then
+        deps_missing_reason="node_modules missing for package manager $pkg_mgr"
+        deps_missing_fix="run \`$install_cmd\` on the VPS as the fieldwork user in $repo_path"
+        return 0
+      fi
+      return 1 ;;
+    rust)
+      if ! command -v cargo >/dev/null 2>&1; then
+        deps_missing_reason="rust toolchain not installed (need cargo on PATH)"
+        deps_missing_fix="install Rust/cargo system-wide or for the fieldwork user, then rerun verify"
+        return 0
+      fi
+      return 1 ;;
+    go)
+      if ! command -v go >/dev/null 2>&1; then
+        deps_missing_reason="go toolchain not installed (need go on PATH)"
+        deps_missing_fix="install Go system-wide or for the fieldwork user, then rerun verify"
+        return 0
+      fi
+      return 1 ;;
+    python)
+      if ! command -v python3 >/dev/null 2>&1; then
+        deps_missing_reason="python toolchain not installed (need python3 on PATH)"
+        deps_missing_fix="install python3 on the VPS, then rerun verify"
+        return 0
+      fi
+      return 1 ;;
+    *)      return 1 ;;
+  esac
+}
+
+if [ -n "$stack" ] && deps_missing; then
+  echo "fieldwork-verify: deps-missing for stack=$stack" >&2
+  if [ -n "$deps_missing_reason" ]; then
+    echo "  $deps_missing_reason" >&2
+  fi
+  if [ -n "$deps_missing_fix" ]; then
+    echo "  Fix: $deps_missing_fix" >&2
+  else
+    echo "  Install deps outside the agent session, then re-run." >&2
+    case "$stack" in
+      rust)   echo "  e.g. cargo fetch && cargo build --offline" >&2 ;;
+      python) echo "  e.g. pip install -r requirements.txt" >&2 ;;
+    esac
+  fi
+  exit 30
+fi
+
+# ---- Pipeline ---------------------------------------------------------------
+#
+# Each step is wrapped in run_inner so a hostile repo-side script (e.g.
+# `"lint": "cat /etc/fieldwork-pr-broker/gh-token"`) cannot exfiltrate or
+# touch host state. Network is unshared per step, so `curl` from inside fails
+# closed.
+
+step() {
+  local label="$1"; shift
+  local exit_on_fail="$1"; shift
+  echo "[fieldwork-verify] $label" >&2
+  if ! run_inner "$@"; then
+    echo "[fieldwork-verify] $label: FAIL" >&2
+    exit "$exit_on_fail"
+  fi
+}
+
+step_skip() {
+  echo "[fieldwork-verify] $1: skipped ($2)" >&2
+}
+
+# Helpers per stack. Tools that are absent from the repo are skipped, never
+# faked-passing — but absent for the *whole stack* is treated as
+# inner-sandbox failure since the agent could otherwise game it.
+
+# 1. Lint -------------------------------------------------------------------
+case "$stack" in
+  node)
+    if [ -f package.json ] && jq -e '.scripts.lint' package.json >/dev/null 2>&1; then
+      step "lint (npm run lint)" 10 npm run lint --silent
+    else
+      step_skip "lint" "no scripts.lint in package.json"
+    fi
+    ;;
+  go)
+    if command -v golangci-lint >/dev/null 2>&1; then
+      step "lint (golangci-lint)" 10 golangci-lint run ./...
+    else
+      step_skip "lint" "golangci-lint not installed"
+    fi
+    ;;
+  rust)
+    step "lint (cargo clippy)" 10 cargo clippy --all-targets -- -D warnings
+    ;;
+  python)
+    if command -v ruff >/dev/null 2>&1; then
+      step "lint (ruff)" 10 ruff check .
+    elif command -v flake8 >/dev/null 2>&1; then
+      step "lint (flake8)" 10 flake8 .
+    else
+      step_skip "lint" "no ruff/flake8"
+    fi
+    ;;
+  "")
+    step_skip "lint" "no recognised stack"
+    ;;
+esac
+
+# 2. Typecheck -------------------------------------------------------------
+case "$stack" in
+  node)
+    if [ -f tsconfig.json ]; then
+      step "typecheck (tsc --noEmit)" 11 npx --no-install tsc --noEmit
+    else
+      step_skip "typecheck" "no tsconfig.json"
+    fi
+    ;;
+  go)
+    step "typecheck (go vet)"   11 go vet ./...
+    step "typecheck (go build)" 11 go build ./...
+    ;;
+  rust)
+    step "typecheck (cargo check)" 11 cargo check --all-targets
+    ;;
+  python)
+    if [ -f mypy.ini ] || [ -f .mypy.ini ] || ( [ -f pyproject.toml ] && grep -q '\[tool.mypy\]' pyproject.toml ); then
+      step "typecheck (mypy)" 11 mypy .
+    else
+      step_skip "typecheck" "no mypy config"
+    fi
+    ;;
+esac
+
+# 3. Tests -----------------------------------------------------------------
+case "$stack" in
+  node)
+    if [ -f package.json ] && jq -e '.scripts.test' package.json >/dev/null 2>&1; then
+      step "tests (npm test)" 12 npm test --silent -- --watch=false
+    else
+      step_skip "tests" "no scripts.test in package.json"
+    fi
+    ;;
+  go)
+    step "tests (go test)" 12 go test ./...
+    ;;
+  rust)
+    step "tests (cargo test)" 12 cargo test --offline
+    ;;
+  python)
+    if command -v pytest >/dev/null 2>&1; then
+      step "tests (pytest)" 12 pytest -q
+    else
+      step_skip "tests" "pytest not installed"
+    fi
+    ;;
+esac
+
+# 4. Secret scan (always; gitleaks works regardless of stack) --------------
+if command -v gitleaks >/dev/null 2>&1; then
+  step "gitleaks protect --staged" 13 gitleaks protect --staged --redact --no-banner
+else
+  step_skip "gitleaks" "gitleaks not installed"
+fi
+
+# 5. Semgrep on changed files (always; OWASP Top Ten pack) -----------------
+# Skip when no changed files: a no-op semgrep call still emits noise.
+if command -v semgrep >/dev/null 2>&1; then
+  changed="$(git diff --cached --name-only --diff-filter=ACMR 2>/dev/null \
+             | tr '\n' '\0' | xargs -0 -I{} -r echo {})"
+  if [ -n "$changed" ]; then
+    # shellcheck disable=SC2086
+    step "semgrep (owasp-top-ten, changed files)" 14 \
+      semgrep --config=p/owasp-top-ten --error --quiet $changed
+  else
+    step_skip "semgrep" "no staged changes"
+  fi
+else
+  step_skip "semgrep" "semgrep not installed"
+fi
+
+echo "[fieldwork-verify] OK"
+exit 0

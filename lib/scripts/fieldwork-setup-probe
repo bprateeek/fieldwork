@@ -1,0 +1,236 @@
+#!/usr/bin/env bash
+# fieldwork-setup-probe - one-shot remote state snapshot for fieldwork setup.
+
+set -u
+
+FIELDWORK_SETUP_TIMING="${FIELDWORK_SETUP_TIMING:-0}"
+FIELDWORK_EXPECTED_FINGERPRINT_HASH="${FIELDWORK_EXPECTED_FINGERPRINT_HASH:-}"
+FIELDWORK_FINGERPRINT_FILES="${FIELDWORK_FINGERPRINT_FILES:-}"
+FIELDWORK_PROJECTS_DIR="${FIELDWORK_PROJECTS_DIR:-$HOME/projects}"
+FIELDWORK_REMOTE_USER="${FIELDWORK_REMOTE_USER:-fieldwork}"
+
+emit() {
+  local key="$1"
+  local value="${2:-}"
+  value="${value//$'\n'/ }"
+  value="${value//$'\r'/ }"
+  printf '%s=%s\n' "$key" "$value"
+}
+
+timing_enabled() {
+  [ "$FIELDWORK_SETUP_TIMING" = "1" ]
+}
+
+timing_now() {
+  timing_enabled || {
+    printf '0\n'
+    return 0
+  }
+  local now
+  if command -v perl >/dev/null 2>&1; then
+    if now="$(perl -MTime::HiRes=time -e 'printf "%.3f\n", time' 2>/dev/null)"; then
+      printf '%s\n' "$now"
+      return 0
+    fi
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    if now="$(python3 -c 'import time; print(f"{time.time():.3f}")' 2>/dev/null)"; then
+      printf '%s\n' "$now"
+      return 0
+    fi
+  fi
+  date +%s
+}
+
+timing_elapsed() {
+  local start="$1"
+  local end
+  end="$(timing_now)"
+  awk -v start="$start" -v end="$end" 'BEGIN { printf "%.3f", end - start }'
+}
+
+timing_emit() {
+  local key="$1"
+  local start="$2"
+  timing_enabled || return 0
+  emit "$key" "$(timing_elapsed "$start")"
+}
+
+status_for() {
+  local key="$1"
+  shift
+  if "$@" >/dev/null 2>&1; then
+    emit "$key" ok
+  else
+    emit "$key" missing
+  fi
+}
+
+path_configured() {
+  case ":$PATH:" in *":$HOME/.local/bin:"*) return 0 ;; esac
+  grep -Eq "Fieldwork local bin|[$]HOME/\\.local/bin|/\\.local/bin" "$HOME/.profile" 2>/dev/null
+}
+
+fingerprint_current() {
+  [ -n "$FIELDWORK_FINGERPRINT_FILES" ] || return 1
+  [ -n "$FIELDWORK_EXPECTED_FINGERPRINT_HASH" ] || return 1
+  [ -x "$HOME/.local/bin/fieldwork" ] || return 1
+  [ -d "$HOME/fieldwork" ] || return 1
+  local remote_hash
+  remote_hash="$(cd "$HOME/fieldwork" && cksum $FIELDWORK_FINGERPRINT_FILES 2>/dev/null | cksum | awk '{ print $1 ":" $2 }')" || return 1
+  [ -n "$remote_hash" ] && [ "$remote_hash" = "$FIELDWORK_EXPECTED_FINGERPRINT_HASH" ]
+}
+
+bootstrap_ready() {
+  export PATH="$HOME/.local/bin:$PATH"
+  command -v gh >/dev/null 2>&1 &&
+    test -d "$FIELDWORK_PROJECTS_DIR" &&
+    test -f "$HOME/.config/systemd/user/fieldwork-verify-runner.socket" &&
+    test -f "$HOME/.config/systemd/user/fieldwork-pr-prepare-runner.socket" || return 1
+  case "${FIELDWORK_SETUP_AGENTS:-claude}" in
+    claude|both|claude,codex|codex,claude)
+      command -v claude >/dev/null 2>&1 &&
+        test -f "$HOME/.config/systemd/user/fieldwork-agent@.service"
+      ;;
+    *) return 0 ;;
+  esac
+}
+
+verify_runner_ready() {
+  export PATH="$HOME/.local/bin:$PATH"
+  local runtime_dir
+  test -x "$HOME/.local/bin/fieldwork-verify" &&
+    test -x "$HOME/.local/bin/fieldwork-verify-runner" &&
+    test -x "$HOME/.fieldwork/scripts/fieldwork-verify-pipeline" &&
+    test -f "$HOME/.config/systemd/user/fieldwork-verify-runner.socket" &&
+    test -f "$HOME/.config/systemd/user/fieldwork-verify-runner@.service" &&
+    systemctl --user is-active --quiet fieldwork-verify-runner.socket || return 1
+  runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+  test -S "$runtime_dir/fieldwork-verify.sock" &&
+    command -v bwrap >/dev/null 2>&1 &&
+    bwrap --unshare-user --unshare-net --unshare-pid --unshare-uts --unshare-ipc \
+      --ro-bind / / --tmpfs /tmp --dev /dev --proc /proc \
+      -- /bin/true
+}
+
+gh_live_status() {
+  export PATH="$HOME/.local/bin:$PATH"
+  command -v gh >/dev/null 2>&1 || { emit gh_live missing; return 0; }
+  local marker pid watcher status
+  marker="${TMPDIR:-/tmp}/fieldwork-gh-timeout.$$"
+  rm -f "$marker"
+  ( gh auth status >/dev/null 2>&1 ) &
+  pid=$!
+  ( sleep 3; touch "$marker"; kill "$pid" 2>/dev/null || true ) &
+  watcher=$!
+  set +e
+  wait "$pid"
+  status=$?
+  set +e
+  kill "$watcher" 2>/dev/null || true
+  wait "$watcher" 2>/dev/null || true
+  if [ -f "$marker" ]; then
+    rm -f "$marker"
+    emit gh_live timeout
+  elif [ "$status" -eq 0 ]; then
+    emit gh_live ok
+  else
+    emit gh_live missing
+  fi
+}
+
+broker_pat_sudo() {
+  sudo -n stat -c '%U:%G %a' /etc/fieldwork-pr-broker/gh-token 2>/dev/null | grep -qx 'fieldwork-pr-broker:fieldwork-pr-broker 600'
+}
+
+# Distinguishes "token absent" from "passwordless sudo denied" (post-hardening):
+# unavailable = cannot run sudo -n, so token state is unknown; missing = sudo
+# worked but the token file is absent/wrong perms; ok = token present, 600.
+broker_pat_sudo_probe() {
+  if ! sudo -n true >/dev/null 2>&1; then
+    emit broker_pat_sudo_probe unavailable
+    return 0
+  fi
+  if broker_pat_sudo; then
+    emit broker_pat_sudo_probe ok
+  else
+    emit broker_pat_sudo_probe missing
+  fi
+}
+
+codex_cli_ready() {
+  export PATH="$HOME/.local/bin:$PATH"
+  command -v codex >/dev/null 2>&1 || return 1
+  codex --version >/dev/null 2>&1
+}
+
+# Mirrors normalize_agents_value() in bin/fieldwork, and additionally reports
+# whether ~/.fieldwork/agents is absent (missing) or unparseable (invalid) —
+# normalization alone would silently report an invalid file as "claude".
+agents_probe() {
+  local file="$HOME/.fieldwork/agents" raw stripped
+  if [ ! -f "$file" ]; then
+    emit configured_agents_raw ""
+    emit configured_agents claude
+    emit configured_agents_status missing
+    return 0
+  fi
+  raw="$(cat "$file" 2>/dev/null || true)"
+  emit configured_agents_raw "$raw"
+  stripped="$(printf '%s' "$raw" | tr -d '[:space:]')"
+  case "$stripped" in
+    claude|codex)
+      emit configured_agents "$stripped"
+      emit configured_agents_status ok
+      ;;
+    both|claude,codex|codex,claude)
+      emit configured_agents claude,codex
+      emit configured_agents_status ok
+      ;;
+    *)
+      emit configured_agents claude
+      emit configured_agents_status invalid
+      ;;
+  esac
+}
+
+public_ssh_rule() {
+  sudo -n ufw status 2>/dev/null |
+    grep -Ei '^[[:space:]]*22/tcp[[:space:]]+ALLOW' |
+    grep -Eiv '(on[[:space:]]+(tailscale|wg|tun)[0-9]*|(^|[^0-9.])(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.))' >/dev/null
+}
+
+remote_script_start="$(timing_now)"
+emit remote_user "$(id -un 2>/dev/null || printf unknown)"
+status_for fieldwork_cli test -x "$HOME/.local/bin/fieldwork"
+fieldwork_checkout_start="$(timing_now)"
+status_for fieldwork_checkout fingerprint_current
+timing_emit timing_remote_fingerprint "$fieldwork_checkout_start"
+status_for path_configured path_configured
+status_for bootstrap_ready bootstrap_ready
+status_for claude_login test -f "$HOME/.fieldwork/state/claude-login-confirmed"
+export PATH="$HOME/.local/bin:$PATH"
+status_for claude_cli command -v claude
+status_for codex_cli codex_cli_ready
+status_for codex_login test -f "$HOME/.fieldwork/state/codex-login-confirmed"
+agents_probe
+status_for gh_cli command -v gh
+status_for gh_hosts test -s "$HOME/.config/gh/hosts.yml"
+gh_live_start="$(timing_now)"
+gh_live_status
+timing_emit timing_remote_gh_auth_status "$gh_live_start"
+status_for verify_runner verify_runner_ready
+status_for prepare_runner test -f "$HOME/.config/systemd/user/fieldwork-pr-prepare-runner.socket"
+status_for claude_service test -f "$HOME/.config/systemd/user/fieldwork-agent@.service"
+broker_checks_start="$(timing_now)"
+status_for broker_socket sh -c 'test -S /run/fieldwork-pr-broker/fieldwork-pr.sock && test -w /run/fieldwork-pr-broker/fieldwork-pr.sock'
+status_for broker_pat_tool test -f /usr/local/sbin/rotate-pat
+status_for broker_thin_client test -e "$HOME/.local/bin/fieldwork-pr-submit"
+status_for broker_pat_marker test -f "$HOME/.fieldwork/state/broker-pat-confirmed"
+status_for broker_pat_sudo broker_pat_sudo
+broker_pat_sudo_probe
+timing_emit timing_remote_broker_checks "$broker_checks_start"
+status_for temporary_sudo test -f "/etc/sudoers.d/fieldwork-$FIELDWORK_REMOTE_USER"
+status_for public_ssh_rule public_ssh_rule
+status_for projects_dir test -d "$FIELDWORK_PROJECTS_DIR"
+timing_emit timing_remote_script_total "$remote_script_start"

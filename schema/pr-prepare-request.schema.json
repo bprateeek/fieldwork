@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fieldwork.local/schema/pr-prepare-request.schema.json",
+  "title": "Fieldwork PR Prepare Request",
+  "description": "Runtime-enforced request shape accepted by fieldwork-pr-prepare-runner. Performs checkout-b + add + commit on the agent's behalf, outside the agent's PR_SET_NO_NEW_PRIVS user namespace.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["request_id", "created_at", "repo_path", "branch", "paths", "message"],
+  "properties": {
+    "request_id": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$",
+      "description": "Client-generated UUID used for replay protection and audit correlation. Must be unique across the runner's ledger."
+    },
+    "created_at": {
+      "type": "string",
+      "pattern": "^20[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$",
+      "description": "UTC timestamp for auditability, formatted like 2026-05-17T10:30:00Z."
+    },
+    "repo_path": {
+      "type": "string",
+      "pattern": "^/home/fieldwork/projects/[a-z0-9][a-z0-9-]{0,30}$",
+      "description": "Absolute path to an onboarded repo under the Fieldwork projects root. Default shown; the runner derives the real pattern from FIELDWORK_PROJECTS_ROOT."
+    },
+    "branch": {
+      "type": "string",
+      "pattern": "^fieldwork/[a-z0-9][a-z0-9/_-]{1,80}$",
+      "description": "Head branch to create for this commit. The runner refuses if the branch already exists. Default prefix shown; the runner derives the real prefix from FIELDWORK_BRANCH_PREFIX."
+    },
+    "paths": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 100,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 256,
+        "pattern": "^[^\\x00\\n/][^\\x00\\n]*$"
+      },
+      "description": "Repo-relative paths to stage. Each must be non-empty, ≤256 chars, contain no NUL or newline, not start with '/' (absolute path), and resolve inside the repo root after realpath (no '..' escapes). The runner additionally rejects if the set of files dirty in the worktree does not match this list exactly."
+    },
+    "message": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 8192,
+      "description": "Commit message body. The runner spools this to a tmpfile and passes -F to git commit (never argv). At least one non-blank character required."
+    }
+  }
+}

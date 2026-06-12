@@ -1,0 +1,30 @@
+[Unit]
+Description=Fieldwork verify runner (connection %i)
+Requires=fieldwork-verify-runner.socket
+
+[Service]
+# Critical: do NOT set NoNewPrivileges=true here. The whole point of this
+# unit is to give the verify runner an execution context where bwrap can
+# create user namespaces — which requires AppArmor profile transitions
+# that PR_SET_NO_NEW_PRIVS blocks. The trust boundary is enforced by
+# the socket's 0600 mode (only the fieldwork user can connect) and by
+# the runner's own input validation (path allowlist, symlink rejection),
+# not by systemd hardening on this unit.
+ExecStart=%h/.local/bin/fieldwork-verify-runner
+Environment=FIELDWORK_PROJECTS_ROOT=%h/projects
+Environment=FIELDWORK_WORKTREES_ROOT=%h/worktrees
+
+# The socket is passed in on stdin and used for stdout. stderr is split off
+# so internal runner errors land in the journal and can't be confused with
+# the framed protocol stream we send to the client.
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+
+# A full verify pipeline (lint + typecheck + tests + secret scan + semgrep)
+# on a large repo can run minutes. 10 minutes is generous; client-side will
+# be the actual ceiling.
+TimeoutStartSec=600
+
+# One-shot: each connection gets its own instance; exit when done.
+Type=simple

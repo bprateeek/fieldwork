@@ -1,0 +1,4 @@
+{
+  "_comment": "All MCP credentials MUST come from env vars; never inline. .mcp.local.json (gitignored) carries write-capable creds for local use only. fieldwork-init --verify greps for token-shaped strings.",
+  "mcpServers": {}
+}

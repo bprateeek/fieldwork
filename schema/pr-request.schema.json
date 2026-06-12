@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fieldwork.local/schema/pr-request.schema.json",
+  "title": "Fieldwork PR Request",
+  "description": "Runtime-enforced request shape accepted by fieldwork-pr-broker.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["request_id", "created_at", "repo_path", "branch", "title", "body"],
+  "properties": {
+    "request_id": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$",
+      "description": "Client-generated UUID used for replay protection and audit correlation."
+    },
+    "created_at": {
+      "type": "string",
+      "pattern": "^20[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$",
+      "description": "UTC timestamp for auditability, formatted like 2026-05-11T10:30:00Z."
+    },
+    "repo_path": {
+      "type": "string",
+      "pattern": "^/home/fieldwork/projects/[a-z0-9][a-z0-9-]{0,30}$",
+      "description": "Absolute path to an onboarded repo under the Fieldwork projects root. Default shown; the broker derives the real pattern from FIELDWORK_BROKER_PROJECTS_ROOT."
+    },
+    "branch": {
+      "type": "string",
+      "pattern": "^fieldwork/[a-z0-9][a-z0-9/_-]{1,80}$",
+      "description": "PR head branch to push. The broker pushes HEAD to this branch. Default prefix shown; the broker derives the real prefix from FIELDWORK_BROKER_BRANCH_PREFIX."
+    },
+    "title": {
+      "type": "string",
+      "maxLength": 200,
+      "pattern": "^[^\\n]*$",
+      "description": "Pull request title. Runtime rejects titles over 200 characters or containing newlines."
+    },
+    "body": {
+      "type": "string",
+      "maxLength": 65536,
+      "description": "Pull request body. Runtime enforces a 64 KiB UTF-8 byte limit and scans with gitleaks."
+    }
+  }
+}

@@ -1,0 +1,1511 @@
+#!/usr/bin/env bash
+# fieldwork onboard — chain fieldwork-clone → priming → fieldwork-init → broker PR
+# → remote Claude session service
+# for a GitHub repo. Idempotent: each step preflights its own "already done?" gate.
+#
+# Usage:
+#   fieldwork onboard <owner>/<repo> [--branch <name>] [--no-workflows] [--with-approval-gate] [--status] [--reset-state] [--reseed-templates]
+#   fieldwork onboard --help
+#
+# --reseed-templates forces re-application of fieldwork-managed template
+# paths (.claude/skills/, .claude/hooks/, .gitignore additions) onto an
+# already-onboarded repo, then commits and submits the drift through the
+# broker. Use this after a Fieldwork upgrade that changed skills/hooks.
+#
+# Requires:
+#   - SSH alias `fieldwork-vps` resolves to the VPS.
+#   - Broker, fieldwork-clone, fieldwork-init already deployed on the VPS.
+#   - PAT already covers <owner>/<repo>; if not, this script tells you and exits.
+#
+# Does NOT:
+#   - Widen the PAT (manual github.com action).
+#   - Drive workspace-trust / remote-control consent dialogs.
+#   - Touch the default branch or merge anything.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Resolve the control-plane config so a direct run matches `fieldwork onboard`
+# and the host/user/branch defaults live in exactly one place (lib/cli/config.sh).
+# When launched by bin/fieldwork these values arrive forwarded in the env, and
+# config.sh keeps env-provided values (env wins).
+# shellcheck source=lib/cli/config.sh
+source "$SCRIPT_DIR/../cli/config.sh"
+fieldwork_load_config
+
+SSH_HOST="$FIELDWORK_SSH_HOST"
+REMOTE_USER="$FIELDWORK_REMOTE_USER"
+BROKER_USER="${FIELDWORK_BROKER_USER:-fieldwork-pr-broker}"
+PROJECTS_DIR="$FIELDWORK_PROJECTS_DIR"
+DEFAULT_BRANCH="$FIELDWORK_DEFAULT_BRANCH"
+BRANCH_RE='^fieldwork/[a-z0-9][a-z0-9/_-]{1,80}$'
+FIELDWORK_UI_COLOR=0
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  FIELDWORK_UI_COLOR=1
+fi
+FIELDWORK_CURSOR_HIDDEN=0
+# shellcheck source=lib/scripts/fieldwork-status
+source "$SCRIPT_DIR/fieldwork-status"
+
+# Reuse the SSH ControlMaster that bin/fieldwork warmed before exec'ing us, so
+# every ssh/scp here rides one connection instead of paying a fresh handshake
+# (which is what made the flow feel stuck between steps). FIELDWORK_SSH_CONTROL_PATH
+# carries the literal %C token; ssh resolves it to the same socket the parent
+# opened. Calls that need a direct connection (-t tty, -G dump, root@) bypass the
+# mux, matching the wrappers in bin/fieldwork. If the env vars are unset (mux not
+# available), both wrappers fall through to a plain command.
+# Returns success when this call may reuse the shared ControlMaster: a control
+# path is set and no arg forces a direct connection. Phrased without "&& !" so it
+# works on macOS's bash 3.2, which does not parse "!" after "&&".
+_onboard_ssh_can_mux() {
+  [ -n "${FIELDWORK_SSH_CONTROL_PATH:-}" ] || return 1
+  local arg
+  for arg in "$@"; do
+    case "$arg" in
+      -G|-t|-tt|root@*) return 1 ;;
+    esac
+  done
+  return 0
+}
+ssh() {
+  if _onboard_ssh_can_mux "$@"; then
+    command ssh -o ControlMaster=auto -o ControlPersist="${FIELDWORK_SSH_CONTROL_PERSIST:-600}" -o ControlPath="$FIELDWORK_SSH_CONTROL_PATH" "$@"
+  else
+    command ssh "$@"
+  fi
+}
+scp() {
+  if _onboard_ssh_can_mux "$@"; then
+    command scp -o ControlMaster=auto -o ControlPersist="${FIELDWORK_SSH_CONTROL_PERSIST:-600}" -o ControlPath="$FIELDWORK_SSH_CONTROL_PATH" "$@"
+  else
+    command scp "$@"
+  fi
+}
+
+# Which agent surfaces this host is configured for (~/.fieldwork/agents on the
+# VPS). Claude-only steps (workspace-trust, remote-control consent, the
+# fieldwork-agent@ session unit) are gated on claude; Codex connects per-SSH via
+# Codex Desktop and has no per-repo session service. Defaults to claude when the
+# file is absent or unreadable.
+CONFIGURED_AGENTS=""
+configured_agents() {
+  if [ -z "$CONFIGURED_AGENTS" ]; then
+    local value
+    value="$(ssh "$SSH_HOST" "cat ~/.fieldwork/agents 2>/dev/null || true" 2>/dev/null || true)"
+    value="$(printf '%s' "$value" | tr -d '[:space:]')"
+    case "$value" in
+      claude|codex) CONFIGURED_AGENTS="$value" ;;
+      both|claude,codex|codex,claude) CONFIGURED_AGENTS="claude,codex" ;;
+      *) CONFIGURED_AGENTS="claude" ;;
+    esac
+  fi
+  printf '%s\n' "$CONFIGURED_AGENTS"
+}
+agent_enabled() {
+  case ",$(configured_agents)," in
+    *",$1,"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+codex_connection_hint() {
+  cat <<EOF
+Codex
+  - SSH host: $SSH_HOST
+  - User: $REMOTE_USER
+  - Repo: $REMOTE_REPO_DIR
+
+  One-time setup:
+    Connections -> SSH -> add or open this connection.
+    In Details, enable "Available from signed-in devices" for mobile access.
+
+  Then:
+    Open $REMOTE_REPO_DIR on mobile or desktop and start building.
+    Before PR work, confirm the mobile header shows $SLUG on the VPS SSH connection
+    ($SSH_HOST or the server display name), not your local Mac/Windows host.
+
+Mobile note
+  - Mobile uses signed-in Desktop connections; do not skip the Details setting.
+  - If the VPS host or repo path is missing, open it once in Codex Desktop.
+
+Codex does not create a named session like Claude's vps-$SLUG.
+EOF
+}
+
+usage() {
+  sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'
+  exit "${1:-2}"
+}
+
+OWNER_REPO=""
+BRANCH="fieldwork/init"
+NO_WORKFLOWS=0
+WITH_APPROVAL_GATE=0
+STATUS_ONLY=0
+RESET_STATE=0
+RESEED_TEMPLATES=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --help|-h) usage 0 ;;
+    --branch)  BRANCH="${2:?--branch requires a name}"; shift 2 ;;
+    --no-workflows) NO_WORKFLOWS=1; shift ;;
+    --with-approval-gate) WITH_APPROVAL_GATE=1; shift ;;
+    --status) STATUS_ONLY=1; shift ;;
+    --reset-state) RESET_STATE=1; shift ;;
+    --reseed-templates) RESEED_TEMPLATES=1; shift ;;
+    --)
+      shift
+      [ $# -eq 0 ] || { echo "unexpected argument after --: $1" >&2; usage; }
+      break
+      ;;
+    -*) echo "unknown flag: $1" >&2; usage ;;
+    *)
+      [ -z "$OWNER_REPO" ] || { echo "fieldwork onboard accepts exactly one <owner>/<repo>" >&2; usage; }
+      OWNER_REPO="$1"
+      shift
+      ;;
+  esac
+done
+
+[ -n "$OWNER_REPO" ] || usage
+
+# Strict owner/repo validation. Owner: 1-39 chars, alnum + single hyphens, no leading/trailing
+# hyphen. Repo: 1-100 chars, alnum + . _ -. Defends interpolation into ssh command strings.
+case "$OWNER_REPO" in
+  */*) ;;
+  *) echo "expected <owner>/<repo>, got: $OWNER_REPO" >&2; exit 2 ;;
+esac
+OWNER="${OWNER_REPO%%/*}"
+REPO_NAME="${OWNER_REPO#*/}"
+[[ "$OWNER" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,37}[a-zA-Z0-9])?$ ]] || {
+  echo "[onboard] FAIL: owner '$OWNER' is not a valid GitHub user/org name" >&2
+  exit 2
+}
+[[ "$OWNER" == *--* ]] && {
+  echo "[onboard] FAIL: owner '$OWNER' contains consecutive hyphens" >&2
+  exit 2
+}
+[[ "$REPO_NAME" =~ ^[a-zA-Z0-9._-]{1,100}$ ]] || {
+  echo "[onboard] FAIL: repo name '$REPO_NAME' contains characters outside [A-Za-z0-9._-] or is too long" >&2
+  exit 2
+}
+
+[[ "$BRANCH" =~ $BRANCH_RE ]] || {
+  echo "[onboard] FAIL: branch '$BRANCH' does not match broker pattern $BRANCH_RE" >&2
+  exit 2
+}
+
+[[ "$BROKER_USER" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || {
+  echo "[onboard] FAIL: broker user '$BROKER_USER' is not a safe Linux user name" >&2
+  exit 2
+}
+
+SLUG="$REPO_NAME"
+[[ "$SLUG" =~ ^[a-z0-9][a-z0-9-]{0,30}$ ]] || {
+  echo "[onboard] FAIL: slug '$SLUG' fails ^[a-z0-9][a-z0-9-]{0,30}\$ — broker would reject" >&2
+  exit 2
+}
+
+# Two distinct paths matter:
+#   REMOTE_REPO_DIR is what ssh commands see — `$HOME` is expanded by the VPS shell.
+#   BROKER_REPO_PATH is what goes into the JSON request to the broker, which validates it
+#   against ^/home/fieldwork/projects/[a-z0-9][a-z0-9-]{0,30}$ (server.py REPO_PATH_RE) and
+#   does NOT expand $HOME.
+REMOTE_REPO_DIR="$PROJECTS_DIR/$SLUG"
+BROKER_REPO_PATH="$PROJECTS_DIR/$SLUG"
+STATE_FILE="$REMOTE_REPO_DIR/.fieldwork/local/fieldwork-onboard-state.json"
+STATE_DISPLAY_FILE="$BROKER_REPO_PATH/.fieldwork/local/fieldwork-onboard-state.json"
+PR_URL=""
+PR_STATE=""
+PR_REQUEST_ID=""
+PR_EXPIRES_AT=""
+if [ "$NO_WORKFLOWS" = "1" ]; then
+  WORKFLOW_MODE="skipped (--no-workflows)"
+  WORKFLOW_REVIEW_TARGET="CODEOWNERS and broker config. Workflow templates were not included."
+  INIT_PR_BODY="Adds .claude/, CODEOWNERS, branch protection (where supported), dependabot, and Fieldwork broker config. Workflow templates were skipped via --no-workflows, so the broker PAT does not need Workflows read/write for this init PR unless existing workflow files changed. Generated by fieldwork-init via fieldwork onboard."
+else
+  WORKFLOW_MODE="included"
+  WORKFLOW_REVIEW_TARGET="CODEOWNERS and workflow files."
+  INIT_PR_BODY="Adds .claude/, .github/workflows/, CODEOWNERS, branch protection (where supported), dependabot. Generated by fieldwork-init via fieldwork onboard. Review the CODEOWNERS substitution carefully."
+fi
+if [ "$WITH_APPROVAL_GATE" = "1" ]; then
+  INIT_PR_BODY="$INIT_PR_BODY
+
+This repo also opts in to the broker approval gate via .fieldwork/approval-gate — every PR request from this repo will be queued for a Telegram approval before the broker pushes."
+fi
+say() { echo "[onboard] $*"; }
+
+# Detect whether sudo on the VPS requires a password. Matches the helpers in
+# bin/fieldwork (remote_sudo_passwordless / remote_sudo_prefix) so user-facing
+# command suggestions don't emit a "-p '[sudo] VPS Linux password for ...'" prompt
+# when /etc/sudoers.d/fieldwork-fieldwork makes sudo NOPASSWD for the agent user.
+remote_sudo_prefix() {
+  if [ -z "${FIELDWORK_REMOTE_SUDO_PASSWORDLESS:-}" ]; then
+    if ssh -o BatchMode=yes "$SSH_HOST" "sudo -n true" >/dev/null 2>&1; then
+      FIELDWORK_REMOTE_SUDO_PASSWORDLESS=1
+    else
+      FIELDWORK_REMOTE_SUDO_PASSWORDLESS=0
+    fi
+  fi
+  if [ "$FIELDWORK_REMOTE_SUDO_PASSWORDLESS" = "1" ]; then
+    printf 'sudo'
+  else
+    printf "sudo -p '[sudo] VPS Linux password for %s: '" "$REMOTE_USER"
+  fi
+}
+
+supports_utf8() {
+  case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
+    *UTF-8*|*utf8*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+use_color() {
+  [ "$FIELDWORK_UI_COLOR" = "1" ]
+}
+
+green() {
+  if use_color; then
+    printf '\033[32m%s\033[0m' "$1"
+  else
+    printf '%s' "$1"
+  fi
+}
+
+blue() {
+  if use_color; then
+    printf '\033[34m%s\033[0m' "$1"
+  else
+    printf '%s' "$1"
+  fi
+}
+
+bold() {
+  if use_color; then
+    printf '\033[1m%s\033[0m' "$1"
+  else
+    printf '%s' "$1"
+  fi
+}
+
+phase_section() {
+  echo
+  if use_color; then
+    printf '%s\n' "$(bold "$(blue "$1")")"
+  else
+    echo "$1"
+  fi
+}
+
+status_ok_line() {
+  local label="$1"
+  if [ -t 1 ] && supports_utf8; then
+    printf '  %s %s\n' "$(green "✓")" "$label"
+  else
+    printf '  %-7s %s\n' "ok" "$label"
+  fi
+}
+
+status_info_line() {
+  printf '  %-7s %s\n' "info" "$*"
+}
+
+status_pending_line() {
+  printf '  %-7s %s\n' "..." "$*"
+}
+
+status_pending_live() {
+  printf '\r\033[K'
+  printf '  %-7s %s' "..." "$*"
+}
+
+clear_live_line() {
+  printf '\r\033[K'
+}
+
+hide_cursor() {
+  [ -t 1 ] || return 0
+  printf '\033[?25l'
+  FIELDWORK_CURSOR_HIDDEN=1
+}
+
+show_cursor() {
+  [ "$FIELDWORK_CURSOR_HIDDEN" = "1" ] || return 0
+  printf '\033[?25h'
+  FIELDWORK_CURSOR_HIDDEN=0
+}
+
+begin_visible_step() {
+  local label="$1"
+  fieldwork_status_start "$label"
+}
+
+update_visible_step() {
+  local label="$1"
+  fieldwork_status_update "$label"
+}
+
+finish_visible_ok() {
+  local label="$1"
+  fieldwork_status_succeed "$label"
+}
+
+finish_visible_info() {
+  local label="$1"
+  fieldwork_status_succeed ""
+  status_info_line "$label"
+}
+
+finish_visible_fail() {
+  local label="$1"
+  fieldwork_status_fail "$label"
+}
+
+status_warn_line() {
+  printf '  %-7s %s\n' "warn" "$*"
+}
+
+status_fail_line() {
+  printf '  %-7s %s\n' "fail" "$*" >&2
+}
+
+confirm() {
+  local prompt="$1"
+  local default_yes="${2:-1}"
+  local suffix answer
+  if [ "$default_yes" = "1" ]; then
+    suffix="[Y/n]"
+  else
+    suffix="[y/N]"
+  fi
+  read -r -p "$prompt $suffix " answer
+  case "$answer" in
+    y|Y|yes|YES) return 0 ;;
+    n|N|no|NO) return 1 ;;
+    "")
+      [ "$default_yes" = "1" ]
+      return
+      ;;
+    *)
+      echo "Please answer yes or no." >&2
+      confirm "$prompt" "$default_yes"
+      ;;
+  esac
+}
+
+print_next_action_and_exit() {
+  local action="$1"
+  local status="${2:-0}"
+  echo
+  echo "Next action:"
+  echo "  $action"
+  exit "$status"
+}
+
+manual_step_marker_path() {
+  case "$1" in
+    workspace_trust_confirmed|remote_control_consent_confirmed)
+      printf '%s/.fieldwork/local/fieldwork-%s' "$REMOTE_REPO_DIR" "$1"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+manual_step_marker_exists() {
+  local marker
+  marker="$(manual_step_marker_path "$1")" || return 1
+  ssh "$SSH_HOST" "test -f $marker" >/dev/null 2>&1
+}
+
+persist_manual_step_marker() {
+  local marker
+  marker="$(manual_step_marker_path "$1")" || return 0
+  ssh "$SSH_HOST" "mkdir -p $REMOTE_REPO_DIR/.fieldwork/local && touch $marker" >/dev/null 2>&1 || true
+}
+
+remote_service_active() {
+  ssh "$SSH_HOST" "systemctl --user is-active --quiet 'fieldwork-agent@$SLUG'" >/dev/null 2>&1
+}
+
+run_quiet() {
+  local pending_label="$1"
+  local done_label="$2"
+  local output status pid
+  shift 2
+  output="$(mktemp "${TMPDIR:-/tmp}/fieldwork-onboard.XXXXXX")"
+  remember_tmp "$output"
+
+  fieldwork_status_start "$pending_label"
+  set +e
+  "$@" >"$output" 2>&1 &
+  pid=$!
+  wait "$pid"
+  status=$?
+  set -e
+  if [ "$status" -eq 0 ]; then
+    fieldwork_status_succeed "$done_label"
+    return 0
+  fi
+
+  fieldwork_status_fail "$pending_label"
+  if [ -s "$output" ]; then
+    echo "  Last output:" >&2
+    tail -40 "$output" | sed 's/^/    /' >&2
+  fi
+  return "$status"
+}
+
+run_capture() {
+  local __var="$1"
+  local pending_label="$2"
+  local done_label="$3"
+  local output status pid
+  shift 3
+  output="$(mktemp "${TMPDIR:-/tmp}/fieldwork-onboard.XXXXXX")"
+  remember_tmp "$output"
+
+  fieldwork_status_start "$pending_label"
+  set +e
+  "$@" >"$output" 2>&1 &
+  pid=$!
+  wait "$pid"
+  status=$?
+  set -e
+  if [ "$status" -eq 0 ]; then
+    fieldwork_status_succeed "$done_label"
+    printf -v "$__var" '%s' "$(cat "$output")"
+    return 0
+  fi
+
+  fieldwork_status_fail "$pending_label"
+  printf -v "$__var" '%s' "$(cat "$output")"
+  return "$status"
+}
+
+run_interactive_checkpoint() {
+  local step="$1"
+  local title="$2"
+  local purpose="$3"
+  local opens="$4"
+  local expected="$5"
+  local remote_command="$6"
+  local next_action="$7"
+  local status
+
+  if state_has_step "$step"; then
+    phase_section "$title"
+    status_ok_line "$title already completed"
+    return 0
+  fi
+
+  phase_section "$title"
+  echo "  $purpose"
+  [ -z "$opens" ] || echo "  Opens: $opens"
+  [ -z "$expected" ] || echo "  Do: $expected"
+  echo
+  if ! confirm "Open now?" 1; then
+    print_next_action_and_exit "$next_action" 0
+  fi
+
+  fieldwork_status_cleanup
+  printf '  Claude may take a moment to draw its UI.\n'
+  printf '  opening Claude session: %s\n' "$title"
+  set +e
+  ssh -t "$SSH_HOST" "$remote_command"
+  status=$?
+  set -e
+  if [ "$status" -ne 0 ]; then
+    status_warn_line "interactive session exited with status $status"
+  fi
+
+  if confirm "Mark $title complete?" 1; then
+    mark_step "$step"
+    persist_manual_step_marker "$step"
+    status_ok_line "$title complete"
+  else
+    print_next_action_and_exit "$next_action" 1
+  fi
+}
+
+print_broker_pat_widening_steps() {
+  cat >&2 <<EOF
+Widen the existing PAT on github.com:
+  Settings -> Developer settings -> Personal access tokens -> Fine-grained
+  -> click the existing PAT -> Repository access -> Selected repositories
+  -> add $OWNER_REPO -> Update.
+Re-run fieldwork onboard $OWNER_REPO after widening.
+EOF
+}
+
+print_stale_broker_contract_steps() {
+  cat >&2 <<EOF
+
+This usually means the VPS broker daemon is still running an older Fieldwork
+contract that treats /preflight like a PR request.
+
+Next action:
+  fieldwork sync-vps --force-install
+  ssh -t $SSH_HOST "$(remote_sudo_prefix) bash ~/.fieldwork/infra/fieldwork-pr-broker/install.sh"
+
+Then rerun:
+  fieldwork onboard $OWNER_REPO
+EOF
+}
+
+print_broker_submit_failure() {
+  local response="$1"
+  local error request_id workflow_hint
+  error="$(printf '%s' "$response" | jq -r '.error // empty' 2>/dev/null || true)"
+  request_id="$(printf '%s' "$response" | jq -r '.request_id // empty' 2>/dev/null || true)"
+
+  cat >&2 <<EOF
+[onboard] FAIL: broker did not open the init PR.
+EOF
+
+  if [ -n "$request_id" ]; then
+    printf '  request_id: %s\n' "$request_id" >&2
+  fi
+  if [ -n "$error" ]; then
+    printf '  broker error: %s\n' "$error" >&2
+  fi
+
+  workflow_hint=0
+  case "$error" in
+    *"Workflows"*|*"workflow"*) workflow_hint=1 ;;
+    *"git/gh failure"*) [ "$NO_WORKFLOWS" = "0" ] && workflow_hint=1 ;;
+  esac
+
+  if [ "$workflow_hint" = "1" ]; then
+    cat >&2 <<EOF
+
+Most likely cause:
+  The broker PAT can see the repo, but it cannot push workflow file changes.
+  Default onboarding includes .github/workflows/**, which requires the
+  fine-grained PAT permission Workflows: read/write.
+
+Next action:
+  Add Workflows: read/write to the existing broker PAT, then rerun:
+    fieldwork onboard $OWNER_REPO
+
+Alternative:
+  If you want to keep the PAT narrower, delete the local init branch on the VPS,
+  reset the checkpoint, and rerun with --no-workflows:
+    ssh $SSH_HOST 'cd $REMOTE_REPO_DIR && git checkout $DEFAULT_BRANCH && git branch -D $BRANCH'
+    fieldwork onboard $OWNER_REPO --reset-state --no-workflows
+EOF
+  else
+    cat >&2 <<EOF
+
+Next action:
+  inspect the broker response above, then run fieldwork doctor --remote --explain
+EOF
+  fi
+
+  if [ -n "$request_id" ]; then
+    cat >&2 <<EOF
+
+Broker log lookup:
+  ssh -t $SSH_HOST "$(remote_sudo_prefix) grep '$request_id' /var/log/fieldwork-pr-broker.log"
+EOF
+  fi
+}
+
+grant_broker_checkout_read_access() {
+  ssh "$SSH_HOST" "repo=\"$REMOTE_REPO_DIR\"; projects=\"$PROJECTS_DIR\"; parent=\"\$(dirname \"\$projects\")\"; broker_user='$BROKER_USER'; chmod o+x \"\$parent\" \"\$projects\" 2>/dev/null || true; if command -v setfacl >/dev/null 2>&1 && id \"\$broker_user\" >/dev/null 2>&1; then setfacl -m \"u:\$broker_user:--x\" \"\$parent\" \"\$projects\" 2>/dev/null || true; setfacl -R -m \"u:\$broker_user:rX\" \"\$repo\" 2>/dev/null || true; else chmod -R o+rX \"\$repo\" 2>/dev/null || true; fi"
+}
+
+broker_pat_preflight() {
+  local payload raw http_code body error
+  payload="$(jq -nc --arg repo "$OWNER_REPO" '{repo: $repo}')"
+  raw="$(ssh "$SSH_HOST" "printf '%s' '$payload' | curl -sS --unix-socket /run/fieldwork-pr-broker/fieldwork-pr.sock -H 'Content-Type: application/json' --data-binary @- -w '\n%{http_code}' http://localhost/preflight 2>&1")" || {
+    cat >&2 <<EOF
+[onboard] FAIL: could not contact the PR broker socket.
+$raw
+
+Next action:
+  fieldwork doctor --remote --explain
+EOF
+    return 1
+  }
+
+  http_code="$(printf '%s\n' "$raw" | tail -n 1)"
+  body="$(printf '%s\n' "$raw" | sed '$d')"
+  if [ "$http_code" = "200" ] && printf '%s' "$body" | jq -e '.ok == true' >/dev/null 2>&1; then
+    return 0
+  fi
+
+  error="$(printf '%s' "$body" | jq -r '.error // empty' 2>/dev/null || true)"
+  [ -n "$error" ] || error="$body"
+  cat >&2 <<EOF
+[onboard] FAIL: broker preflight failed for $OWNER_REPO.
+Reason: ${error:-HTTP $http_code from broker}
+EOF
+  case "$error" in
+    *"missing required field: request_id"*|*"unexpected field: repo"*)
+      print_stale_broker_contract_steps
+      ;;
+    *"selected repositories"*|*"cannot reach"*)
+      print_broker_pat_widening_steps
+      ;;
+    *"not stored"*|*"empty"*|*"rotate-pat"*)
+      cat >&2 <<EOF
+
+Next action:
+  fieldwork setup
+EOF
+      ;;
+    *)
+      cat >&2 <<EOF
+
+Next action:
+  fieldwork doctor --remote --explain
+EOF
+      ;;
+  esac
+  return 1
+}
+
+TMP_FILES=""
+cleanup() {
+  local file
+  fieldwork_status_cleanup
+  show_cursor
+  for file in $TMP_FILES; do
+    rm -f "$file"
+  done
+}
+trap cleanup EXIT
+remember_tmp() {
+  TMP_FILES="$TMP_FILES $1"
+}
+
+COMPLETED_STEPS=""
+STATE_READY=0
+STATE_LOADED=0
+STATE_CORRUPT=0
+STATE_WORKFLOWS_INCLUDED=""
+
+state_step_label() {
+  case "$1" in
+    preflight_passed) echo "preflight passed" ;;
+    clone_deploy_key_completed) echo "clone/deploy key completed" ;;
+    workspace_trust_confirmed) echo "workspace trust confirmed" ;;
+    remote_control_consent_confirmed) echo "remote-control consent confirmed" ;;
+    init_artifacts_applied) echo "init artifacts applied" ;;
+    init_commit_created) echo "init commit created or already present" ;;
+    init_pr_opened) echo "init PR opened or already present" ;;
+    systemd_unit_active) echo "remote Claude session service enabled and active" ;;
+    *) echo "$1" ;;
+  esac
+}
+
+state_has_step() {
+  case " $COMPLETED_STEPS " in
+    *" $1 "*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+state_add_local() {
+  state_has_step "$1" && return 0
+  COMPLETED_STEPS="$COMPLETED_STEPS $1"
+}
+
+state_steps_json() {
+  # shellcheck disable=SC2086
+  printf '%s\n' $COMPLETED_STEPS | sed '/^$/d' | jq -R . | jq -s .
+}
+
+write_state() {
+  [ "$STATE_READY" = "1" ] || return 0
+  local tmp remote_tmp steps_json workflow_included
+  tmp="$(mktemp "${TMPDIR:-/tmp}/fieldwork-onboard.XXXXXX")"
+  remember_tmp "$tmp"
+  remote_tmp="/tmp/fieldwork-onboard-state-$SLUG.json"
+  steps_json="$(state_steps_json)"
+  if [ "$NO_WORKFLOWS" = "1" ]; then
+    workflow_included="false"
+  else
+    workflow_included="true"
+  fi
+  jq -n \
+    --arg repo "$OWNER_REPO" \
+    --arg slug "$SLUG" \
+    --arg branch "$BRANCH" \
+    --arg updated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --argjson workflows_included "$workflow_included" \
+    --argjson completed_steps "$steps_json" \
+    '{
+      version: 1,
+      repo: $repo,
+      slug: $slug,
+      branch: $branch,
+      workflows_included: $workflows_included,
+      completed_steps: $completed_steps,
+      updated_at: $updated_at
+    }' >"$tmp"
+  fieldwork_status_start "saving onboarding checkpoint"
+  if scp -q "$tmp" "$SSH_HOST:$remote_tmp" \
+    && ssh "$SSH_HOST" "mkdir -p $REMOTE_REPO_DIR/.fieldwork/local && mv '$remote_tmp' $STATE_FILE"; then
+    fieldwork_status_succeed ""
+    return 0
+  fi
+  fieldwork_status_fail "onboarding checkpoint save failed"
+  return 1
+}
+
+load_state() {
+  STATE_LOADED=0
+  STATE_CORRUPT=0
+  if ! ssh "$SSH_HOST" "test -f $STATE_FILE" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  local state_json
+  state_json="$(ssh "$SSH_HOST" "cat $STATE_FILE" 2>/dev/null || true)"
+  if ! printf '%s' "$state_json" | jq -e '.version == 1 and (.completed_steps | type == "array")' >/dev/null 2>&1; then
+    STATE_CORRUPT=1
+    COMPLETED_STEPS=""
+    say "WARN: onboarding checkpoint is corrupt; ignoring it."
+    say "      Repair: fieldwork onboard $OWNER_REPO --reset-state"
+    return 0
+  fi
+
+  COMPLETED_STEPS="$(printf '%s' "$state_json" | jq -r '.completed_steps[]?' | tr '\n' ' ')"
+  STATE_WORKFLOWS_INCLUDED="$(printf '%s' "$state_json" | jq -r 'if has("workflows_included") then (.workflows_included | tostring) else "" end')"
+  STATE_LOADED=1
+}
+
+validate_loaded_workflow_mode() {
+  [ "$STATE_LOADED" = "1" ] || return 0
+  case "$STATE_WORKFLOWS_INCLUDED:$NO_WORKFLOWS" in
+    true:0|false:1|"":*) return 0 ;;
+    true:1)
+      cat >&2 <<EOF
+[onboard] FAIL: checkpoint was created with workflow templates included,
+         but this run passed --no-workflows.
+         Re-run without --no-workflows, or use --reset-state if you intend
+         to discard only the checkpoint and recompute from repo state.
+EOF
+      exit 2
+      ;;
+    false:0)
+      cat >&2 <<EOF
+[onboard] FAIL: checkpoint was created with --no-workflows,
+         but this run did not pass --no-workflows.
+         Re-run with --no-workflows, or use --reset-state if you intend
+         to discard only the checkpoint and recompute from repo state.
+EOF
+      exit 2
+      ;;
+  esac
+}
+
+infer_completed_steps() {
+  [ "$STATE_READY" = "1" ] || return 0
+  local inferred=0
+
+  if ! state_has_step "clone_deploy_key_completed" && ssh "$SSH_HOST" "test -d $REMOTE_REPO_DIR/.git" >/dev/null 2>&1; then
+    state_add_local "clone_deploy_key_completed"
+    inferred=1
+  fi
+
+  if ! state_has_step "workspace_trust_confirmed"; then
+    if manual_step_marker_exists "workspace_trust_confirmed" || remote_service_active; then
+      state_add_local "workspace_trust_confirmed"
+      inferred=1
+    fi
+  else
+    persist_manual_step_marker "workspace_trust_confirmed"
+  fi
+
+  if ! state_has_step "remote_control_consent_confirmed"; then
+    if manual_step_marker_exists "remote_control_consent_confirmed" || remote_service_active; then
+      state_add_local "remote_control_consent_confirmed"
+      inferred=1
+    fi
+  else
+    persist_manual_step_marker "remote_control_consent_confirmed"
+  fi
+
+  if ! state_has_step "systemd_unit_active" && remote_service_active; then
+    state_add_local "systemd_unit_active"
+    inferred=1
+  fi
+
+  if [ "$inferred" = "1" ]; then
+    write_state
+  fi
+}
+
+ensure_state_ready() {
+  if ssh "$SSH_HOST" "test -d $REMOTE_REPO_DIR/.git" >/dev/null 2>&1; then
+    STATE_READY=1
+    [ "$STATE_LOADED" = "1" ] || load_state
+    infer_completed_steps
+    write_state
+  fi
+}
+
+mark_step() {
+  state_add_local "$1"
+  write_state
+}
+
+print_onboard_state() {
+  local next_action=""
+  set_next_action() {
+    [ -n "$next_action" ] || next_action="$1"
+  }
+  status_row() {
+    local ok="$1"
+    local label="$2"
+    local action="${3:-fieldwork onboard $OWNER_REPO}"
+    if [ "$ok" = "1" ]; then
+      status_ok_line "$label"
+    else
+      printf '  %-7s %s\n' "!" "$label"
+      set_next_action "$action"
+    fi
+  }
+
+  echo
+  echo "Onboarding: $OWNER_REPO"
+  echo
+  if [ "$STATE_LOADED" = "1" ] && [ -n "$STATE_WORKFLOWS_INCLUDED" ]; then
+    if [ "$STATE_WORKFLOWS_INCLUDED" = "true" ]; then
+      printf '  %-7s %s\n' "info" "workflow templates included"
+    else
+      printf '  %-7s %s\n' "info" "workflow templates skipped (--no-workflows)"
+    fi
+  fi
+
+  state_has_step "preflight_passed" \
+    && status_row 1 "GitHub and broker PAT preflight passed" \
+    || status_row 0 "GitHub and broker PAT preflight not confirmed"
+  [ "$STATE_READY" = "1" ] \
+    && status_row 1 "repo cloned on VPS" \
+    || status_row 0 "repo not cloned on VPS"
+  if state_has_step "clone_deploy_key_completed" || [ "$STATE_READY" = "1" ]; then
+    status_row 1 "read-only deploy key added and clone completed"
+  else
+    status_row 0 "read-only deploy key not confirmed"
+  fi
+  if agent_enabled claude; then
+    state_has_step "workspace_trust_confirmed" \
+      && status_row 1 "workspace trust completed" \
+      || status_row 0 "workspace trust pending" "ssh -t $SSH_HOST 'cd $REMOTE_REPO_DIR && ~/.local/bin/claude'"
+    state_has_step "remote_control_consent_confirmed" \
+      && status_row 1 "Claude Remote Control consent completed" \
+      || status_row 0 "Claude Remote Control consent pending" "ssh -t $SSH_HOST 'cd $REMOTE_REPO_DIR && ~/.local/bin/claude remote-control'"
+  fi
+  state_has_step "init_artifacts_applied" \
+    && status_row 1 "init artifacts applied" \
+    || status_row 0 "init artifacts not applied"
+  state_has_step "init_commit_created" \
+    && status_row 1 "init commit created or already present" \
+    || status_row 0 "init commit not confirmed"
+  state_has_step "init_pr_opened" \
+    && status_row 1 "init PR opened or already present" \
+    || status_row 0 "init PR not opened"
+  if agent_enabled claude; then
+    if state_has_step "systemd_unit_active"; then
+      status_row 1 "remote Claude session service enabled and active"
+    else
+      status_row 0 "remote Claude session service not confirmed" "ssh $SSH_HOST 'systemctl --user restart fieldwork-agent@$SLUG'"
+    fi
+  elif agent_enabled codex; then
+    printf '  %-7s %s\n' "info" "Codex Desktop connects over SSH; no session service to start"
+  fi
+
+  if [ "$STATE_READY" = "1" ]; then
+    printf '  %-7s %s\n' "info" "state file: $STATE_DISPLAY_FILE"
+  else
+    printf '  %-7s %s\n' "info" "state file is created after clone/deploy-key completes"
+  fi
+
+  echo
+  echo "Next action:"
+  if [ -n "$next_action" ]; then
+    echo "  $next_action"
+  else
+    echo "  fieldwork smoke $OWNER_REPO"
+  fi
+}
+
+print_onboard_header() {
+  phase_section "Fieldwork Onboard"
+  echo "  repo: $OWNER_REPO"
+  echo "  branch: $BRANCH"
+  echo "  workflows: $WORKFLOW_MODE"
+}
+
+check_existing_checkout_visible() {
+  begin_visible_step "checking VPS checkout"
+  set +e
+  ssh "$SSH_HOST" "test -d $REMOTE_REPO_DIR/.git" >/dev/null 2>&1
+  local status=$?
+  set -e
+  if [ "$status" -eq 0 ]; then
+    STATE_READY=1
+    finish_visible_ok "VPS checkout found"
+  else
+    finish_visible_info "no VPS checkout yet; deploy-key clone will run"
+  fi
+  return 0
+}
+
+load_state_visible() {
+  [ "$STATE_READY" = "1" ] || return 0
+  local output
+  output="$(mktemp "${TMPDIR:-/tmp}/fieldwork-onboard.XXXXXX")"
+  remember_tmp "$output"
+  begin_visible_step "checking onboarding checkpoint"
+  set +e
+  load_state >"$output" 2>&1
+  local status=$?
+  set -e
+  if [ "$status" -ne 0 ]; then
+    finish_visible_fail "checking onboarding checkpoint"
+    cat "$output"
+    return "$status"
+  fi
+  if [ "$STATE_CORRUPT" = "1" ]; then
+    finish_visible_info "onboarding checkpoint is corrupt; ignoring it"
+    cat "$output"
+  elif [ "$STATE_LOADED" = "1" ]; then
+    finish_visible_ok "onboarding checkpoint loaded"
+  else
+    finish_visible_info "no onboarding checkpoint found"
+  fi
+}
+
+restore_prior_confirmations_visible() {
+  [ "$STATE_READY" = "1" ] || return 0
+  agent_enabled claude || return 0
+  begin_visible_step "restoring prior Claude approvals"
+  infer_completed_steps
+  if state_has_step "workspace_trust_confirmed" && state_has_step "remote_control_consent_confirmed"; then
+    finish_visible_ok "prior Claude approvals restored"
+  else
+    finish_visible_info "Claude approvals still need confirmation"
+  fi
+}
+
+if [ "$STATUS_ONLY" != "1" ]; then
+  print_onboard_header
+  phase_section "Resume"
+fi
+
+if [ "$RESET_STATE" = "1" ]; then
+  run_quiet \
+    "resetting onboarding checkpoint" \
+    "onboarding checkpoint reset" \
+    ssh "$SSH_HOST" "rm -f $STATE_FILE" || true
+  COMPLETED_STEPS=""
+  STATE_LOADED=0
+  STATE_CORRUPT=0
+fi
+
+if [ "$STATUS_ONLY" = "1" ]; then
+  if fieldwork_status_check "checking VPS checkout" ssh "$SSH_HOST" "test -d $REMOTE_REPO_DIR/.git"; then
+    STATE_READY=1
+    load_state
+  else
+    say "$REMOTE_REPO_DIR is not cloned yet."
+  fi
+  print_onboard_state
+  exit 0
+fi
+
+check_existing_checkout_visible
+if [ "$STATE_READY" = "1" ]; then
+  load_state_visible
+  validate_loaded_workflow_mode
+  restore_prior_confirmations_visible
+fi
+
+phase_section "Preflight"
+echo "  repo: $OWNER_REPO"
+
+# 1. VPS-side preflight: gh resolves repo, default branch is captured, PAT reaches.
+run_capture preflight_json \
+  "checking repo with VPS GitHub CLI" \
+  "VPS GitHub CLI can resolve repo" \
+  ssh "$SSH_HOST" "gh repo view '$OWNER_REPO' --json defaultBranchRef,nameWithOwner,visibility" || {
+  cat >&2 <<EOF
+[onboard] FAIL: VPS gh cannot resolve $OWNER_REPO. Output:
+$preflight_json
+
+Diagnose:
+  ssh $SSH_HOST gh auth status
+If logged out:
+  ssh -t $SSH_HOST gh auth login
+EOF
+  exit 1
+}
+
+default_branch="$(printf '%s' "$preflight_json" | jq -r '.defaultBranchRef.name // empty')"
+visibility="$(printf '%s' "$preflight_json"     | jq -r '.visibility // empty')"
+echo "  default branch: ${default_branch:-?}, visibility: ${visibility:-?}"
+
+[ -n "$default_branch" ] || default_branch="$DEFAULT_BRANCH"
+[[ "$default_branch" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$ ]] || {
+  echo "[onboard] FAIL: default branch '$default_branch' has an unsupported name." >&2
+  exit 2
+}
+DEFAULT_BRANCH="$default_branch"
+
+run_quiet \
+  "checking broker PAT reach through broker socket" \
+  "broker PAT can reach repo" \
+  broker_pat_preflight || exit 1
+state_add_local "preflight_passed"
+write_state
+
+# 2. Clone (skip if already cloned).
+if fieldwork_status_check "checking VPS checkout" ssh "$SSH_HOST" "test -d $REMOTE_REPO_DIR/.git"; then
+  phase_section "Repository Checkout"
+  status_ok_line "repo checkout ready on VPS"
+else
+  phase_section "Deploy Key"
+  echo "  Purpose: give the VPS read-only clone access without giving the agent a write token."
+  echo "  GitHub path: $OWNER_REPO -> Settings -> Deploy keys -> Add deploy key"
+  echo "  Important: leave Allow write access unchecked."
+  echo
+  run_capture deploy_key \
+    "preparing per-repo SSH key on VPS" \
+    "deploy key ready on VPS" \
+    ssh "$SSH_HOST" "~/.fieldwork/scripts/fieldwork-clone --prepare-deploy-key '$OWNER_REPO'" || {
+    printf '%s\n' "$deploy_key" >&2
+    exit 1
+  }
+  echo
+  echo "Public key:"
+  echo
+  printf '%s\n' "$deploy_key"
+  echo
+  read -r -p "Press Enter after adding this read-only deploy key in GitHub (Ctrl-C to abort) " _
+
+  phase_section "Clone"
+  run_quiet \
+    "checking deploy-key access and cloning repository" \
+    "repository cloned on VPS" \
+    ssh "$SSH_HOST" "~/.fieldwork/scripts/fieldwork-clone --clone-after-deploy-key '$OWNER_REPO'" || {
+      echo >&2
+      echo "Next action:" >&2
+      echo "  confirm the deploy key was added as read-only, then rerun fieldwork onboard $OWNER_REPO" >&2
+      exit 1
+    }
+fi
+STATE_READY=1
+mark_step "clone_deploy_key_completed"
+
+# 3. Manual priming checkpoints — Claude Code only. No way to drive
+# workspace-trust / remote-control automatically. Codex has no Fieldwork-driven
+# trust or consent dialog; it connects per-SSH via Codex Desktop.
+if agent_enabled claude; then
+  run_interactive_checkpoint \
+    "workspace_trust_confirmed" \
+    "Workspace Trust" \
+    "Trust this repo folder in Claude Code before Fieldwork starts the long-running service." \
+    "Claude Code in the VPS checkout" \
+    "choose 1 to trust the folder, then run /exit" \
+    "cd $REMOTE_REPO_DIR && ~/.local/bin/claude" \
+    "ssh -t $SSH_HOST 'cd $REMOTE_REPO_DIR && ~/.local/bin/claude'"
+
+  run_interactive_checkpoint \
+    "remote_control_consent_confirmed" \
+    "Claude Remote Control Consent" \
+    "Enable Claude remote control for Fieldwork session vps-$SLUG." \
+    "" \
+    "Answer y if asked. Fieldwork already sets isolated worktrees; stop with Ctrl-C after the URL/session appears." \
+    "cd $REMOTE_REPO_DIR && ~/.local/bin/claude remote-control --name 'vps-$SLUG' --remote-control-session-name-prefix 'vps-$SLUG' --sandbox --spawn=worktree --capacity=1" \
+    "ssh -t $SSH_HOST 'cd $REMOTE_REPO_DIR && ~/.local/bin/claude remote-control --name vps-$SLUG --remote-control-session-name-prefix vps-$SLUG --sandbox --spawn=worktree --capacity=1'"
+fi
+
+phase_section "Initialization PR"
+
+# 4. fieldwork-init on feature branch.
+# Resume gate: a previous failed run can leave the branch existing without
+# init having completed (e.g. fieldwork-init died after `git checkout -b` but
+# before finishing the rsync / GH-side config). The honest "init completed"
+# signal is `.fieldwork/expected-origin` rewritten to the actual repo URL —
+# that's the last template-substitution step. Branch existence alone is too
+# weak. Check both: branch exists AND expected-origin contains the right URL.
+expected_origin_re="^https://github\\.com/${OWNER}/${REPO_NAME}(\\.git)?$"
+init_done=0
+if fieldwork_status_check "checking init branch state" ssh "$SSH_HOST" "cd $REMOTE_REPO_DIR && git rev-parse --verify '$BRANCH' >/dev/null 2>&1"; then
+  if fieldwork_status_check "checking init branch artifacts" ssh "$SSH_HOST" "cd $REMOTE_REPO_DIR && git show '$BRANCH:.fieldwork/expected-origin' 2>/dev/null | grep -Eq '$expected_origin_re'"; then
+    init_done=1
+  fi
+fi
+if [ "$init_done" = 1 ]; then
+  status_ok_line "init artifacts already applied on $BRANCH"
+  mark_step "init_artifacts_applied"
+elif fieldwork_status_check "checking init branch state" ssh "$SSH_HOST" "cd $REMOTE_REPO_DIR && git rev-parse --verify '$BRANCH' >/dev/null 2>&1"; then
+  cat >&2 <<EOF
+[onboard] FAIL: branch '$BRANCH' exists but .fieldwork/expected-origin is missing
+         or doesn't match $OWNER_REPO. A previous fieldwork-init run probably
+         died midway. Choose one:
+           inspect first: ssh $SSH_HOST 'cd $REMOTE_REPO_DIR && git log $BRANCH --oneline'
+           discard + retry: ssh $SSH_HOST 'cd $REMOTE_REPO_DIR && git checkout $DEFAULT_BRANCH && git branch -D $BRANCH'
+                            then re-run fieldwork onboard $OWNER_REPO --branch $BRANCH
+EOF
+  exit 1
+else
+  init_extra=""
+  [ "$NO_WORKFLOWS" = "1" ] && init_extra="$init_extra --no-workflows"
+  [ "$WITH_APPROVAL_GATE" = "1" ] && init_extra="$init_extra --with-approval-gate"
+  run_quiet \
+    "applying Fieldwork init templates on $BRANCH" \
+    "Fieldwork init templates applied on $BRANCH" \
+    ssh "$SSH_HOST" "~/.fieldwork/scripts/fieldwork-init --branch '$BRANCH' --repo '$OWNER_REPO'$init_extra $REMOTE_REPO_DIR"
+  mark_step "init_artifacts_applied"
+fi
+
+# 4b. Ensure the working tree is on the target branch BEFORE staging or PR submission.
+# If we took the resume-skip path in step 4, the checkout may still be on whatever
+# branch the previous failed run left behind (often the default branch). Without this guard,
+# step 5 would commit to the wrong branch and step 6 would push that branch's HEAD
+# as the PR head — broker would happily push `main`'s tip to the fieldwork/init ref.
+run_quiet \
+  "checking out $BRANCH" \
+  "checkout is on $BRANCH" \
+  ssh "$SSH_HOST" "cd $REMOTE_REPO_DIR && current=\$(git rev-parse --abbrev-ref HEAD) && if [ \"\$current\" != '$BRANCH' ]; then git checkout '$BRANCH'; fi" || {
+  echo "[onboard] FAIL: could not switch to '$BRANCH'. Inspect:" >&2
+  echo "  ssh $SSH_HOST 'cd $REMOTE_REPO_DIR && git status && git branch -vv'" >&2
+  exit 1
+}
+
+# 4c. Optional: re-apply fieldwork-managed template paths over the existing
+# checkout. Scoped to .claude/skills/, .claude/hooks/, .claude/agents/, and
+# idempotent .gitignore additions — paths owned by Fieldwork that a user
+# would not customize. CLAUDE.md, AGENTS.md, REVIEW.md, .mcp.json, workflows, etc. are
+# user-customizable and stay untouched. The next commit step will pick up
+# any drift and the broker submit will surface it as a follow-up PR.
+if [ "$RESEED_TEMPLATES" = "1" ]; then
+  run_quiet \
+    "re-seeding fieldwork-managed template paths" \
+    "fieldwork-managed templates re-seeded" \
+    ssh "$SSH_HOST" "set -e
+cd $REMOTE_REPO_DIR
+tpl=~/.fieldwork/templates/repo
+for path in .claude/skills .claude/hooks .claude/agents; do
+  if [ -d \"\$tpl/\$path\" ]; then
+    mkdir -p \"\$path\"
+    rsync -a --delete \"\$tpl/\$path/\" \"\$path/\"
+  fi
+done
+# Idempotent .gitignore additions for fieldwork-managed paths. rsync
+# preserves the user's .gitignore so we append missing entries here.
+if [ -f .gitignore ]; then
+  for line in '.fieldwork/local/' '.claude/worktrees/'; do
+    grep -qxF \"\$line\" .gitignore || printf '%s\\n' \"\$line\" >> .gitignore
+  done
+fi
+# Idempotent .eslintignore: per-conversation worktrees under
+# .claude/worktrees/ duplicate source files and would otherwise cause
+# ESLint to report the same finding 2-3x. Create the file if absent.
+touch .eslintignore
+grep -qxF '.claude/worktrees/' .eslintignore || printf '%s\\n' '.claude/worktrees/' >> .eslintignore
+"
+fi
+
+# 5. Stage + commit init artifacts (idempotent: noop if nothing staged).
+run_quiet \
+  "committing init artifacts if needed" \
+  "init artifacts committed or already clean" \
+  ssh "$SSH_HOST" "cd $REMOTE_REPO_DIR && git add -A && (git diff --cached --quiet || git -c user.email=fieldwork@vps -c user.name='Fieldwork VPS' commit -m 'chore(fieldwork): bootstrap Fieldwork config')"
+mark_step "init_commit_created"
+
+run_quiet \
+  "granting broker read access to checkout" \
+  "broker can read checkout" \
+  grant_broker_checkout_read_access
+
+# 6. Open init PR via broker (skip if one already open for this branch).
+existing_pr=""
+existing_pr_status=0
+run_capture existing_pr \
+  "checking for an existing init PR on $BRANCH" \
+  "checked for existing init PR" \
+  ssh "$SSH_HOST" "gh pr list --repo '$OWNER_REPO' --head '$BRANCH' --state open --json number --jq '.[0].number'" || existing_pr_status=$?
+if [ "$existing_pr_status" != "0" ]; then
+  existing_pr=""
+fi
+existing_pr="$(printf '%s' "$existing_pr" | tr -d '[:space:]')"
+
+# 6a. When no PR is open yet, detect the already-onboarded case: if the init
+# branch has no commits ahead of the default branch, the init PR was already
+# merged and there is nothing left to open — the broker would reject this as
+# "no commits between". Catch it here and report a clean no-op. Fetch uses the
+# read-only deploy key. Any failure leaves init_ahead empty so we fall through
+# to the broker (fail-open).
+init_ahead=""
+if [ -z "$existing_pr" ]; then
+  init_ahead_status=0
+  run_capture init_ahead \
+    "checking whether $BRANCH has changes vs $DEFAULT_BRANCH" \
+    "compared $BRANCH against $DEFAULT_BRANCH" \
+    ssh "$SSH_HOST" "cd $REMOTE_REPO_DIR && git fetch -q origin '$DEFAULT_BRANCH' && git rev-list --count 'origin/$DEFAULT_BRANCH..HEAD'" || init_ahead_status=$?
+  [ "$init_ahead_status" = "0" ] || init_ahead=""
+  init_ahead="$(printf '%s' "$init_ahead" | tr -d '[:space:]')"
+fi
+
+if [ -n "$existing_pr" ]; then
+  PR_URL="https://github.com/$OWNER_REPO/pull/$existing_pr"
+  PR_STATE="already open"
+  mark_step "init_pr_opened"
+  status_ok_line "init PR already open: $PR_URL"
+elif [ "$init_ahead" = "0" ]; then
+  PR_STATE="already merged"
+  mark_step "init_pr_opened"
+  status_ok_line "init already merged into $DEFAULT_BRANCH — nothing to open"
+  echo "  $BRANCH has no commits ahead of $DEFAULT_BRANCH; this repo is already onboarded."
+else
+  remote_script="/tmp/${SLUG}-init-pr.sh"
+  local_script="$(mktemp "${TMPDIR:-/tmp}/fieldwork-onboard.XXXXXX")"
+  remember_tmp "$local_script"
+  cat >"$local_script" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+cd $REMOTE_REPO_DIR
+mkdir -p .fieldwork/local
+request_id="\$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen)"
+created_at="\$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+body_file="\$(mktemp)"
+trap 'rm -f "\$body_file"' EXIT
+cat > "\$body_file" <<'BODY_EOF'
+$INIT_PR_BODY
+BODY_EOF
+body="\$(cat "\$body_file")"
+jq -n \\
+  --arg request_id "\$request_id" \\
+  --arg created_at "\$created_at" \\
+  --arg repo_path "$BROKER_REPO_PATH" \\
+  --arg branch "$BRANCH" \\
+  --arg title "chore(fieldwork): bootstrap Fieldwork config" \\
+  --arg body "\$body" \\
+  '{request_id: \$request_id, created_at: \$created_at, repo_path: \$repo_path, branch: \$branch, title: \$title, body: \$body}' \\
+  > .fieldwork/local/pr-request.json
+if [ -n "\$(git status --short -- ':!.fieldwork/local/')" ]; then
+  echo 'tree dirty — broker requires a clean worktree. Dirty paths:' >&2
+  git status --short -- ':!.fieldwork/local/' >&2
+  exit 1
+fi
+~/.local/bin/fieldwork-pr-submit .fieldwork/local/pr-request.json
+EOF
+  # Outer heredoc (unquoted) expands $REMOTE_REPO_DIR, $BROKER_REPO_PATH, $BRANCH,
+  # and $INIT_PR_BODY locally. The inner 'BODY_EOF' heredoc is quoted so the body
+  # lands on the VPS verbatim, and jq builds the request JSON — that keeps newlines
+  # and other JSON-special characters in the body properly escaped instead of
+  # breaking the request the way a naive "body": "$INIT_PR_BODY" string interpolation
+  # would (jq would reject literal newlines as unescaped control characters).
+  run_quiet \
+    "uploading PR request script to VPS" \
+    "PR request script uploaded" \
+    scp -q "$local_script" "$SSH_HOST:$remote_script"
+  broker_status=0
+  run_capture broker_response \
+    "opening init PR through broker" \
+    "init PR opened through broker" \
+    ssh "$SSH_HOST" "bash $remote_script; status=\$?; rm -f $remote_script; exit \$status" || broker_status=$?
+  # fieldwork-pr-submit prints the broker's JSON response on the first stdout
+  # line, then (for the approval-gate path) appends a human-readable "queued"
+  # notice. Parse only the JSON line. The body is printed even on a non-200
+  # status, so parse it before treating a non-zero exit as a hard failure.
+  broker_json="$(printf '%s\n' "$broker_response" | awk '/^\{.*\}$/ { print; exit }')"
+  if [ -n "$broker_json" ] && printf '%s' "$broker_json" | jq -e '.already_pending == true' >/dev/null 2>&1; then
+    # Idempotent re-run: the broker already has a queued request for this branch.
+    # Report the existing one instead of submitting a duplicate.
+    PR_URL=""
+    PR_STATE="queued"
+    PR_REQUEST_ID="$(printf '%s' "$broker_json" | jq -r '.pending_request_id // empty' 2>/dev/null || true)"
+    PR_EXPIRES_AT="$(printf '%s' "$broker_json" | jq -r '.expires_at // empty' 2>/dev/null || true)"
+    mark_step "init_pr_opened"
+    if [ -n "$PR_EXPIRES_AT" ]; then
+      status_ok_line "init PR already queued for Telegram approval (expires $PR_EXPIRES_AT)"
+    else
+      status_ok_line "init PR already queued for Telegram approval"
+    fi
+    [ -z "$PR_REQUEST_ID" ] || echo "  request_id: $PR_REQUEST_ID"
+  elif [ "$broker_status" != "0" ]; then
+    printf '%s\n' "$broker_response" >&2
+    print_broker_submit_failure "$broker_response"
+    exit "$broker_status"
+  elif [ -z "$broker_json" ] || ! printf '%s' "$broker_json" | jq -e '.ok == true' >/dev/null 2>&1; then
+    status_fail_line "broker did not accept the init PR request"
+    printf '%s\n' "$broker_response" >&2
+    print_broker_submit_failure "$broker_response"
+    exit 1
+  elif printf '%s' "$broker_json" | jq -e '.queued == true' >/dev/null 2>&1; then
+    PR_URL=""
+    PR_STATE="queued"
+    PR_REQUEST_ID="$(printf '%s' "$broker_json" | jq -r '.request_id // empty' 2>/dev/null || true)"
+    PR_EXPIRES_AT="$(printf '%s' "$broker_json" | jq -r '.expires_at // empty' 2>/dev/null || true)"
+    mark_step "init_pr_opened"
+    if [ -n "$PR_EXPIRES_AT" ]; then
+      status_ok_line "init PR queued for Telegram approval (expires $PR_EXPIRES_AT)"
+    else
+      status_ok_line "init PR queued for Telegram approval"
+    fi
+    [ -z "$PR_REQUEST_ID" ] || echo "  request_id: $PR_REQUEST_ID"
+  else
+    PR_URL="$(printf '%s' "$broker_json" | jq -r '.url // empty' 2>/dev/null || true)"
+    if [ -z "$PR_URL" ]; then
+      status_fail_line "broker response did not include a PR URL"
+      printf '%s\n' "$broker_response" >&2
+      print_broker_submit_failure "$broker_response"
+      exit 1
+    fi
+    PR_STATE="created"
+    mark_step "init_pr_opened"
+    echo "  PR: $PR_URL"
+  fi
+fi
+
+if agent_enabled claude; then
+  phase_section "Remote service"
+
+  # 7. Enable + start the remote Claude session service; tail journal for permission-denied lines.
+  # The unit exits 0 while the checkout is still on the init branch
+  # (fieldwork-agent-session gates until the init PR merges), so a non-active
+  # state with the gate marker in the journal is expected, not a failure.
+  w2_status=0
+  run_capture w2_output \
+    "starting remote Claude session service" \
+    "remote Claude session service checked" \
+    ssh "$SSH_HOST" "
+  systemctl --user enable --now 'fieldwork-agent@$SLUG' &&
+  sleep 4 &&
+  state=\$(systemctl --user is-active 'fieldwork-agent@$SLUG' || true) &&
+  echo \"\$state\" &&
+  if [ \"\$state\" = active ]; then
+    ( journalctl --user -u 'fieldwork-agent@$SLUG' -n 30 --no-pager | grep -iE 'permission denied' && echo '[onboard] WARN: permission-denied lines above — extend ReadWritePaths' || true )
+  elif journalctl --user -u 'fieldwork-agent@$SLUG' -n 30 --no-pager | grep -q 'refusing to serve sessions from the init branch'; then
+    echo GATED_UNTIL_INIT_MERGE
+  else
+    exit 1
+  fi
+" || w2_status=$?
+  if [ "$w2_status" != "0" ]; then
+    status_fail_line "remote Claude session service did not start"
+    printf '%s\n' "$w2_output" >&2
+    exit "$w2_status"
+  fi
+  w2_state="$(printf '%s\n' "$w2_output" | awk '/^(active|inactive|failed|activating|deactivating)$/ { state=$0 } END { print state }')"
+  if printf '%s\n' "$w2_output" | grep -qi 'permission denied'; then
+    status_warn_line "permission-denied lines appeared in the service journal"
+    printf '%s\n' "$w2_output" | grep -i 'permission denied' | sed 's/^/    /'
+  fi
+  mark_step "systemd_unit_active"
+  if printf '%s\n' "$w2_output" | grep -q 'GATED_UNTIL_INIT_MERGE'; then
+    status_ok_line "agent session gated until the init PR merges (expected); fieldwork refresh $SLUG lifts it"
+  else
+    [ -z "$w2_state" ] || echo "  service state: $w2_state"
+  fi
+elif agent_enabled codex; then
+  phase_section "Remote service"
+  status_ok_line "Codex Desktop connects over SSH; no per-repo session service to start"
+fi
+
+phase_section "Onboarding Complete"
+if [ "$PR_STATE" = "queued" ]; then
+  status_ok_line "init PR request queued for Telegram approval"
+elif [ "$PR_STATE" = "already merged" ]; then
+  status_ok_line "repo already onboarded — init config is on $DEFAULT_BRANCH"
+else
+  status_ok_line "init PR ready for review"
+fi
+echo "  repo: $OWNER_REPO"
+if [ "$PR_STATE" = "queued" ]; then
+  echo "  PR: pending Telegram approval (run: gh pr list --repo $OWNER_REPO --head $BRANCH once approved)"
+  [ -z "${PR_REQUEST_ID:-}" ] || echo "  request_id: $PR_REQUEST_ID"
+  [ -z "${PR_EXPIRES_AT:-}" ] || echo "  approval window expires: $PR_EXPIRES_AT"
+elif [ "$PR_STATE" = "already merged" ]; then
+  echo "  PR: none needed ($BRANCH has no changes vs $DEFAULT_BRANCH)"
+else
+  echo "  PR: ${PR_URL:-run: gh pr list --repo $OWNER_REPO --head $BRANCH}"
+fi
+echo "  workflows: $WORKFLOW_MODE"
+if agent_enabled claude; then
+  echo "  mobile session: vps-$SLUG"
+fi
+
+phase_section "Review"
+if [ "$PR_STATE" = "already merged" ]; then
+  echo "  Nothing to review — the Fieldwork init config is already on $DEFAULT_BRANCH."
+  echo "  Re-onboard only opens a PR when $BRANCH has changes the default branch lacks."
+elif [ "$PR_STATE" = "queued" ]; then
+  echo "  1. Approve the queued request from Telegram; the broker will then push and open the PR."
+  echo "  2. Once opened, wait for CI/security checks."
+  echo "  3. Review $WORKFLOW_REVIEW_TARGET"
+  echo "  4. Merge only when the PR looks right. Merging to $DEFAULT_BRANCH may deploy production."
+else
+  echo "  1. Open the init PR and wait for CI/security checks."
+  echo "  2. Review $WORKFLOW_REVIEW_TARGET"
+  echo "  3. Merge only when the PR looks right. Merging to $DEFAULT_BRANCH may deploy production."
+fi
+
+phase_section "After Merge"
+if agent_enabled claude; then
+  echo "  Refresh the VPS checkout and restart the session service:"
+else
+  echo "  Sync the VPS checkout to the merged default branch:"
+fi
+echo
+echo "    fieldwork refresh $SLUG"
+if agent_enabled claude; then
+  echo
+  echo "  Sessions stay gated until the refresh runs. Optional sanity check:"
+  echo "    fieldwork doctor --remote --session-probe"
+fi
+
+# Reflect the repo's ACTUAL approval-gate state, not just the CLI flag. The
+# .fieldwork/approval-gate marker may already be committed from an earlier
+# onboard (e.g. a Claude --with-approval-gate run). PR_STATE=queued is the broker
+# telling us the gate is live; otherwise check the marker on the branch directly.
+approval_gate_active=0
+if [ "$WITH_APPROVAL_GATE" = "1" ] || [ "$PR_STATE" = "queued" ]; then
+  approval_gate_active=1
+elif ssh "$SSH_HOST" "cd $REMOTE_REPO_DIR && git cat-file -e '$BRANCH:.fieldwork/approval-gate'" >/dev/null 2>&1; then
+  approval_gate_active=1
+fi
+
+if [ "$approval_gate_active" = "1" ]; then
+  phase_section "Approval gate"
+  echo "  Enabled for this repo (.fieldwork/approval-gate) — every PR request is"
+  echo "  queued for Telegram approval before the broker pushes."
+else
+  phase_section "Optional"
+  echo "  Telegram approval bot (not enabled for this repo) — queue each PR for"
+  echo "  mobile approval before the broker pushes."
+  echo "    One-time install:  fieldwork setup-notify --telegram-bot"
+  echo "    Opt in this repo:  fieldwork onboard $OWNER_REPO --with-approval-gate"
+fi
+
+phase_section "Work Session Ready"
+if agent_enabled claude && agent_enabled codex; then
+  echo "  Fieldwork prepared both agent surfaces for this repo."
+  echo
+  echo "  Claude"
+  echo "    - Open Claude mobile or claude.ai/code"
+  echo "    - Session: vps-$SLUG"
+  echo
+  codex_connection_hint | sed 's/^/  /'
+  echo
+  echo "  Important: Do not use Claude and Codex concurrently in the same checkout."
+elif agent_enabled codex; then
+  echo "  Fieldwork prepared Codex for this repo."
+  echo
+  codex_connection_hint | sed 's/^/  /'
+else
+  echo "  Fieldwork prepared Claude for this repo."
+  echo
+  echo "  Claude"
+  echo "    - Open Claude mobile or claude.ai/code"
+  echo "    - Session: vps-$SLUG"
+fi

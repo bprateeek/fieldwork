@@ -1,0 +1,12 @@
+[Unit]
+Description=Fieldwork PR broker socket
+
+[Socket]
+ListenStream=/run/fieldwork-pr-broker/fieldwork-pr.sock
+SocketUser=fieldwork-pr-broker
+SocketGroup=fieldwork-pr
+SocketMode=0660
+RuntimeDirectory=fieldwork-pr-broker
+
+[Install]
+WantedBy=sockets.target

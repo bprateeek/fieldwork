@@ -1,0 +1,31 @@
+[Unit]
+Description=Fieldwork PR-prepare runner (connection %i)
+Requires=fieldwork-pr-prepare-runner.socket
+
+[Service]
+# Critical: do NOT set NoNewPrivileges=true here. The whole point of this
+# unit is to give the prepare runner an execution context where git can
+# run normally — under PR_SET_NO_NEW_PRIVS the runner's children inherit
+# NNP, which interacts poorly with AppArmor profile transitions and
+# generally makes git's subprocess handling unpredictable. The trust
+# boundary is enforced by the socket's 0600 mode (only the fieldwork user
+# can connect) and by the runner's own input validation (path allowlist,
+# branch regex, schema preflight, worktree-state mismatch rejection, and
+# `git -c core.hooksPath=/dev/null` so repo-controlled hooks cannot run),
+# not by systemd hardening on this unit.
+ExecStart=%h/.local/bin/fieldwork-pr-prepare-runner
+Environment=FIELDWORK_PROJECTS_ROOT=%h/projects
+
+# The socket is passed in on stdin and used for stdout. stderr is split off
+# so internal runner errors land in the journal and can't be confused with
+# the framed protocol stream we send to the client.
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+
+# A prepare is short — checkout, add, commit. 30s is generous; any longer
+# is almost certainly a stuck git invocation that should be killed.
+TimeoutStartSec=30
+
+# One-shot: each connection gets its own instance; exit when done.
+Type=simple

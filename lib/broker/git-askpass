@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Git askpass helper for the broker. Git invokes this with one argument:
+# a prompt string like "Username for ..." or "Password for ...". Echo the
+# right value; git reads it from stdout.
+#
+# Token is read from disk ONLY when git asks for it. It is not in env, not in
+# argv. It briefly exists in the helper's stdout pipe to git — same uid as the
+# broker, so no /proc cross-uid exposure.
+case "$1" in
+  Username*) echo "x-access-token" ;;
+  Password*) cat "${FIELDWORK_BROKER_TOKEN_PATH:-/etc/fieldwork-pr-broker/gh-token}" ;;
+  *)         exit 1 ;;
+esac

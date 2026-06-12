@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# Start a per-repo Claude Code Remote Control session on the VPS.
+# Usage: fieldwork-launch <repo-slug>
+#
+# Validates input, checks the repo exists, starts the user-mode systemd unit,
+# and tails the journal for the first 5 seconds to confirm it came up.
+
+set -euo pipefail
+
+section() {
+  echo
+  echo "$1"
+}
+
+REPO="${1:-}"
+[ -n "$REPO" ] || { echo "usage: fieldwork-launch <repo-slug>" >&2; exit 2; }
+
+# Allowlist regex: lowercase alphanum + hyphens, 1–31 chars.
+[[ "$REPO" =~ ^[a-z0-9][a-z0-9-]{0,30}$ ]] || {
+  echo "[fieldwork-launch] invalid repo slug: $REPO" >&2
+  echo "[fieldwork-launch] must match ^[a-z0-9][a-z0-9-]{0,30}$" >&2
+  exit 2
+}
+
+REPO_DIR="$HOME/projects/$REPO"
+[ -d "$REPO_DIR/.git" ] || {
+  echo "[fieldwork-launch] no git repo at $REPO_DIR" >&2
+  echo "[fieldwork-launch] clone or move it first: git clone <url> $REPO_DIR" >&2
+  exit 1
+}
+
+UNIT="fieldwork-agent@$REPO.service"
+
+section "Remote session"
+echo "  repo: $REPO"
+echo "  service: $UNIT"
+
+echo "[fieldwork-launch] starting service"
+systemctl --user start "$UNIT"
+
+section "Startup log"
+echo "[fieldwork-launch] tailing journal for 5s"
+timeout 5 journalctl --user -u "$UNIT" -f --no-pager 2>/dev/null || true
+
+section "Result"
+if systemctl --user is-active --quiet "$UNIT"; then
+  echo "  ok: $UNIT is active"
+  echo
+  echo "Next action:"
+  echo "  open Claude mobile and use session vps-$REPO"
+else
+  echo "[fieldwork-launch] $UNIT did not stay active." >&2
+  echo "Next action:" >&2
+  echo "  inspect:" >&2
+  echo "  systemctl --user status $UNIT" >&2
+  echo "  journalctl --user -u $UNIT -n 100 --no-pager" >&2
+  exit 1
+fi

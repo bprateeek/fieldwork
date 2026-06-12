@@ -1,0 +1,157 @@
+#!/usr/bin/env bash
+# fieldwork-pr-prepare-runner — socket-activated frontend to the PR-prepare impl.
+#
+# Invoked by systemd as fieldwork-pr-prepare-runner@<conn>.service when a client
+# connects to fieldwork-pr-prepare-runner.socket. The socket gives us its file
+# descriptor on stdin/stdout (StandardInput=socket / StandardOutput=socket).
+# This runner reads one JSON line of request, schema-validates it, spools the
+# commit message into a tmpfile (avoiding argv), and execs the impl script.
+# stdout/stderr from the impl are line-tagged and streamed back to the client;
+# a final exit-code frame closes the protocol.
+#
+# Why this layer exists at all: the agent process that calls
+# /home/fieldwork/.local/bin/fieldwork-pr-prepare has PR_SET_NO_NEW_PRIVS set
+# and runs inside its own user namespace (claude remote-control --sandbox).
+# Routing the call through this socket-activated unit puts the git work
+# under the user manager (systemd --user) — outside the agent's userns,
+# with NNP clear. Mirror of fieldwork-verify-runner.
+#
+# Wire protocol (one direction in, one direction out, line-delimited):
+#
+#   client -> server:  one JSON object terminated by \n (the full request)
+#   server -> client:  one or more frames, each a \n-terminated line:
+#                        O\t<line>     stdout from impl
+#                        E\t<line>     stderr from impl
+#                        X\t<exit>     final exit code (always last)
+#
+# Exit codes (mirror fieldwork-verify, with prepare-specific codes):
+#     0   ok
+#    10   branch already exists
+#    11   worktree state mismatch (unexpected files dirty)
+#    12   checkout/add/commit failed; rolled back
+#    13   path safety rejected
+#    20   abuse / sandbox-unavailable / schema mismatch / missing field
+#    21   duplicate request_id (replay)
+
+set -uo pipefail
+
+IMPL="$(dirname -- "$(readlink -f -- "$0")")/fieldwork-pr-prepare-impl"
+
+emit_error_and_exit() {
+  local msg="$1" code="$2"
+  printf 'E\trunner: %s\n' "$msg"
+  printf 'X\t%d\n' "$code"
+  exit 0
+}
+
+# ---- Scratch dir + spool files (cleaned on exit) ---------------------------
+
+tmpdir="$(mktemp -d 2>/dev/null)" || emit_error_and_exit "mktemp failed" 20
+trap 'rm -rf "$tmpdir"' EXIT
+msg_file="$tmpdir/message"
+paths_file="$tmpdir/paths"
+
+# ---- Read the request (one JSON object terminated by \n) -------------------
+
+if ! IFS= read -r request_line; then
+  emit_error_and_exit "no request received on stdin" 20
+fi
+
+if ! command -v jq >/dev/null 2>&1; then
+  emit_error_and_exit "jq not installed on the runner host" 20
+fi
+
+# Schema preflight (the impl re-validates against the on-disk schema, but
+# reject obviously-malformed requests here so the impl never sees garbage).
+# Paths array must contain no newlines (the schema forbids it) and at least
+# one entry.
+if ! printf '%s' "$request_line" | jq -e '
+      type == "object"
+      and (has("request_id") and has("created_at") and has("repo_path")
+           and has("branch") and has("paths") and has("message"))
+      and (.paths | type == "array")
+      and (.paths | length > 0)
+      and (.paths | length <= 100)
+      and (.paths | all(type == "string" and length > 0 and length <= 256
+                        and (contains("\n") | not)))
+    ' >/dev/null 2>&1; then
+  emit_error_and_exit "request JSON shape rejected by preflight" 20
+fi
+
+request_id="$(printf '%s' "$request_line" | jq -r '.request_id // empty')"
+created_at="$(printf '%s' "$request_line" | jq -r '.created_at // empty')"
+repo_path="$(printf '%s'  "$request_line" | jq -r '.repo_path // empty')"
+branch="$(printf '%s'     "$request_line" | jq -r '.branch // empty')"
+projects_root="${FIELDWORK_PROJECTS_ROOT:-/home/fieldwork/projects}"
+
+if [ -z "$request_id" ] || [ -z "$created_at" ] || [ -z "$repo_path" ] || [ -z "$branch" ]; then
+  emit_error_and_exit "request has empty required field(s)" 20
+fi
+
+case "$request_id" in
+  [0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]-[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]-[1-5][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]-[89abAB][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]-[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]) ;;
+  *) emit_error_and_exit "request_id is not a UUID" 20 ;;
+esac
+
+case "$repo_path" in
+  "$projects_root"/*) ;;
+  *) emit_error_and_exit "repo_path outside allowlist: $repo_path" 20 ;;
+esac
+
+case "$branch" in
+  fieldwork/*) ;;
+  *) emit_error_and_exit "branch outside allowlist (must start with fieldwork/): $branch" 20 ;;
+esac
+
+# Spool the commit message into a file so the impl can pass -F to git commit.
+# Keeps message off argv (visible in /proc to anyone in the pid ns) and
+# accommodates messages with newlines / control chars without shell escaping.
+if ! printf '%s' "$request_line" | jq -r '.message // empty' > "$msg_file"; then
+  emit_error_and_exit "failed to spool commit message" 20
+fi
+if [ ! -s "$msg_file" ]; then
+  emit_error_and_exit "commit message is empty" 20
+fi
+
+# Spool the paths array, one path per line. The schema bans newlines and NULs
+# inside path strings, so this separator is unambiguous. The impl reads with
+# `mapfile -t < $PATHS_FILE`.
+if ! printf '%s' "$request_line" | jq -r '.paths[]' > "$paths_file"; then
+  emit_error_and_exit "failed to spool paths" 20
+fi
+if [ ! -s "$paths_file" ]; then
+  emit_error_and_exit "paths array is empty" 20
+fi
+
+if [ ! -x "$IMPL" ]; then
+  emit_error_and_exit "fieldwork-pr-prepare-impl not executable at $IMPL" 20
+fi
+
+# ---- Set up framed output --------------------------------------------------
+
+out_fifo="$tmpdir/out"
+err_fifo="$tmpdir/err"
+mkfifo -m 0600 "$out_fifo" "$err_fifo" || emit_error_and_exit "mkfifo failed" 20
+
+( while IFS= read -r line; do printf 'O\t%s\n' "$line"; done < "$out_fifo" ) &
+tag_out_pid=$!
+
+( while IFS= read -r line; do printf 'E\t%s\n' "$line"; done < "$err_fifo" ) &
+tag_err_pid=$!
+
+# ---- Run the impl ----------------------------------------------------------
+
+ec=0
+REQUEST_ID="$request_id" \
+CREATED_AT="$created_at" \
+REPO_PATH="$repo_path" \
+BRANCH="$branch" \
+MESSAGE_FILE="$msg_file" \
+PATHS_FILE="$paths_file" \
+  "$IMPL" >"$out_fifo" 2>"$err_fifo" || ec=$?
+
+wait "$tag_out_pid" 2>/dev/null || true
+wait "$tag_err_pid" 2>/dev/null || true
+
+printf 'X\t%d\n' "$ec"
+exit 0

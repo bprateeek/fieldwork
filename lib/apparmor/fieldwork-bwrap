@@ -1,0 +1,34 @@
+# Fieldwork — narrow AppArmor allowance for bwrap.
+#
+# Ubuntu 24.04 ships kernel.apparmor_restrict_unprivileged_userns=1, which
+# blocks every unprivileged user-namespace creation that is not covered by
+# an attached AppArmor profile — including bwrap's "setting up uid map"
+# step. Without an allowance, fieldwork-verify's inner sandbox cannot run.
+#
+# This profile attaches to /usr/bin/bwrap in unconfined mode and grants
+# `userns` only. The scope is intentionally minimal: every other
+# unprivileged userns consumer (curl, podman, firefox, …) stays subject
+# to the system-wide restriction. We do not flip
+# kernel.apparmor_restrict_unprivileged_userns globally.
+#
+# Install (once per VPS, persists across reboots):
+#
+#   sudo install -m 644 ~/fieldwork/lib/apparmor/fieldwork-bwrap \
+#                       /etc/apparmor.d/fieldwork-bwrap
+#   sudo apparmor_parser -r /etc/apparmor.d/fieldwork-bwrap
+#
+# Verify:
+#
+#   bwrap --unshare-user --bind / / -- /bin/true   # exit 0 when working
+#   sudo aa-status | grep -i bwrap                 # profile listed
+#
+# `fieldwork doctor --remote` runs the same probe and prescribes this
+# install when it sees the AppArmor-restricted case.
+
+abi <abi/4.0>,
+
+include <tunables/global>
+
+profile fieldwork-bwrap /usr/bin/bwrap flags=(unconfined) {
+  userns,
+}

@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if grep -R -q 'SECRET_SHAPED_TOKEN' "${2:-.}" 2>/dev/null; then
+  exit 1
+fi
+exit 0
