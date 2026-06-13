@@ -9,3 +9,9 @@ __pycache__/
 !.fieldwork/local/.gitkeep
 docs/ux-principles.md
 docs/assets/hero-gif-brief.md
+node_modules/
+dist/
+build/
+coverage/
+*.log
+*.bak
