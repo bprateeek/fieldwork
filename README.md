@@ -20,7 +20,7 @@ cd ~/fieldwork
 bash install.sh
 ```
 
-## Try it locally
+### Try it locally
 
 No VPS. No GitHub token. Requires Docker. About 2 minutes. This spins up the broker shape in Docker so you can watch the pull request path end to end.
 
@@ -30,7 +30,7 @@ fieldwork eval up && fieldwork eval smoke
 
 See [docs/evaluation.md](docs/evaluation.md).
 
-## Set up your VPS
+### Set up your VPS
 
 Requires a Mac or Linux workstation, an Ubuntu 24.04 VPS, a GitHub repo, and Claude Code or Codex Desktop access.
 
