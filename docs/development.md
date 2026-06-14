@@ -63,6 +63,18 @@ rg -n 'stale PR-flow phrase|TODO|draft marker' README.md docs
 rg -n 'fieldwork (setup|onboard|start|status|report|setup-notify|sync-vps|verify-security|doctor|bot-status|smoke)' README.md docs
 ```
 
+## README Demo GIF
+
+The README hero is generated from [demo source](demo/hero.yml) with demoframe:
+
+```sh
+npm install
+npm run demo:check
+npm run demo:render
+```
+
+`npm run demo:render` writes render QA files under `docs/demo/dist/`, copies the primary GIF to `docs/assets/hero.gif`, then uses ImageMagick's `magick` CLI to mask the area outside the phone frame transparent.
+
 ## CLI Surface
 
 The user-facing command surface is:

@@ -1,0 +1,14 @@
+{
+  "name": "fieldwork-readme-demo",
+  "private": true,
+  "description": "README demo media tooling for Fieldwork.",
+  "scripts": {
+    "demo:check": "demoframe check docs/demo/hero.yml",
+    "demo:preview": "demoframe preview docs/demo/hero.yml -o docs/demo/dist/preview",
+    "demo:render": "demoframe render docs/demo/hero.yml -o docs/demo/dist --asset-out docs/assets/hero.gif --strict && npm run demo:mask",
+    "demo:mask": "node docs/demo/apply-phone-mask.mjs docs/assets/hero.gif"
+  },
+  "devDependencies": {
+    "demoframe": "0.7.0"
+  }
+}

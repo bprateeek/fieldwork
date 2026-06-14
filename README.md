@@ -12,7 +12,7 @@ Fieldwork runs Claude or Codex on your VPS, verifies the change, and opens a Git
 Developer preview. Try it on a test repo first.
 
 <p align="center">
-  <img src="docs/assets/hero.gif" alt="Fieldwork mobile to pull request demo" width="260">
+  <img src="docs/assets/hero.gif" alt="Fieldwork mobile to pull request demo" width="280">
 </p>
 
 ## Install

@@ -1,0 +1,29 @@
+title: Fieldwork mobile to pull request demo
+output: { format: gif, width: 480, fps: 15, budget: 5MB, displayWidth: 280 }
+theme: { preset: github-dark, accent: "#e2603a", font: inter }
+frame: { type: phone, title: vps-fieldwork-smoke, subtitle: "fieldwork-smoke · VPS" }
+scenes:
+  - type: typing
+    duration: 3.8
+    text: "Add a tiny release-notes helper with a basic test"
+    send: true
+  - type: steps
+    duration: 3.6
+    header: { title: Workspace ready, detail: "VPS connected. Pull requests open for review." }
+    items:
+      - { label: Verification passed, detail: "Read files, created a basic test +3 -0", state: done }
+      - { label: Prepare succeeded, detail: "Branch prepared for broker submission", state: done }
+      - { label: Opening pull request, detail: "fieldwork/mobile-release-notes-helper", state: active, link: true }
+      - { label: PR ready for review, detail: "fieldwork-smoke #12", state: done }
+  - type: status-card
+    duration: 3.0
+    transition: crossfade
+    frame: { title: GitHub, subtitle: "bprateeek / fieldwork-smoke" }
+    title: Add release notes helper
+    subtitle: "Pull request #12"
+    branch: { from: fieldwork/mobile-release-notes-helper, into: main }
+    checks: [Checks passed, Ready for review]
+    cta: { label: Merge pull request, style: success }
+    caption: Broker opened the PR; GitHub owns the merge
+  - type: hold
+    duration: 1.4
