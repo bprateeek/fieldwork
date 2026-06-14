@@ -5,7 +5,7 @@
 Fieldwork runs Claude or Codex on your VPS, verifies the change, and opens a GitHub pull request through a separate broker. The agent can edit code, but it never receives the token that can push to GitHub.
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.1.0-blue)](CHANGELOG.md)
+[![Version](https://img.shields.io/github/v/tag/bprateeek/fieldwork?label=version&sort=semver)](CHANGELOG.md)
 [![Status](https://img.shields.io/badge/status-developer%20preview-orange)](docs/developer-preview.md)
 [![Platform](https://img.shields.io/badge/VPS-Ubuntu%2024.04-E95420)](docs/known-limitations.md)
 
