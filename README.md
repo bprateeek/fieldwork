@@ -73,7 +73,7 @@ The core rule: the coding agent never receives the GitHub write token.
 - The agent submits structured, **tokenless** PR requests.
 - The **broker** owns the GitHub write token (a fine-grained PAT) and validates repo state, branch names, origins, replay IDs, changed paths, and PR body content before it pushes.
 - An optional **Telegram approval gate** adds a human tap before the broker pushes.
-- No Fieldwork-operated telemetry; releases ship signed Git tags and SHA256 checksums ([docs/supply-chain.md](docs/supply-chain.md)).
+- Fieldwork has no Fieldwork-operated telemetry; releases ship signed Git tags and SHA256 checksums ([docs/supply-chain.md](docs/supply-chain.md)).
 
 Read [SECURITY.md](SECURITY.md) and [docs/threat-model.md](docs/threat-model.md) before trusting Fieldwork with a serious repository.
 
@@ -94,6 +94,8 @@ See [docs/known-limitations.md](docs/known-limitations.md) and [docs/developer-p
 - [Full setup](docs/setup.md): complete setup guide.
 - [Architecture](docs/architecture.md): full system map.
 - [Threat model](docs/threat-model.md): trust boundaries and defenses.
+
+Running the broker for a different agent? See the [advanced broker-only install](docs/broker-standalone.md).
 
 ## Contributing
 
