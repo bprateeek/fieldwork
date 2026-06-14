@@ -1,21 +1,18 @@
 # Fieldwork
 
-**Ship code from your phone without giving a coding agent your GitHub write token.**
-
-Fieldwork runs Claude or Codex on your VPS, verifies the change, and opens a GitHub pull request through a separate broker. The agent can edit code, but it never receives the token that can push to GitHub.
-
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Version](https://img.shields.io/github/v/tag/bprateeek/fieldwork?label=version&sort=semver)](CHANGELOG.md)
-[![Status](https://img.shields.io/badge/status-developer%20preview-orange)](docs/developer-preview.md)
 [![Platform](https://img.shields.io/badge/VPS-Ubuntu%2024.04-E95420)](docs/known-limitations.md)
 
-Developer preview. Try it on a test repo first.
+**Ship code from your phone without giving a coding agent your GitHub write token.**
+
+Fieldwork runs Claude or Codex on your VPS, verifies the change, and opens a GitHub pull request for review. The agent never receives your GitHub write token.
 
 <p align="center">
   <img src="docs/assets/hero.gif" alt="Fieldwork mobile to pull request demo" width="280">
 </p>
 
-## Install
+## Install Fieldwork
 
 ```sh
 git clone https://github.com/bprateeek/fieldwork.git ~/fieldwork
@@ -33,7 +30,7 @@ fieldwork eval up && fieldwork eval smoke
 
 See [docs/evaluation.md](docs/evaluation.md).
 
-## Set it up for real
+## Set up your VPS
 
 Requires a Mac or Linux workstation, an Ubuntu 24.04 VPS, a GitHub repo, and Claude Code or Codex Desktop access.
 
