@@ -622,6 +622,7 @@ step "Fieldwork systemd units"
 mkdir -p "$HOME/.config/systemd/user"
 units_installed=0
 units=(
+  fieldwork-dashboard.service
   fieldwork-event-poll.service
   fieldwork-event-poll.timer
   fieldwork-verify-runner.socket

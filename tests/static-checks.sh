@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-FIELDWORK_TEST_FINGERPRINT_FILES="bin/fieldwork install.sh AGENTS.md lib/cli/config.sh lib/cli/messaging.sh lib/cli/health.sh lib/cli/ssh-config.sh lib/cli/setup.sh lib/cli/onboard.sh lib/cli/provision.sh lib/cli/verify-security.sh lib/cli/uninstall.sh lib/cli/developer-preview.sh lib/systemd/bootstrap-vps.sh lib/apparmor/fieldwork-bwrap lib/broker/install.sh lib/broker/standalone-install.sh lib/broker/fieldwork-pr-broker.service lib/broker/fieldwork-pr-broker.socket lib/broker/fieldwork-pr-approve.socket lib/broker/server.py schema/pr-request.schema.json schema/pr-prepare-request.schema.json lib/scripts/fieldwork-status lib/scripts/fieldwork-pr-submit lib/scripts/fieldwork-clone lib/scripts/fieldwork-init lib/scripts/fieldwork-launch lib/scripts/fieldwork-agent-session lib/scripts/fieldwork-event-poll lib/scripts/fieldwork-setup-probe lib/scripts/fieldwork-session-probe lib/scripts/fieldwork-codex-sandbox lib/scripts/fieldwork-bot lib/scripts/fieldwork-pr-prepare lib/scripts/fieldwork-pr-prepare-runner lib/scripts/fieldwork-pr-prepare-impl lib/agents/claude-remote-control lib/templates/repo/AGENTS.md lib/templates/repo/CLAUDE.md lib/templates/repo/.gitignore lib/templates/repo/.fieldwork/expected-origin lib/systemd/fieldwork-agent@.service lib/systemd/fieldwork-event-poll.service lib/systemd/fieldwork-event-poll.timer lib/systemd/fieldwork-bot.service lib/systemd/fieldwork-pr-prepare-runner.socket lib/systemd/fieldwork-pr-prepare-runner@.service lib/systemd/fieldwork-verify-runner.socket lib/systemd/fieldwork-verify-runner@.service examples/eval/docker-compose.yml examples/eval/Dockerfile examples/eval/eval-smoke.sh examples/eval/fake-gh examples/eval/fake-gitleaks examples/eval/gh examples/eval/gitleaks examples/eval/README.md"
+FIELDWORK_TEST_FINGERPRINT_FILES="bin/fieldwork install.sh AGENTS.md lib/cli/config.sh lib/cli/messaging.sh lib/cli/health.sh lib/cli/ssh-config.sh lib/cli/setup.sh lib/cli/onboard.sh lib/cli/provision.sh lib/cli/verify-security.sh lib/cli/uninstall.sh lib/cli/developer-preview.sh lib/systemd/bootstrap-vps.sh lib/apparmor/fieldwork-bwrap lib/broker/install.sh lib/broker/standalone-install.sh lib/broker/fieldwork-pr-broker.service lib/broker/fieldwork-pr-broker.socket lib/broker/fieldwork-pr-approve.socket lib/broker/server.py schema/pr-request.schema.json schema/pr-prepare-request.schema.json lib/scripts/fieldwork-status lib/scripts/fieldwork-status-snapshot lib/scripts/fieldwork-dashboard-server lib/scripts/fieldwork-pr-submit lib/scripts/fieldwork-clone lib/scripts/fieldwork-init lib/scripts/fieldwork-launch lib/scripts/fieldwork-agent-session lib/scripts/fieldwork-event-poll lib/scripts/fieldwork-setup-probe lib/scripts/fieldwork-session-probe lib/scripts/fieldwork-codex-sandbox lib/scripts/fieldwork-bot lib/scripts/fieldwork-pr-prepare lib/scripts/fieldwork-pr-prepare-runner lib/scripts/fieldwork-pr-prepare-impl lib/agents/claude-remote-control lib/templates/repo/AGENTS.md lib/templates/repo/CLAUDE.md lib/templates/repo/.gitignore lib/templates/repo/.fieldwork/expected-origin lib/systemd/fieldwork-agent@.service lib/systemd/fieldwork-dashboard.service lib/systemd/fieldwork-event-poll.service lib/systemd/fieldwork-event-poll.timer lib/systemd/fieldwork-bot.service lib/systemd/fieldwork-pr-prepare-runner.socket lib/systemd/fieldwork-pr-prepare-runner@.service lib/systemd/fieldwork-verify-runner.socket lib/systemd/fieldwork-verify-runner@.service examples/eval/docker-compose.yml examples/eval/Dockerfile examples/eval/eval-smoke.sh examples/eval/fake-gh examples/eval/fake-gitleaks examples/eval/gh examples/eval/gitleaks examples/eval/README.md"
 TMP_DIRS=""
 cleanup() {
   local dir
@@ -230,6 +230,22 @@ python3 "$ROOT/tests/event-poll-tests.py"
 grep -q "fieldwork-event-poll.timer" "$ROOT/lib/systemd/bootstrap-vps.sh"
 grep -q "fieldwork-event-poll" "$ROOT/install.sh"
 grep -q "fieldwork-event-poll.timer" "$ROOT/lib/cli/uninstall.sh"
+
+echo "[checks] dashboard tests"
+python3 -m py_compile "$ROOT/lib/scripts/fieldwork-status-snapshot" "$ROOT/lib/scripts/fieldwork-dashboard-server" "$ROOT/tests/dashboard-tests.py"
+python3 "$ROOT/tests/dashboard-tests.py"
+grep -q '^  dashboard ' "$ROOT/bin/fieldwork"
+grep -q '`fieldwork dashboard`' "$ROOT/docs/cli-reference.md"
+grep -q "fieldwork-status-snapshot" "$ROOT/install.sh"
+grep -q "fieldwork-dashboard-server" "$ROOT/install.sh"
+grep -q "fieldwork-dashboard.service" "$ROOT/lib/systemd/bootstrap-vps.sh"
+grep -q "fieldwork-dashboard.service" "$ROOT/lib/cli/setup.sh"
+grep -q "fieldwork-dashboard.service" "$ROOT/lib/cli/uninstall.sh"
+grep -Fxq "Environment=FIELDWORK_DASHBOARD_HOST=127.0.0.1" "$ROOT/lib/systemd/fieldwork-dashboard.service"
+if grep -Fq "innerHTML" "$ROOT/lib/scripts/fieldwork-dashboard-server"; then
+  echo "fieldwork-dashboard-server must render with safe DOM APIs, not innerHTML" >&2
+  exit 1
+fi
 
 echo "[checks] settings.json has pr-prepare in excludedCommands"
 python3 -c '

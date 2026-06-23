@@ -285,7 +285,7 @@ link_one "$HOME/.fieldwork/scripts/fieldwork-codex-sandbox" "$HOME/.local/bin/fi
 record_group_state command
 
 start_group "Claude helpers"
-for script in fieldwork-status fieldwork-clone fieldwork-init fieldwork-launch fieldwork-pr-submit fieldwork-agent-session fieldwork-event-poll fieldwork-setup-probe fieldwork-session-probe fieldwork-codex-sandbox fieldwork-verify fieldwork-verify-runner fieldwork-verify-pipeline fieldwork-pr-prepare fieldwork-pr-prepare-runner fieldwork-pr-prepare-impl notify.sh; do
+for script in fieldwork-status fieldwork-status-snapshot fieldwork-dashboard-server fieldwork-clone fieldwork-init fieldwork-launch fieldwork-pr-submit fieldwork-agent-session fieldwork-event-poll fieldwork-setup-probe fieldwork-session-probe fieldwork-codex-sandbox fieldwork-verify fieldwork-verify-runner fieldwork-verify-pipeline fieldwork-pr-prepare fieldwork-pr-prepare-runner fieldwork-pr-prepare-impl notify.sh; do
   link_one "$ROOT/lib/scripts/$script" "$HOME/.fieldwork/scripts/$script"
 done
 link_one "$ROOT/lib/claude/CLAUDE.md" "$HOME/.claude/CLAUDE.md"
@@ -298,6 +298,7 @@ record_group_state template
 
 start_group "VPS support files"
 link_one "$ROOT/lib/systemd/fieldwork-agent@.service" "$HOME/.fieldwork/infra/fieldwork-agent@.service"
+link_one "$ROOT/lib/systemd/fieldwork-dashboard.service" "$HOME/.fieldwork/infra/fieldwork-dashboard.service"
 link_one "$ROOT/lib/systemd/fieldwork-verify-runner.socket" "$HOME/.fieldwork/infra/fieldwork-verify-runner.socket"
 link_one "$ROOT/lib/systemd/fieldwork-verify-runner@.service" "$HOME/.fieldwork/infra/fieldwork-verify-runner@.service"
 link_one "$ROOT/lib/systemd/fieldwork-event-poll.service" "$HOME/.fieldwork/infra/fieldwork-event-poll.service"

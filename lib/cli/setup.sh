@@ -531,7 +531,7 @@ EOF
   ensure_remote_runner_sockets() {
     ssh "$FIELDWORK_SSH_HOST" 'set -eu
 mkdir -p "$HOME/.config/systemd/user"
-cp "$HOME/.fieldwork/infra/fieldwork-verify-runner.socket" "$HOME/.fieldwork/infra/fieldwork-verify-runner@.service" "$HOME/.fieldwork/infra/fieldwork-pr-prepare-runner.socket" "$HOME/.fieldwork/infra/fieldwork-pr-prepare-runner@.service" "$HOME/.fieldwork/infra/fieldwork-event-poll.service" "$HOME/.fieldwork/infra/fieldwork-event-poll.timer" "$HOME/.config/systemd/user/"
+cp "$HOME/.fieldwork/infra/fieldwork-verify-runner.socket" "$HOME/.fieldwork/infra/fieldwork-verify-runner@.service" "$HOME/.fieldwork/infra/fieldwork-pr-prepare-runner.socket" "$HOME/.fieldwork/infra/fieldwork-pr-prepare-runner@.service" "$HOME/.fieldwork/infra/fieldwork-event-poll.service" "$HOME/.fieldwork/infra/fieldwork-event-poll.timer" "$HOME/.fieldwork/infra/fieldwork-dashboard.service" "$HOME/.config/systemd/user/"
 systemctl --user daemon-reload
 systemctl --user enable --now fieldwork-verify-runner.socket fieldwork-pr-prepare-runner.socket fieldwork-event-poll.timer
 ' >/dev/null 2>&1

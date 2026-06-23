@@ -94,6 +94,12 @@ Codex preview gaps:
 - Codex works directly in the canonical checkout, so concurrent Codex tasks or
   simultaneous Claude+Codex work on that checkout are unsupported.
 
+## Dashboard Boundary
+
+The dashboard is a read-only operator convenience, not a delivery or approval path. `fieldwork dashboard` starts `fieldwork-dashboard.service` as the agent user and reaches it through SSH local forwarding. Both the service and the tunnel endpoints bind to `127.0.0.1`.
+
+The server accepts GET requests only and shells only to `fieldwork-status-snapshot`, a local JSON snapshot helper. That helper reads Fieldwork-owned event state, resume-context artifacts, project journals, and broker audit JSONL entries when the agent user's audit-read ACL allows it. It does not read broker PAT files, Telegram bot secrets, approval HMAC secrets, pending approval bodies, or notification config secrets, and it does not mutate broker, repo, or approval state.
+
 ## Broker Defenses
 
 The broker is the GitHub write boundary. It rejects requests unless they pass runtime validation.

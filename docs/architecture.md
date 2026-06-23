@@ -67,6 +67,7 @@ GitHub branch + pull request
 | `bin/fieldwork`               |                        local user | Setup, doctor, sync, onboarding, status, reports, smoke tests.                |
 | `fieldwork-agent@.service`    |                       `fieldwork` | One Claude Code remote session per repo.                                      |
 | Codex Desktop SSH session     |                       `fieldwork` | Codex preview path; process lifecycle and remote-project list owned by Codex Desktop. |
+| `fieldwork-dashboard`         |                       `fieldwork` | Read-only localhost status surface served on the VPS and reached through SSH tunnel.  |
 | `fieldwork-verify`            |                       `fieldwork` | Thin client from the agent to the verify runner socket.                       |
 | `fieldwork-verify-runner`     | `fieldwork`, systemd user manager | Runs the verify pipeline outside the agent's NNP/userns cage.                 |
 | `fieldwork-pr-prepare`        |                       `fieldwork` | Thin client from the agent to the prepare runner socket.                      |
@@ -103,6 +104,20 @@ Claude's sandbox gives the agent useful host-secret protection, but it also mean
 Fieldwork solves this with two socket-activated runners under `systemd --user`. The clients are listed in Claude's `sandbox.excludedCommands`, and Codex setup writes a Codex sandbox Unix-socket allowlist for the broker, verify, and pr-prepare sockets. The clients only connect to private sockets. The runner processes are spawned by the user manager outside the agent sandbox and do the real work.
 
 Runner sockets are `0600` under `$XDG_RUNTIME_DIR`. The runners do not hold broker, bot, deploy-key, or notification credentials. See [runner-architecture.md](runner-architecture.md).
+
+## Dashboard Surface
+
+`fieldwork dashboard` starts a user service on the VPS and opens an SSH tunnel to it:
+
+```text
+browser on workstation
+  -> http://127.0.0.1:<local-port>
+  -> ssh -L <local-port>:127.0.0.1:<remote-port>
+  -> fieldwork-dashboard.service on VPS
+  -> fieldwork-status-snapshot
+```
+
+The dashboard server binds only to `127.0.0.1`, accepts GET requests only, and serves a read-only JSON snapshot plus a static browser view. `fieldwork-status-snapshot` reads Fieldwork-owned event state, resume-context files, project journals, and the broker audit log when the agent user's audit-read ACL permits it. It does not call `fieldwork status`, SSH back to the workstation, invoke shell renderers, or write broker state.
 
 ## Broker Boundary
 
