@@ -2794,7 +2794,7 @@ EOF
       if [ "$remote_gh" = "1" ]; then
         ssh "$FIELDWORK_SSH_HOST" "export PATH=\"\$HOME/.local/bin:\$PATH\"; gh auth status >/dev/null 2>&1" \
           && doctor_ok "GitHub CLI authenticated" \
-          || doctor_manual "GitHub CLI login needed" "ssh -t $FIELDWORK_SSH_HOST 'gh auth login'" "gh is installed but not logged in on the VPS" "onboarding needs gh auth for repo-resolution preflights before the broker opens PRs" "run ssh -t $FIELDWORK_SSH_HOST 'gh auth login'" "yes"
+          || doctor_manual "GitHub CLI login needed" "ssh -t $FIELDWORK_SSH_HOST 'gh auth login --hostname github.com --git-protocol ssh --web --skip-ssh-key'" "gh is installed but not logged in on the VPS" "onboarding needs gh auth for repo-resolution preflights before the broker opens PRs" "run ssh -t $FIELDWORK_SSH_HOST 'gh auth login --hostname github.com --git-protocol ssh --web --skip-ssh-key'" "yes"
 	      fi
 
       # Opt-in because the probe runs claude headless on the VPS: it spends

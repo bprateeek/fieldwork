@@ -3284,7 +3284,7 @@ case "$args" in
     test -f "$FIELDWORK_FAKE_MANUAL_PHASE_GH"
     exit $?
     ;;
-  *"-t fieldwork-vps gh auth login"*)
+  *"-t fieldwork-vps gh auth login --hostname github.com --git-protocol ssh --web --skip-ssh-key"*)
     touch "$FIELDWORK_FAKE_MANUAL_PHASE_GH"
     if [ "${FIELDWORK_FAKE_MANUAL_PHASE_GH_DISCONNECT:-0}" = "1" ]; then
       exit 255
@@ -3398,6 +3398,7 @@ grep -q "type exit to return to Fieldwork" ${TMPDIR:-/tmp}/fieldwork-setup-manua
 grep -q "\\[ready\\] Claude Code login confirmed" ${TMPDIR:-/tmp}/fieldwork-setup-manual-phase.out
 grep -q "Purpose: Authenticate gh for repo-resolution preflights" ${TMPDIR:-/tmp}/fieldwork-setup-manual-phase.out
 grep -q "Git protocol: SSH" ${TMPDIR:-/tmp}/fieldwork-setup-manual-phase.out
+grep -q "Auth method: Login with a web browser (preselected by Fieldwork)" ${TMPDIR:-/tmp}/fieldwork-setup-manual-phase.out
 grep -q "Do not paste the broker token here" ${TMPDIR:-/tmp}/fieldwork-setup-manual-phase.out
 grep -q "Browser hint: the VPS has no desktop browser" ${TMPDIR:-/tmp}/fieldwork-setup-manual-phase.out
 grep -q "Credential note: gh may warn that credentials were saved in plain text" ${TMPDIR:-/tmp}/fieldwork-setup-manual-phase.out
@@ -3443,7 +3444,7 @@ if grep -qi "tailscale" ${TMPDIR:-/tmp}/fieldwork-setup-manual-phase.out; then
   exit 1
 fi
 grep -q -- "-t fieldwork-vps ~/.local/bin/claude login" "$fake_manual_phase_bin/ssh.log"
-grep -q -- "-t fieldwork-vps gh auth login" "$fake_manual_phase_bin/ssh.log"
+grep -q -- "-t fieldwork-vps gh auth login --hostname github.com --git-protocol ssh --web --skip-ssh-key" "$fake_manual_phase_bin/ssh.log"
 
 echo "[checks] setup-notify resolves local then remote stages in order"
 tmp_notify_flow_home="$(mktemp_dir)"

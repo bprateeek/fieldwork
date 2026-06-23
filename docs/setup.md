@@ -94,17 +94,18 @@ Complete the manual account steps when setup asks:
 
 ```sh
 ssh -t fieldwork-vps '~/.local/bin/claude login'
-ssh -t fieldwork-vps 'gh auth login'
+ssh -t fieldwork-vps 'gh auth login --hostname github.com --git-protocol ssh --web --skip-ssh-key'
 ```
 
 For Codex, setup additionally verifies that `codex` resolves on the non-interactive SSH login PATH, is at least the reviewed minimum version, `loginctl enable-linger fieldwork` is active, `$XDG_RUNTIME_DIR` points at `/run/user/<fieldwork-uid>`, runner sockets are enabled, and Codex's sandbox can connect to the Fieldwork broker/runner Unix sockets. Setup uses the pinned npm package in `FIELDWORK_CODEX_NPM_PACKAGE` when it offers to install Codex, defaulting to `@openai/codex@0.137.0`. Setup writes the Fieldwork socket allowlist into Codex config before accepting Codex readiness.
 
-For `gh auth login`, do not paste the broker PAT. Browser login gives GitHub CLI
-its own token after you approve the device code. On a headless VPS, `gh` may warn
-that authentication credentials were saved in plain text because no OS keychain is
-available; that token lives under the `fieldwork` user's GitHub CLI config and is
-separate from the broker PAT. The broker PAT is installed later into the broker
-user's root-owned config path.
+Fieldwork preselects GitHub.com, SSH git protocol, browser/device auth, and
+skip-SSH-key upload for `gh auth login`. Do not paste the broker PAT. Browser
+login gives GitHub CLI its own token after you approve the device code. On a
+headless VPS, `gh` may warn that credentials were saved in plain text because
+no OS keychain is available; that token lives under the `fieldwork`
+user's GitHub CLI config and is separate from the broker PAT. The broker PAT is
+installed later into the broker user's root-owned config path.
 
 Once a private SSH path is working (Tailscale, WireGuard, or similar that you set up yourself), point `HostName` at the private name and consider restricting public SSH:
 
@@ -205,7 +206,7 @@ To avoid workflow templates:
 fieldwork onboard <owner>/<repo> --no-workflows
 ```
 
-Onboarding is resumable. It clones with a read-only deploy key, applies repo templates, and asks the broker to open the init PR. In Claude mode it also primes Claude workspace trust and remote-control consent and starts `fieldwork-agent@<slug>.service`. In Codex mode, Codex Desktop owns the live SSH connection and remote-project folder state.
+Onboarding is resumable. It clones with a read-only deploy key, applies repo templates, and asks the broker to open the init PR. In Claude mode it also primes Claude workspace trust and remote-control consent and starts `fieldwork-agent@<slug>.service`; those two Claude prompts are interactive confirmations that Fieldwork cannot safely automate. In Codex mode, Codex Desktop owns the live SSH connection and remote-project folder state.
 
 Inspect progress without changing state:
 

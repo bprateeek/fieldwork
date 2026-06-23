@@ -188,9 +188,9 @@ _health_render_remote() {
   elif [ "$gh_live" = timeout ]; then
     _health_row info "GitHub auth" "status check timed out"
   elif [ "$gh_hosts" = ok ]; then
-    _health_row needs "GitHub auth" "re-authenticate. Run: gh auth login"
+    _health_row needs "GitHub auth" "re-authenticate. Run fieldwork setup."
   else
-    _health_row needs "GitHub auth" "not authenticated. Run: gh auth login"
+    _health_row needs "GitHub auth" "not authenticated. Run fieldwork setup."
   fi
 
   # Agents

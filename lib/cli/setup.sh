@@ -2076,12 +2076,12 @@ EOF
     print_manual_step \
       "GitHub CLI login" \
       "Authenticate gh for repo-resolution preflights on the VPS. Pull request pushes still use the separate broker token." \
-      "ssh -t $FIELDWORK_SSH_HOST 'gh auth login'"
+      "ssh -t $FIELDWORK_SSH_HOST 'gh auth login --hostname github.com --git-protocol ssh --web --skip-ssh-key'"
     label_line "When gh prompts" "  "
     info_bullet "Account: GitHub.com"
     info_bullet "Git protocol: SSH"
     info_bullet "Upload SSH key: skip"
-    info_bullet "Auth method: Login with a web browser"
+    info_bullet "Auth method: Login with a web browser (preselected by Fieldwork)"
     info_bullet "Do not paste the broker token here"
     echo
     info_row "Browser hint" "the VPS has no desktop browser, so gh prints a one-time code and a 'Failed opening a web browser' line. That is expected."
@@ -2091,7 +2091,7 @@ EOF
     info_note "This SSH session may disconnect while you complete browser auth. Fieldwork will recheck GitHub auth afterward."
     local gh_login_status=0
     if maybe_run_manual_step "[fieldwork setup] Run GitHub CLI login now?"; then
-      ssh -t "$FIELDWORK_SSH_HOST" "gh auth login" || gh_login_status=$?
+      ssh -t "$FIELDWORK_SSH_HOST" "gh auth login --hostname github.com --git-protocol ssh --web --skip-ssh-key" || gh_login_status=$?
       fieldwork_setup_snapshot_mark_dirty
     fi
     if progress_wait "checking GitHub CLI authentication" github_authenticated; then
@@ -2103,7 +2103,7 @@ EOF
         status_info_line "The SSH session disconnected after browser auth. That is okay."
       fi
     else
-      setup_row manual "GitHub CLI login needed" "ssh -t $FIELDWORK_SSH_HOST 'gh auth login'" "fieldwork setup" hard
+      setup_row manual "GitHub CLI login needed" "ssh -t $FIELDWORK_SSH_HOST 'gh auth login --hostname github.com --git-protocol ssh --web --skip-ssh-key'" "fieldwork setup" hard
     fi
   fi
 
