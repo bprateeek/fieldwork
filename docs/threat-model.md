@@ -123,6 +123,9 @@ Defenses:
   default 12/hour, clamped to `1..120`).
 - Git push uses `GIT_ASKPASS`; token is not passed in git argv.
 - `gh pr create` gets `GH_TOKEN` only in the broker process environment.
+- The credential provider chooses the GitHub token source; the GitHub backend
+  still routes that token through `GIT_ASKPASS` for `git push` and `GH_TOKEN`
+  for `gh`.
 
 The broker derives the push URL from `.fieldwork/expected-origin`. It does not trust a repo-controlled `origin` remote as the destination.
 

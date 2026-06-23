@@ -3721,10 +3721,20 @@ grep -q 'setfacl -m "u:$AGENT_USER:--x" "$STATE_DIR"' "$ROOT/lib/broker/install.
 grep -q 'setfacl -m "u:$AGENT_USER:r--" "$audit_path"' "$ROOT/lib/broker/install.sh"
 grep -q 'setfacl -m "u:$BROKER_USER:rwx" "$STATE_DIR/notifications"' "$ROOT/lib/broker/install.sh"
 grep -q "def preflight" "$ROOT/lib/broker/server.py"
+grep -q "FIELDWORK_FORGE" "$ROOT/lib/broker/server.py"
+grep -q "FIELDWORK_GITHUB_CREDENTIAL_MODE" "$ROOT/lib/broker/server.py"
+grep -q "class CredentialProvider" "$ROOT/lib/broker/server.py"
+grep -q "class PatCredentialProvider" "$ROOT/lib/broker/server.py"
+grep -q "class ForgeBackend" "$ROOT/lib/broker/server.py"
+grep -q "class GitHubBackend" "$ROOT/lib/broker/server.py"
+grep -q "github_credential_provider" "$ROOT/lib/broker/server.py"
 grep -q "GIT_CONFIG_KEY_0.*safe.directory" "$ROOT/lib/broker/server.py"
 grep -q "GIT_CONFIG_KEY_1.*core.hooksPath" "$ROOT/lib/broker/server.py"
 grep -q '"push", "--no-verify"' "$ROOT/lib/broker/server.py"
 grep -q "broker cannot read repo checkout" "$ROOT/lib/broker/server.py"
+grep -q "FIELDWORK_GITHUB_CREDENTIAL_MODE=pat" "$ROOT/docs/broker-standalone.md"
+grep -q "future GitHub App provider" "$ROOT/docs/broker-standalone.md"
+grep -q "The credential provider chooses the GitHub token source" "$ROOT/docs/threat-model.md"
 if grep -v '^[[:space:]]*#' "$ROOT/lib/scripts/fieldwork-onboard" | grep -Eq 'sudo([[:space:]]+-[^[:space:]]+)*[[:space:]]+-u[[:space:]]+fieldwork-pr-broker'; then
   echo "onboard must not require sudo to impersonate the broker after setup hardening" >&2
   exit 1

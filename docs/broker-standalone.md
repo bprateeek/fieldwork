@@ -176,6 +176,10 @@ client is the smallest correct implementation worth copying.
   restart. Adjust with `FIELDWORK_BROKER_RATE_LIMIT_PER_HOUR` in the broker
   service environment. Bad values fall back to the default; values are clamped
   to `1..120`.
+- **Forge and credentials:** `FIELDWORK_FORGE=github` is the only supported
+  forge backend in this preview. `FIELDWORK_GITHUB_CREDENTIAL_MODE=pat` is the
+  default and only implemented GitHub credential provider; `app` is reserved for
+  a future GitHub App provider.
 - **PAT rotation:** `sudo /usr/local/sbin/rotate-pat` prompts for the new PAT
   and writes it atomically; the broker re-reads on the next request.
 - **Re-install:** `lib/broker/standalone-install.sh` is idempotent; rerun it

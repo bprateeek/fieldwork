@@ -199,6 +199,17 @@ class BrokerValidationTests(unittest.TestCase):
         self.assertEqual(ctx.exception.status, 503)
         self.assertIn("PAT is not stored", ctx.exception.message)
 
+    def test_github_app_mode_is_reserved(self) -> None:
+        old = self.server.GITHUB_CREDENTIAL_MODE
+        self.server.GITHUB_CREDENTIAL_MODE = "app"
+        try:
+            with self.assertRaises(self.server.RequestError) as ctx:
+                self.server.github_credential_provider().acquire_token()
+        finally:
+            self.server.GITHUB_CREDENTIAL_MODE = old
+        self.assertEqual(ctx.exception.status, 503)
+        self.assertIn("not implemented", ctx.exception.message)
+
     def test_preflight_reports_selected_repo_scope(self) -> None:
         (self.tmp / "gh-token").write_text("github_pat_test\n")
         self.write_fake_gh(
@@ -675,6 +686,54 @@ class BrokerValidationTests(unittest.TestCase):
         self.assertIn("pr_opened", names)
         opened = [event for event in events if event["event"] == "pr_opened"][-1]
         self.assertEqual(opened["pr_url"], pr_url)
+
+    def test_github_backend_preserves_pat_command_and_env_shape(self) -> None:
+        repo = self.make_repo()
+        (self.tmp / "gh-token").write_text("github_pat_test\n")
+        validated = self.server.validate(self.request(repo))
+        calls: list[dict] = []
+        from unittest.mock import patch
+
+        def fake_run(argv, *args, **kwargs):
+            calls.append({"argv": list(argv), "env": dict(kwargs.get("env") or {})})
+
+            class _R:
+                returncode = 0
+                stdout = ""
+                stderr = ""
+
+            r = _R()
+            if argv[:2] == ["git", "-C"] and "push" in argv:
+                return r
+            if argv[:3] == ["gh", "pr", "create"]:
+                r.stdout = "https://github.com/owner/fieldwork-smoke/pull/42\n"
+                return r
+            if argv[:3] == ["gh", "pr", "edit"]:
+                return r
+            raise AssertionError(f"unexpected subprocess.run call: {argv}")
+
+        backend = self.server.GitHubBackend(self.server.PatCredentialProvider())
+        with patch.object(self.server.subprocess, "run", side_effect=fake_run):
+            pr_url = backend.push_and_open_pr(validated)
+
+        self.assertEqual(pr_url, "https://github.com/owner/fieldwork-smoke/pull/42")
+        push = calls[0]
+        create = calls[1]
+        edit = calls[2]
+        self.assertEqual(
+            push["argv"],
+            [
+                "git", "-C", str(repo), "push", "--no-verify",
+                "https://github.com/owner/fieldwork-smoke.git",
+                "HEAD:refs/heads/fieldwork/test-change",
+            ],
+        )
+        self.assertEqual(create["argv"][:5], ["gh", "pr", "create", "--repo", "owner/fieldwork-smoke"])
+        self.assertEqual(edit["argv"][:3], ["gh", "pr", "edit"])
+        self.assertEqual(push["env"]["GIT_ASKPASS"], self.server.ASKPASS_PATH)
+        self.assertNotIn("GH_TOKEN", push["env"])
+        self.assertEqual(create["env"]["GH_TOKEN"], "github_pat_test")
+        self.assertEqual(edit["env"]["GH_TOKEN"], "github_pat_test")
 
     def test_push_succeeds_when_label_apply_fails(self) -> None:
         # gh pr edit returns nonzero (e.g. label not defined on the repo).

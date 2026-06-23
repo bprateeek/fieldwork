@@ -145,6 +145,10 @@ The broker:
 - pushes with `GIT_ASKPASS`
 - opens the PR with `gh pr create`
 
+`FIELDWORK_FORGE=github` selects the GitHub backend. GitHub credential source is
+a separate axis: `FIELDWORK_GITHUB_CREDENTIAL_MODE=pat` is the current default,
+and `app` is reserved for a future GitHub App provider.
+
 The broker pushes to a URL derived from `.fieldwork/expected-origin`; it does not trust `origin` for push authentication.
 
 The broker also appends redacted lifecycle events to its audit JSONL log:
