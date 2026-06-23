@@ -125,7 +125,7 @@ directly, it shows concise step progress and saves the full root-only log under
 ssh -t fieldwork-vps "sudo -p '[sudo] VPS Linux password for fieldwork: ' bash ~/.fieldwork/infra/fieldwork-pr-broker/install.sh"
 ```
 
-Create a fine-grained GitHub PAT with:
+By default, create a fine-grained GitHub PAT with:
 
 - Contents: read/write
 - Pull requests: read/write
@@ -175,6 +175,10 @@ Use `--no-workflows` if the broker PAT should not have Workflows read/write perm
 ```sh
 fieldwork onboard <owner>/<repo> --no-workflows
 ```
+
+Advanced: the broker can use a GitHub App instead of a PAT by running
+`rotate-pat` with `FIELDWORK_GITHUB_CREDENTIAL_MODE=app`, the App id, the
+installation id, and the App private key PEM.
 
 In Claude mode, the command pauses for three manual actions:
 

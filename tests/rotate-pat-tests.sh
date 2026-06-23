@@ -78,6 +78,23 @@ else
   echo "  FAIL non-github-forge-skips: rc=$rc curl_called=$CURL_CALLED" >&2; fail=1
 fi
 
+echo "[rotate-pat] GitHub App validation"
+if fieldwork_validate_github_app_ids 123 456; then
+  echo "  ok   app-ids-numeric"
+else
+  echo "  FAIL app-ids-numeric" >&2; fail=1
+fi
+if fieldwork_validate_github_app_ids app 456 >/dev/null 2>&1; then
+  echo "  FAIL app-id-rejects-nonnumeric" >&2; fail=1
+else
+  echo "  ok   app-id-rejects-nonnumeric"
+fi
+if fieldwork_validate_github_app_ids 123 "" >/dev/null 2>&1; then
+  echo "  FAIL app-installation-rejects-empty" >&2; fail=1
+else
+  echo "  ok   app-installation-rejects-empty"
+fi
+
 if [ "$fail" = "0" ]; then
   echo "[rotate-pat] ok"
 else

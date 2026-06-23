@@ -15,7 +15,8 @@ so you can decide whether it fits before investing setup time.
 - GitHub only. GitLab, Gitea, and other forges are planned, not present.
 - Single operator. There is no multi-user, RBAC, or shared-team model yet.
 - No managed or hosted option. You bring your own VPS, SSH config, and GitHub
-  fine-grained PAT.
+  write credential. PAT mode is the default; GitHub App mode is available for
+  operators who can create and install an App per repository.
 
 ## Agents
 

@@ -2,7 +2,7 @@
 # Standalone PR broker install: installs the broker on a host that does NOT
 # have the full Fieldwork CLI or bootstrap layout. The broker is the durable
 # artifact: any coding agent that can write a JSON request file can submit PRs
-# through it without holding a GitHub PAT itself.
+# through it without holding a GitHub write credential itself.
 #
 # This script is a thin wrapper: it collects the identities and projects root
 # the operator chose, verifies prerequisites are already installed (it does
@@ -49,8 +49,10 @@ Prerequisites (the installer verifies, but does not install, these):
   - the agent user must already exist with a home directory
 
 After install:
-  1. Store the broker's GitHub PAT:
+  1. Store the broker's GitHub credential. PAT mode:
        sudo /usr/local/sbin/rotate-pat <<< 'github_pat_...'
+     GitHub App mode:
+       sudo env FIELDWORK_GITHUB_CREDENTIAL_MODE=app FIELDWORK_GITHUB_APP_ID=<id> FIELDWORK_GITHUB_APP_INSTALLATION_ID=<id> /usr/local/sbin/rotate-pat < private-key.pem
   2. The broker socket appears at
        /run/fieldwork-pr-broker/fieldwork-pr.sock
      readable+writable by group <broker-group> (default: the agent user's

@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
-# /usr/local/sbin/rotate-pat — quarterly PAT rotation. Root-owned, mode 700.
+# /usr/local/sbin/rotate-pat — broker GitHub credential rotation. Root-owned, mode 700.
 #
-# Reads a new GitHub fine-grained PAT from stdin, atomically replaces
-# the broker token file, restarts the broker. The agent is never involved.
+# In the default PAT mode, reads a new GitHub fine-grained PAT from stdin,
+# atomically replaces the broker token file, and restarts the broker.
+# In GitHub App mode, reads the App private key PEM from stdin and stores it
+# alongside an EnvironmentFile containing the App and installation ids.
+# The agent is never involved.
 #
 # Usage:
 #   sudo -p "[sudo] VPS Linux password for $USER: " rotate-pat <<<'github_pat_NEW_TOKEN_HERE'
@@ -68,6 +71,14 @@ fieldwork_validate_pat() {
   return 1
 }
 
+fieldwork_validate_github_app_ids() {
+  local app_id="$1"
+  local installation_id="$2"
+  case "$app_id" in ""|*[!0-9]*) echo "GitHub App id must be numeric" >&2; return 1 ;; esac
+  case "$installation_id" in ""|*[!0-9]*) echo "GitHub App installation id must be numeric" >&2; return 1 ;; esac
+  return 0
+}
+
 if [ "${FIELDWORK_ROTATE_PAT_SOURCE_ONLY:-0}" = "1" ]; then
   return 0 2>/dev/null || exit 0
 fi
@@ -79,8 +90,18 @@ fi
 BROKER_USER="${FIELDWORK_BROKER_USER:-fieldwork-pr-broker}"
 BROKER_SERVICE="${FIELDWORK_BROKER_SERVICE:-fieldwork-pr-broker}"
 AGENT_USER="${FIELDWORK_REMOTE_USER:-fieldwork}"
+CREDENTIAL_MODE="${FIELDWORK_GITHUB_CREDENTIAL_MODE:-pat}"
 TOKEN_PATH="${FIELDWORK_BROKER_TOKEN_PATH:-/etc/fieldwork-pr-broker/gh-token}"
 TOKEN_DIR="$(dirname "$TOKEN_PATH")"
+CONFIG_DIR="${FIELDWORK_BROKER_CONFIG_DIR:-/etc/fieldwork-pr-broker}"
+APP_PRIVATE_KEY_PATH="${FIELDWORK_GITHUB_APP_PRIVATE_KEY_PATH:-$CONFIG_DIR/github-app-private-key.pem}"
+APP_ENV_PATH="${FIELDWORK_GITHUB_APP_ENV_PATH:-$CONFIG_DIR/credential.env}"
+
+case "$CREDENTIAL_MODE" in
+  pat|"") CREDENTIAL_MODE="pat" ;;
+  app) ;;
+  *) echo "unsupported FIELDWORK_GITHUB_CREDENTIAL_MODE: $CREDENTIAL_MODE" >&2; exit 1 ;;
+esac
 
 TOKEN=""
 TTY_STATE=""
@@ -91,6 +112,94 @@ restore_tty() {
   fi
 }
 trap 'restore_tty' EXIT
+
+mark_agent_credential_confirmed() {
+  local marker="$1"
+  if id "$AGENT_USER" >/dev/null 2>&1; then
+    local agent_home
+    agent_home="$(getent passwd "$AGENT_USER" | cut -d: -f6)"
+    if [ -n "$agent_home" ]; then
+      install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 700 "$agent_home/.fieldwork/state"
+      : > "$agent_home/.fieldwork/state/$marker"
+      chown "$AGENT_USER:$AGENT_USER" "$agent_home/.fieldwork/state/$marker"
+      chmod 600 "$agent_home/.fieldwork/state/$marker"
+    fi
+  fi
+}
+
+write_credential_env() {
+  local mode="$1"
+  local tmp
+  tmp="$(mktemp "$CONFIG_DIR/.credential.env.XXXXXX")"
+  {
+    printf 'FIELDWORK_GITHUB_CREDENTIAL_MODE=%s\n' "$mode"
+    if [ "$mode" = "app" ]; then
+      printf 'FIELDWORK_GITHUB_APP_ID=%s\n' "$FIELDWORK_GITHUB_APP_ID"
+      printf 'FIELDWORK_GITHUB_APP_INSTALLATION_ID=%s\n' "$FIELDWORK_GITHUB_APP_INSTALLATION_ID"
+      printf 'FIELDWORK_GITHUB_APP_PRIVATE_KEY_PATH=%s\n' "$APP_PRIVATE_KEY_PATH"
+    fi
+  } > "$tmp"
+  chown root:root "$tmp"
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$APP_ENV_PATH"
+}
+
+store_github_app_credentials() {
+  FIELDWORK_GITHUB_APP_ID="${FIELDWORK_GITHUB_APP_ID:-}"
+  FIELDWORK_GITHUB_APP_INSTALLATION_ID="${FIELDWORK_GITHUB_APP_INSTALLATION_ID:-}"
+  if [ -t 0 ]; then
+    if [ -z "$FIELDWORK_GITHUB_APP_ID" ]; then
+      printf 'GitHub App ID: ' >&2
+      IFS= read -r FIELDWORK_GITHUB_APP_ID
+    fi
+    if [ -z "$FIELDWORK_GITHUB_APP_INSTALLATION_ID" ]; then
+      printf 'GitHub App installation ID: ' >&2
+      IFS= read -r FIELDWORK_GITHUB_APP_INSTALLATION_ID
+    fi
+    printf 'Paste GitHub App private key PEM, then press Ctrl-D:\n' >&2
+  elif [ "${FIELDWORK_ROTATE_PAT_TTY:-0}" = "1" ] && [ -r /dev/tty ] && [ -w /dev/tty ]; then
+    if [ -z "$FIELDWORK_GITHUB_APP_ID" ]; then
+      printf 'GitHub App ID: ' >/dev/tty
+      IFS= read -r FIELDWORK_GITHUB_APP_ID </dev/tty
+    fi
+    if [ -z "$FIELDWORK_GITHUB_APP_INSTALLATION_ID" ]; then
+      printf 'GitHub App installation ID: ' >/dev/tty
+      IFS= read -r FIELDWORK_GITHUB_APP_INSTALLATION_ID </dev/tty
+    fi
+    printf 'Paste GitHub App private key PEM, then press Ctrl-D:\n' >/dev/tty
+    TOKEN="$(cat </dev/tty)"
+  fi
+  if [ -z "${TOKEN:-}" ]; then
+    TOKEN="$(cat)"
+  fi
+  TOKEN="${TOKEN%$'\n'}"
+
+  fieldwork_validate_github_app_ids "$FIELDWORK_GITHUB_APP_ID" "$FIELDWORK_GITHUB_APP_INSTALLATION_ID"
+  case "$TOKEN" in
+    *"BEGIN "*"PRIVATE KEY"*"END "*"PRIVATE KEY"*) ;;
+    *) echo "input does not look like a GitHub App private key PEM" >&2; exit 1 ;;
+  esac
+
+  install -o "$BROKER_USER" -g "$BROKER_USER" -m 700 -d "$CONFIG_DIR"
+  local tmp
+  tmp="$(mktemp "$CONFIG_DIR/.github-app-private-key.XXXXXX")"
+  trap 'rm -f "$tmp"' EXIT
+  printf '%s\n' "$TOKEN" > "$tmp"
+  chown "$BROKER_USER:$BROKER_USER" "$tmp"
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$APP_PRIVATE_KEY_PATH"
+  trap - EXIT
+
+  write_credential_env app
+  systemctl restart "$BROKER_SERVICE"
+  mark_agent_credential_confirmed "broker-app-confirmed"
+  echo "[rotate-pat] GitHub App credentials stored; broker restarted"
+}
+
+if [ "$CREDENTIAL_MODE" = "app" ]; then
+  store_github_app_credentials
+  exit 0
+fi
 
 if [ -t 0 ]; then
   TTY_STATE="$(stty -g)"
@@ -139,14 +248,7 @@ chmod 600 "$TMP"
 mv -f "$TMP" "$DEST"
 trap - EXIT
 
+write_credential_env pat
 systemctl restart "$BROKER_SERVICE"
-if id "$AGENT_USER" >/dev/null 2>&1; then
-  agent_home="$(getent passwd "$AGENT_USER" | cut -d: -f6)"
-  if [ -n "$agent_home" ]; then
-    install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 700 "$agent_home/.fieldwork/state"
-    : > "$agent_home/.fieldwork/state/broker-pat-confirmed"
-    chown "$AGENT_USER:$AGENT_USER" "$agent_home/.fieldwork/state/broker-pat-confirmed"
-    chmod 600 "$agent_home/.fieldwork/state/broker-pat-confirmed"
-  fi
-fi
+mark_agent_credential_confirmed "broker-pat-confirmed"
 echo "[rotate-pat] token replaced; broker restarted"

@@ -7,6 +7,7 @@ After=fieldwork-pr-broker.socket fieldwork-pr-approve.socket network-online.targ
 User=fieldwork-pr-broker
 Group=fieldwork-pr-broker
 Environment=FIELDWORK_BROKER_AUDIT_READ_USER=fieldwork
+EnvironmentFile=-/etc/fieldwork-pr-broker/credential.env
 Sockets=fieldwork-pr-broker.socket fieldwork-pr-approve.socket
 ExecStart=/usr/bin/python3 /usr/local/lib/fieldwork-pr-broker/server.py
 Restart=on-failure

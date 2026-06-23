@@ -22,6 +22,7 @@ Trust model:
 """
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
@@ -31,7 +32,10 @@ import re
 import socket
 import subprocess
 import sys
+import tempfile
 import time
+import urllib.error
+import urllib.request
 import uuid
 from pathlib import Path
 
@@ -56,6 +60,20 @@ LOG_PATH = os.environ.get("FIELDWORK_BROKER_LOG_PATH", "/var/log/fieldwork-pr-br
 TOKEN_PATH = os.environ.get("FIELDWORK_BROKER_TOKEN_PATH", "/etc/fieldwork-pr-broker/gh-token")
 ASKPASS_PATH = os.environ.get("FIELDWORK_BROKER_ASKPASS_PATH", "/usr/local/lib/fieldwork-pr-broker/git-askpass")
 PROJECTS_ROOT = os.environ.get("FIELDWORK_BROKER_PROJECTS_ROOT", "/home/fieldwork/projects")
+GITHUB_API = (os.environ.get("FIELDWORK_GITHUB_API", "https://api.github.com").strip() or "https://api.github.com").rstrip("/")
+GITHUB_APP_ID = os.environ.get("FIELDWORK_GITHUB_APP_ID", "").strip()
+GITHUB_APP_INSTALLATION_ID = os.environ.get("FIELDWORK_GITHUB_APP_INSTALLATION_ID", "").strip()
+GITHUB_APP_PRIVATE_KEY_PATH = os.environ.get(
+    "FIELDWORK_GITHUB_APP_PRIVATE_KEY_PATH",
+    "/etc/fieldwork-pr-broker/github-app-private-key.pem",
+)
+GITHUB_APP_TOKEN_DIR = os.environ.get("FIELDWORK_GITHUB_APP_TOKEN_DIR", "/run/fieldwork-pr-broker")
+GITHUB_APP_TOKEN_REFRESH_SKEW_SECONDS = bounded_env_int(
+    "FIELDWORK_GITHUB_APP_TOKEN_REFRESH_SKEW_SECONDS",
+    300,
+    minimum=30,
+    maximum=1800,
+)
 LEDGER_DIR = os.environ.get("FIELDWORK_BROKER_LEDGER_DIR", "/var/lib/fieldwork-pr-broker/requests")
 AUDIT_LOG_PATH = os.environ.get(
     "FIELDWORK_BROKER_AUDIT_LOG_PATH",
@@ -131,6 +149,7 @@ _recent_requests: dict[str, list[float]] = {}
 _schema_cache: dict | None = None
 _setfacl_available: bool | None = None
 _audit_read_user_exists: bool | None = None
+_github_app_token_cache: dict[str, object] = {}
 
 
 class RequestError(Exception):
@@ -491,11 +510,121 @@ class PatCredentialProvider(CredentialProvider):
         return broker_token()
 
 
+def base64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
+
+
+def parse_github_expires_at(value: object) -> float:
+    if not isinstance(value, str) or not value:
+        raise RequestError("broker GitHub App token response missing expires_at", status=502)
+    try:
+        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
+    except ValueError:
+        raise RequestError("broker GitHub App token response had invalid expires_at", status=502)
+
+
+class AppCredentialProvider(CredentialProvider):
+    mode = "app"
+
+    def acquire_token(self) -> str:
+        now = time.time()
+        app_id = GITHUB_APP_ID
+        installation_id = GITHUB_APP_INSTALLATION_ID
+        if not app_id or not installation_id:
+            raise RequestError(
+                "GitHub App credential mode requires FIELDWORK_GITHUB_APP_ID and FIELDWORK_GITHUB_APP_INSTALLATION_ID",
+                status=503,
+            )
+        if not app_id.isdigit() or not installation_id.isdigit():
+            raise RequestError("GitHub App id and installation id must be numeric", status=503)
+        key_path = Path(GITHUB_APP_PRIVATE_KEY_PATH)
+        if not key_path.is_file():
+            raise RequestError("broker GitHub App private key is not stored; run rotate-pat in app mode", status=503)
+
+        cache_key = f"{GITHUB_API}|{app_id}|{installation_id}|{key_path}"
+        token = str(_github_app_token_cache.get("token") or "")
+        expires_at = float(_github_app_token_cache.get("expires_at") or 0)
+        if (
+            token
+            and _github_app_token_cache.get("cache_key") == cache_key
+            and expires_at - GITHUB_APP_TOKEN_REFRESH_SKEW_SECONDS > now
+        ):
+            return token
+
+        jwt = self._build_jwt(app_id, key_path)
+        url = f"{GITHUB_API}/app/installations/{installation_id}/access_tokens"
+        request = urllib.request.Request(
+            url,
+            data=b"{}",
+            method="POST",
+            headers={
+                "Accept": "application/vnd.github+json",
+                "Authorization": f"Bearer {jwt}",
+                "Content-Type": "application/json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                body = response.read()
+        except urllib.error.HTTPError as exc:
+            detail = exc.read(500).decode("utf-8", "replace")
+            if exc.code == 404:
+                raise RequestError("broker GitHub App installation was not found; verify the installation id", status=404)
+            if exc.code in (401, 403):
+                raise RequestError(
+                    "broker GitHub App credentials were rejected; verify app id, installation id, and private key",
+                    status=403,
+                )
+            log.error("GitHub App token mint failed status=%s detail=%s", exc.code, detail[:300])
+            raise RequestError("broker GitHub App token mint failed (see broker log)", status=502)
+        except urllib.error.URLError as exc:
+            log.error("GitHub App token mint could not reach %s: %s", url, exc)
+            raise RequestError("broker GitHub App token mint could not reach GitHub", status=502)
+        except TimeoutError:
+            raise RequestError("broker GitHub App token mint timed out", status=504)
+
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError:
+            raise RequestError("broker GitHub App token response was invalid JSON", status=502)
+        minted = str(payload.get("token") or "")
+        if not minted:
+            raise RequestError("broker GitHub App token response missing token", status=502)
+        expires_at = parse_github_expires_at(payload.get("expires_at"))
+        _github_app_token_cache.clear()
+        _github_app_token_cache.update({"cache_key": cache_key, "token": minted, "expires_at": expires_at})
+        return minted
+
+    def _build_jwt(self, app_id: str, key_path: Path) -> str:
+        now = int(time.time())
+        header = base64url(json.dumps({"alg": "RS256", "typ": "JWT"}, separators=(",", ":")).encode("utf-8"))
+        payload = base64url(json.dumps({"iat": now - 60, "exp": now + 540, "iss": app_id}, separators=(",", ":")).encode("utf-8"))
+        signing_input = f"{header}.{payload}".encode("ascii")
+        try:
+            signed = subprocess.run(
+                ["openssl", "dgst", "-sha256", "-sign", str(key_path)],
+                input=signing_input,
+                capture_output=True,
+                check=True,
+                timeout=10,
+            )
+        except FileNotFoundError:
+            raise RequestError("openssl is missing in the broker environment", status=503)
+        except subprocess.TimeoutExpired:
+            raise RequestError("broker GitHub App JWT signing timed out", status=504)
+        except subprocess.CalledProcessError as exc:
+            log.error("GitHub App JWT signing failed: %s", subprocess_stream_text(getattr(exc, "stderr", ""))[:300])
+            raise RequestError("broker GitHub App JWT signing failed", status=503)
+        signature = base64url(signed.stdout)
+        return f"{header}.{payload}.{signature}"
+
+
 def github_credential_provider() -> CredentialProvider:
     if GITHUB_CREDENTIAL_MODE == "pat":
         return PatCredentialProvider()
     if GITHUB_CREDENTIAL_MODE == "app":
-        raise RequestError("GitHub App credential mode is not implemented in this broker yet", status=503)
+        return AppCredentialProvider()
     raise RequestError(f"unsupported GitHub credential mode: {GITHUB_CREDENTIAL_MODE}", status=503)
 
 
@@ -515,11 +644,43 @@ class ForgeBackend:
         raise NotImplementedError
 
 
+def write_request_token_file(token: str) -> str:
+    token_dir = Path(GITHUB_APP_TOKEN_DIR)
+    try:
+        token_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd, path = tempfile.mkstemp(prefix=".github-app-token.", dir=str(token_dir), text=True)
+    except PermissionError:
+        raise RequestError(f"broker cannot create GitHub App token file under {GITHUB_APP_TOKEN_DIR}", status=503)
+    except FileNotFoundError:
+        raise RequestError(f"broker GitHub App token directory is missing: {GITHUB_APP_TOKEN_DIR}", status=503)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(token)
+            fh.write("\n")
+        os.chmod(path, 0o600)
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise
+    return path
+
+
 class GitHubBackend(ForgeBackend):
     forge = "github"
 
     def __init__(self, credentials: CredentialProvider):
         self.credentials = credentials
+
+    def credential_label(self) -> str:
+        if self.credentials.mode == "app":
+            return "broker GitHub App installation"
+        return "broker PAT"
 
     def parse_origin(self, origin: str) -> tuple[str, str]:
         origin = origin.strip()
@@ -571,15 +732,17 @@ class GitHubBackend(ForgeBackend):
             detail = f"{e.stdout or ''}\n{e.stderr or ''}".strip()
             lower = detail.lower()
             if "could not resolve to a repository" in lower or "not found" in lower or "404" in lower:
-                raise RequestError(
-                    f"broker PAT cannot reach {owner_repo}; add this repository to the fine-grained PAT selected repositories",
-                    status=404,
-                )
+                if self.credentials.mode == "app":
+                    hint = "install the GitHub App on this repository"
+                else:
+                    hint = "add this repository to the fine-grained PAT selected repositories"
+                raise RequestError(f"{self.credential_label()} cannot reach {owner_repo}; {hint}", status=404)
             if "resource not accessible by personal access token" in lower or "403" in lower:
-                raise RequestError(
-                    f"broker PAT lacks required permissions for {owner_repo}; grant Metadata read, Contents read/write, and Pull requests read/write",
-                    status=403,
-                )
+                if self.credentials.mode == "app":
+                    hint = "grant Metadata read, Contents read/write, and Pull requests read/write to the GitHub App"
+                else:
+                    hint = "grant Metadata read, Contents read/write, and Pull requests read/write"
+                raise RequestError(f"{self.credential_label()} lacks required permissions for {owner_repo}; {hint}", status=403)
             log.error("broker preflight failed for %s: %s", owner_repo, detail[:500])
             raise RequestError("broker GitHub preflight failed (see broker log)", status=502)
 
@@ -605,73 +768,89 @@ class GitHubBackend(ForgeBackend):
 
         # `git push`: token reaches git ONLY via the askpass helper. Not in argv, not in env.
         push_env = broker_git_env(req.repo_path)
-        log.info("rid=%s push %s -> %s", req.request_id, req.repo_path, req.branch)
-        audit_event(
-            "push_attempted",
-            request_id=req.request_id,
-            repo=f"{req.owner}/{req.repo}",
-            repo_path_slug=repo_slug(req.repo_path),
-            branch=req.branch,
-            base_branch=req.base_branch,
-            actor="broker",
-            transport="github",
-        )
-        subprocess.run(
-            ["git", "-C", req.repo_path, "push", "--no-verify", push_url, f"HEAD:refs/heads/{req.branch}"],
-            env=push_env, check=True, timeout=120, capture_output=True,
-        )
-
-        # `gh pr create`: GH_TOKEN works for gh.
-        gh_env = {**push_env, "GH_TOKEN": self.credentials.acquire_token()}
-        log.info(
-            "rid=%s gh pr create %s/%s base=%s head=%s",
-            req.request_id, req.owner, req.repo, req.base_branch, req.branch,
-        )
-        out = subprocess.run(
-            ["gh", "pr", "create", "--repo", f"{req.owner}/{req.repo}",
-             "--base", req.base_branch, "--head", req.branch,
-             "--title", req.title, "--body", req.body],
-            env=gh_env, check=True, timeout=120, capture_output=True, text=True,
-        )
-        pr_url = out.stdout.strip().splitlines()[-1]
-        audit_event(
-            "pr_opened",
-            request_id=req.request_id,
-            repo=f"{req.owner}/{req.repo}",
-            repo_path_slug=repo_slug(req.repo_path),
-            branch=req.branch,
-            base_branch=req.base_branch,
-            actor="broker",
-            transport="github",
-            pr_url=pr_url,
-        )
-        notify_lifecycle(
-            "pr_opened",
-            repo_slug_value=repo_slug(req.repo_path),
-            request_id=req.request_id,
-            branch=req.branch,
-            pr_url=pr_url,
-        )
-
-        # Apply the "ready for review" label. The broker is the only entity in
-        # the delivery flow that holds a gh write credential, so the labelling
-        # step belongs here rather than in the agent. A label failure is
-        # non-fatal: the PR is already open and review can proceed without it.
+        token = ""
+        token_path = ""
         try:
-            subprocess.run(
-                ["gh", "pr", "edit", pr_url, "--add-label", "ready for review"],
-                env=gh_env, check=True, timeout=30, capture_output=True, text=True,
-            )
-            log.info("rid=%s label_applied pr=%s label=%s", req.request_id, pr_url, "ready for review")
-        except subprocess.CalledProcessError as exc:
-            log.warning(
-                "rid=%s label_apply_failed pr=%s stderr=%s",
-                req.request_id, pr_url, subprocess_stream_text(getattr(exc, "stderr", "")),
-            )
-        except subprocess.TimeoutExpired:
-            log.warning("rid=%s label_apply_failed pr=%s reason=timeout", req.request_id, pr_url)
+            if self.credentials.mode != "pat":
+                token = self.credentials.acquire_token()
+                token_path = write_request_token_file(token)
+                push_env["FIELDWORK_BROKER_TOKEN_PATH"] = token_path
 
-        return pr_url
+            log.info("rid=%s push %s -> %s", req.request_id, req.repo_path, req.branch)
+            audit_event(
+                "push_attempted",
+                request_id=req.request_id,
+                repo=f"{req.owner}/{req.repo}",
+                repo_path_slug=repo_slug(req.repo_path),
+                branch=req.branch,
+                base_branch=req.base_branch,
+                actor="broker",
+                transport="github",
+            )
+            subprocess.run(
+                ["git", "-C", req.repo_path, "push", "--no-verify", push_url, f"HEAD:refs/heads/{req.branch}"],
+                env=push_env, check=True, timeout=120, capture_output=True,
+            )
+
+            # `gh pr create`: GH_TOKEN works for gh.
+            if not token:
+                token = self.credentials.acquire_token()
+            gh_env = {**push_env, "GH_TOKEN": token}
+            log.info(
+                "rid=%s gh pr create %s/%s base=%s head=%s",
+                req.request_id, req.owner, req.repo, req.base_branch, req.branch,
+            )
+            out = subprocess.run(
+                ["gh", "pr", "create", "--repo", f"{req.owner}/{req.repo}",
+                 "--base", req.base_branch, "--head", req.branch,
+                 "--title", req.title, "--body", req.body],
+                env=gh_env, check=True, timeout=120, capture_output=True, text=True,
+            )
+            pr_url = out.stdout.strip().splitlines()[-1]
+            audit_event(
+                "pr_opened",
+                request_id=req.request_id,
+                repo=f"{req.owner}/{req.repo}",
+                repo_path_slug=repo_slug(req.repo_path),
+                branch=req.branch,
+                base_branch=req.base_branch,
+                actor="broker",
+                transport="github",
+                pr_url=pr_url,
+            )
+            notify_lifecycle(
+                "pr_opened",
+                repo_slug_value=repo_slug(req.repo_path),
+                request_id=req.request_id,
+                branch=req.branch,
+                pr_url=pr_url,
+            )
+
+            # Apply the "ready for review" label. The broker is the only entity in
+            # the delivery flow that holds a gh write credential, so the labelling
+            # step belongs here rather than in the agent. A label failure is
+            # non-fatal: the PR is already open and review can proceed without it.
+            try:
+                subprocess.run(
+                    ["gh", "pr", "edit", pr_url, "--add-label", "ready for review"],
+                    env=gh_env, check=True, timeout=30, capture_output=True, text=True,
+                )
+                log.info("rid=%s label_applied pr=%s label=%s", req.request_id, pr_url, "ready for review")
+            except subprocess.CalledProcessError as exc:
+                log.warning(
+                    "rid=%s label_apply_failed pr=%s stderr=%s",
+                    req.request_id, pr_url, subprocess_stream_text(getattr(exc, "stderr", "")),
+                )
+            except subprocess.TimeoutExpired:
+                log.warning("rid=%s label_apply_failed pr=%s reason=timeout", req.request_id, pr_url)
+
+            return pr_url
+        finally:
+            if token_path:
+                try:
+                    os.unlink(token_path)
+                except OSError:
+                    log.warning("rid=%s app_token_cleanup_failed path=%s", req.request_id, token_path)
 
 
 def forge_backend() -> ForgeBackend:
@@ -1159,18 +1338,20 @@ def broker_subprocess_error_message(e: subprocess.CalledProcessError) -> str:
     lower = detail.lower()
     cmd = " ".join(str(part) for part in getattr(e, "cmd", []) or [])
     cmd_lower = cmd.lower()
+    credential_label = "broker GitHub App installation" if GITHUB_CREDENTIAL_MODE == "app" else "broker PAT"
+    repo_scope = "GitHub App installation access" if GITHUB_CREDENTIAL_MODE == "app" else "selected-repository access"
 
     if "refusing to allow a personal access token to create or update workflow" in lower or "workflow scope" in lower:
         return (
-            "broker PAT lacks Workflows read/write for workflow file changes; "
+            f"{credential_label} lacks Workflows read/write for workflow file changes; "
             "grant Workflows read/write or rerun onboarding with --no-workflows after resetting the init branch"
         )
     if "write access to repository not granted" in lower or "permission denied" in lower or "403" in lower:
         if "git" in cmd_lower and "push" in cmd_lower:
-            return "broker PAT lacks Contents read/write or selected-repository access for git push"
+            return f"{credential_label} lacks Contents read/write or {repo_scope} for git push"
         if "gh" in cmd_lower and "pr" in cmd_lower:
-            return "broker PAT lacks Pull requests read/write for gh pr create"
-        return "broker PAT lacks required GitHub write permissions"
+            return f"{credential_label} lacks Pull requests read/write for gh pr create"
+        return f"{credential_label} lacks required GitHub write permissions"
     if "no commits between" in lower:
         return "GitHub reports no commits between the base branch and the requested branch"
     return "git/gh failure (see broker log)"

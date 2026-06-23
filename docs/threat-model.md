@@ -8,7 +8,8 @@ through broker validation and optional human approval.
 
 ## Assets
 
-- GitHub fine-grained PAT used to push branches and open PRs.
+- GitHub write credential used to push branches and open PRs: either a
+  fine-grained PAT or a GitHub App private key that mints installation tokens.
 - SSH deploy keys used for read-only clones.
 - Telegram bot token and approval HMAC secret.
 - ntfy topic.
@@ -21,10 +22,10 @@ through broker validation and optional human approval.
 fieldwork user
   owns repo checkout
   runs Claude/Codex and tokenless clients
-  cannot read broker PAT
+  cannot read broker GitHub credential
 
 fieldwork-pr-broker user
-  owns GitHub PAT
+  owns GitHub write credential
   validates PR requests
   pushes and opens PRs
   does not run the coding agent
@@ -34,7 +35,7 @@ fieldwork-bot user
   watches pending approvals
   can call approve socket
   cannot submit PR requests
-  cannot read broker PAT
+  cannot read broker GitHub credential
 ```
 
 Root on the VPS can read everything. Fieldwork does not defend against compromised root.
@@ -53,12 +54,13 @@ The agent can:
 The agent cannot, by Fieldwork design:
 
 - read `/etc/fieldwork-pr-broker/gh-token`
+- read `/etc/fieldwork-pr-broker/github-app-private-key.pem`
 - read the Telegram bot token or HMAC secret
-- push with the broker PAT
+- push with the broker GitHub credential
 - call the approve socket
 - merge PRs
 - push directly to `main` through the broker
-- write to GitHub repos outside the broker PAT's selected repositories
+- write to GitHub repos outside the PAT scope or GitHub App installation
 
 ## Agent Runtime Boundaries
 
@@ -83,9 +85,9 @@ Codex sandbox allowlist for the Unix sockets required by delivery:
 
 This is a real security delta from the Claude path: Codex is not inside
 Fieldwork's `claude --sandbox` confinement. The GitHub write boundary does not
-move, because the broker PAT remains readable only by `fieldwork-pr-broker`, PR
-requests still go through broker validation, and approval-gated repos still
-require the Telegram approval path before push.
+move, because the broker GitHub credential remains readable only by
+`fieldwork-pr-broker`, PR requests still go through broker validation, and
+approval-gated repos still require the Telegram approval path before push.
 
 Codex preview gaps:
 
@@ -126,6 +128,9 @@ Defenses:
 - The credential provider chooses the GitHub token source; the GitHub backend
   still routes that token through `GIT_ASKPASS` for `git push` and `GH_TOKEN`
   for `gh`.
+- In GitHub App mode, installation tokens are minted on demand, cached until
+  shortly before expiry, written only to a broker-private request file under
+  `/run/fieldwork-pr-broker` for askpass, and removed after the request.
 
 The broker derives the push URL from `.fieldwork/expected-origin`. It does not trust a repo-controlled `origin` remote as the destination.
 
@@ -174,7 +179,7 @@ PR-prepare runner:
 - commits with `git -c core.hooksPath=/dev/null`
 - rolls back failed branch/add/commit attempts where possible
 
-Neither runner reads the GitHub PAT, Telegram token, HMAC secret, deploy key, or ntfy topic.
+Neither runner reads the GitHub write credential, Telegram token, HMAC secret, deploy key, or ntfy topic.
 
 ## Approval Gate Role
 
@@ -195,7 +200,7 @@ See [approval-gate.md](approval-gate.md).
 
 ## Notification Secrets
 
-The agent service does not load notification secrets into its environment. Hooks call wrapper scripts that load notification config at execution time. The Telegram bot token is owned by `fieldwork-bot`; the broker PAT is owned by `fieldwork-pr-broker`.
+The agent service does not load notification secrets into its environment. Hooks call wrapper scripts that load notification config at execution time. The Telegram bot token is owned by `fieldwork-bot`; the broker GitHub credential is owned by `fieldwork-pr-broker`.
 
 The agent/dashboard user gets direct read ACL access to the broker audit log only. It does not join `fieldwork-bot`, cannot enter `pending/` or `requests/`, and cannot call the approve socket. The notifications directory is a deliberate drop path: the agent may write outbound notification files, the bot may read/delete them, and the broker may write lifecycle drops via a direct ACL.
 
@@ -216,16 +221,16 @@ fieldwork verify-security [repo-slug]
 It checks:
 
 - temporary passwordless sudo cleanup
-- broker PAT owner and mode
-- agent user cannot read broker PAT
+- broker PAT or GitHub App private key owner and mode
+- agent user cannot read broker GitHub credentials
 - Codex SSH identity is `fieldwork` when Codex is configured
-- Codex SSH identity can reach the submit socket but cannot read the broker PAT
+- Codex SSH identity can reach the submit socket but cannot read the broker GitHub credential
 - broker socket owner and mode
 - broker ledger owner and mode
 - broker systemd hardening directives
 - bot user is not in the submit socket group
 - approve socket owner, group, mode, and live connectivity
-- bot cannot read broker PAT
+- bot cannot read broker GitHub credentials
 - bot HMAC secret owner and mode
 - notification secrets are not injected into the agent service
 - optional repo origin checks
