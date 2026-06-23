@@ -85,6 +85,8 @@ NOTIFICATIONS_DIR = os.environ.get(
 NOTIFY_LIFECYCLE_RAW = os.environ.get("FIELDWORK_BROKER_NOTIFY_LIFECYCLE", "").strip()
 NOTIFY_ON_PR_OPENED = os.environ.get("FIELDWORK_BROKER_NOTIFY_ON_PR_OPENED", "0") == "1"
 NOTIFICATION_SCHEMA = 1
+FORGE = os.environ.get("FIELDWORK_FORGE", "github").strip().lower() or "github"
+GITHUB_CREDENTIAL_MODE = os.environ.get("FIELDWORK_GITHUB_CREDENTIAL_MODE", "pat").strip().lower() or "pat"
 # Approve-socket path used to identify the second systemd-passed listening
 # socket. Connections on any other listening socket are treated as agent
 # requests and never see the /approve route.
@@ -366,14 +368,7 @@ def validate_json_schema(req: object) -> dict:
 
 
 def normalize_github_origin(origin: str) -> tuple[str, str]:
-    origin = origin.strip()
-    m = ORIGIN_RE.match(origin)
-    if m:
-        return m.group(1), m.group(2)
-    m = SSH_ORIGIN_RE.match(origin)
-    if m:
-        return m.group(1), m.group(2)
-    raise RequestError("origin remote must be a GitHub HTTPS URL or git@github alias URL")
+    return GitHubBackend(PatCredentialProvider()).parse_origin(origin)
 
 
 def ensure_readable_git_repo(repo_path: str) -> None:
@@ -435,19 +430,7 @@ def read_default_branch(repo_path: str) -> str:
 
 
 def validate_origin_remote(repo_path: str, owner: str, repo: str) -> None:
-    try:
-        result = subprocess.run(
-            ["git", "-C", repo_path, "config", "--get", "remote.origin.url"],
-            env=broker_git_env(repo_path),
-            capture_output=True, text=True,
-        )
-    except FileNotFoundError:
-        raise RequestError("git is missing in the broker environment", status=503)
-    if result.returncode != 0 or not result.stdout.strip():
-        raise RequestError("missing git remote origin")
-    origin_owner, origin_repo = normalize_github_origin(result.stdout.strip())
-    if (origin_owner, origin_repo) != (owner, repo):
-        raise RequestError("origin remote does not match .fieldwork/expected-origin")
+    return forge_backend().validate_origin_remote(repo_path, owner, repo)
 
 
 def validate_owner_repo(value: object) -> tuple[str, str]:
@@ -492,58 +475,213 @@ def broker_git_env(repo_path: str) -> dict[str, str]:
     return env
 
 
-def preflight(req: object) -> dict[str, str]:
-    if not isinstance(req, dict):
-        raise RequestError("preflight request body must be a JSON object")
-    extras = sorted(set(req.keys()) - {"repo"})
-    if extras:
-        raise RequestError(f"preflight request has unexpected field: {extras[0]}")
-    if "repo" not in req:
-        raise RequestError("preflight request missing required field: repo")
+class CredentialProvider:
+    """Provides a GitHub token without deciding how git/gh receive it."""
 
-    owner, repo = validate_owner_repo(req["repo"])
-    owner_repo = f"{owner}/{repo}"
-    env = {**github_env(), "GH_TOKEN": broker_token()}
-    try:
-        out = subprocess.run(
-            ["gh", "repo", "view", owner_repo, "--json", "defaultBranchRef,nameWithOwner,visibility"],
-            env=env, check=True, timeout=30, capture_output=True, text=True,
+    mode = ""
+
+    def acquire_token(self) -> str:
+        raise NotImplementedError
+
+
+class PatCredentialProvider(CredentialProvider):
+    mode = "pat"
+
+    def acquire_token(self) -> str:
+        return broker_token()
+
+
+def github_credential_provider() -> CredentialProvider:
+    if GITHUB_CREDENTIAL_MODE == "pat":
+        return PatCredentialProvider()
+    if GITHUB_CREDENTIAL_MODE == "app":
+        raise RequestError("GitHub App credential mode is not implemented in this broker yet", status=503)
+    raise RequestError(f"unsupported GitHub credential mode: {GITHUB_CREDENTIAL_MODE}", status=503)
+
+
+class ForgeBackend:
+    forge = ""
+
+    def parse_origin(self, origin: str) -> tuple[str, str]:
+        raise NotImplementedError
+
+    def validate_origin_remote(self, repo_path: str, owner: str, repo: str) -> None:
+        raise NotImplementedError
+
+    def preflight(self, req: object) -> dict[str, str]:
+        raise NotImplementedError
+
+    def push_and_open_pr(self, req: ValidatedRequest) -> str:
+        raise NotImplementedError
+
+
+class GitHubBackend(ForgeBackend):
+    forge = "github"
+
+    def __init__(self, credentials: CredentialProvider):
+        self.credentials = credentials
+
+    def parse_origin(self, origin: str) -> tuple[str, str]:
+        origin = origin.strip()
+        m = ORIGIN_RE.match(origin)
+        if m:
+            return m.group(1), m.group(2)
+        m = SSH_ORIGIN_RE.match(origin)
+        if m:
+            return m.group(1), m.group(2)
+        raise RequestError("origin remote must be a GitHub HTTPS URL or git@github alias URL")
+
+    def validate_origin_remote(self, repo_path: str, owner: str, repo: str) -> None:
+        try:
+            result = subprocess.run(
+                ["git", "-C", repo_path, "config", "--get", "remote.origin.url"],
+                env=broker_git_env(repo_path),
+                capture_output=True, text=True,
+            )
+        except FileNotFoundError:
+            raise RequestError("git is missing in the broker environment", status=503)
+        if result.returncode != 0 or not result.stdout.strip():
+            raise RequestError("missing git remote origin")
+        origin_owner, origin_repo = self.parse_origin(result.stdout.strip())
+        if (origin_owner, origin_repo) != (owner, repo):
+            raise RequestError("origin remote does not match .fieldwork/expected-origin")
+
+    def preflight(self, req: object) -> dict[str, str]:
+        if not isinstance(req, dict):
+            raise RequestError("preflight request body must be a JSON object")
+        extras = sorted(set(req.keys()) - {"repo"})
+        if extras:
+            raise RequestError(f"preflight request has unexpected field: {extras[0]}")
+        if "repo" not in req:
+            raise RequestError("preflight request missing required field: repo")
+
+        owner, repo = validate_owner_repo(req["repo"])
+        owner_repo = f"{owner}/{repo}"
+        env = {**github_env(), "GH_TOKEN": self.credentials.acquire_token()}
+        try:
+            out = subprocess.run(
+                ["gh", "repo", "view", owner_repo, "--json", "defaultBranchRef,nameWithOwner,visibility"],
+                env=env, check=True, timeout=30, capture_output=True, text=True,
+            )
+        except FileNotFoundError:
+            raise RequestError("GitHub CLI is missing in the broker environment", status=503)
+        except subprocess.TimeoutExpired:
+            raise RequestError("broker GitHub preflight timed out", status=504)
+        except subprocess.CalledProcessError as e:
+            detail = f"{e.stdout or ''}\n{e.stderr or ''}".strip()
+            lower = detail.lower()
+            if "could not resolve to a repository" in lower or "not found" in lower or "404" in lower:
+                raise RequestError(
+                    f"broker PAT cannot reach {owner_repo}; add this repository to the fine-grained PAT selected repositories",
+                    status=404,
+                )
+            if "resource not accessible by personal access token" in lower or "403" in lower:
+                raise RequestError(
+                    f"broker PAT lacks required permissions for {owner_repo}; grant Metadata read, Contents read/write, and Pull requests read/write",
+                    status=403,
+                )
+            log.error("broker preflight failed for %s: %s", owner_repo, detail[:500])
+            raise RequestError("broker GitHub preflight failed (see broker log)", status=502)
+
+        try:
+            info = json.loads(out.stdout)
+        except json.JSONDecodeError:
+            log.error("broker preflight returned invalid JSON for %s: %s", owner_repo, out.stdout[:500])
+            raise RequestError("broker GitHub preflight returned invalid JSON", status=502)
+
+        default_branch = ""
+        if isinstance(info.get("defaultBranchRef"), dict):
+            default_branch = str(info["defaultBranchRef"].get("name") or "")
+        return {
+            "repo": owner_repo,
+            "nameWithOwner": str(info.get("nameWithOwner") or owner_repo),
+            "defaultBranch": default_branch,
+            "visibility": str(info.get("visibility") or ""),
+        }
+
+    def push_and_open_pr(self, req: ValidatedRequest) -> str:
+        """Returns the PR URL."""
+        push_url = f"https://github.com/{req.owner}/{req.repo}.git"
+
+        # `git push`: token reaches git ONLY via the askpass helper. Not in argv, not in env.
+        push_env = broker_git_env(req.repo_path)
+        log.info("rid=%s push %s -> %s", req.request_id, req.repo_path, req.branch)
+        audit_event(
+            "push_attempted",
+            request_id=req.request_id,
+            repo=f"{req.owner}/{req.repo}",
+            repo_path_slug=repo_slug(req.repo_path),
+            branch=req.branch,
+            base_branch=req.base_branch,
+            actor="broker",
+            transport="github",
         )
-    except FileNotFoundError:
-        raise RequestError("GitHub CLI is missing in the broker environment", status=503)
-    except subprocess.TimeoutExpired:
-        raise RequestError("broker GitHub preflight timed out", status=504)
-    except subprocess.CalledProcessError as e:
-        detail = f"{e.stdout or ''}\n{e.stderr or ''}".strip()
-        lower = detail.lower()
-        if "could not resolve to a repository" in lower or "not found" in lower or "404" in lower:
-            raise RequestError(
-                f"broker PAT cannot reach {owner_repo}; add this repository to the fine-grained PAT selected repositories",
-                status=404,
-            )
-        if "resource not accessible by personal access token" in lower or "403" in lower:
-            raise RequestError(
-                f"broker PAT lacks required permissions for {owner_repo}; grant Metadata read, Contents read/write, and Pull requests read/write",
-                status=403,
-            )
-        log.error("broker preflight failed for %s: %s", owner_repo, detail[:500])
-        raise RequestError("broker GitHub preflight failed (see broker log)", status=502)
+        subprocess.run(
+            ["git", "-C", req.repo_path, "push", "--no-verify", push_url, f"HEAD:refs/heads/{req.branch}"],
+            env=push_env, check=True, timeout=120, capture_output=True,
+        )
 
-    try:
-        info = json.loads(out.stdout)
-    except json.JSONDecodeError:
-        log.error("broker preflight returned invalid JSON for %s: %s", owner_repo, out.stdout[:500])
-        raise RequestError("broker GitHub preflight returned invalid JSON", status=502)
+        # `gh pr create`: GH_TOKEN works for gh.
+        gh_env = {**push_env, "GH_TOKEN": self.credentials.acquire_token()}
+        log.info(
+            "rid=%s gh pr create %s/%s base=%s head=%s",
+            req.request_id, req.owner, req.repo, req.base_branch, req.branch,
+        )
+        out = subprocess.run(
+            ["gh", "pr", "create", "--repo", f"{req.owner}/{req.repo}",
+             "--base", req.base_branch, "--head", req.branch,
+             "--title", req.title, "--body", req.body],
+            env=gh_env, check=True, timeout=120, capture_output=True, text=True,
+        )
+        pr_url = out.stdout.strip().splitlines()[-1]
+        audit_event(
+            "pr_opened",
+            request_id=req.request_id,
+            repo=f"{req.owner}/{req.repo}",
+            repo_path_slug=repo_slug(req.repo_path),
+            branch=req.branch,
+            base_branch=req.base_branch,
+            actor="broker",
+            transport="github",
+            pr_url=pr_url,
+        )
+        notify_lifecycle(
+            "pr_opened",
+            repo_slug_value=repo_slug(req.repo_path),
+            request_id=req.request_id,
+            branch=req.branch,
+            pr_url=pr_url,
+        )
 
-    default_branch = ""
-    if isinstance(info.get("defaultBranchRef"), dict):
-        default_branch = str(info["defaultBranchRef"].get("name") or "")
-    return {
-        "repo": owner_repo,
-        "nameWithOwner": str(info.get("nameWithOwner") or owner_repo),
-        "defaultBranch": default_branch,
-        "visibility": str(info.get("visibility") or ""),
-    }
+        # Apply the "ready for review" label. The broker is the only entity in
+        # the delivery flow that holds a gh write credential, so the labelling
+        # step belongs here rather than in the agent. A label failure is
+        # non-fatal: the PR is already open and review can proceed without it.
+        try:
+            subprocess.run(
+                ["gh", "pr", "edit", pr_url, "--add-label", "ready for review"],
+                env=gh_env, check=True, timeout=30, capture_output=True, text=True,
+            )
+            log.info("rid=%s label_applied pr=%s label=%s", req.request_id, pr_url, "ready for review")
+        except subprocess.CalledProcessError as exc:
+            log.warning(
+                "rid=%s label_apply_failed pr=%s stderr=%s",
+                req.request_id, pr_url, subprocess_stream_text(getattr(exc, "stderr", "")),
+            )
+        except subprocess.TimeoutExpired:
+            log.warning("rid=%s label_apply_failed pr=%s reason=timeout", req.request_id, pr_url)
+
+        return pr_url
+
+
+def forge_backend() -> ForgeBackend:
+    if FORGE == "github":
+        return GitHubBackend(github_credential_provider())
+    raise RequestError(f"unsupported forge backend: {FORGE}", status=503)
+
+
+def preflight(req: object) -> dict[str, str]:
+    return forge_backend().preflight(req)
 
 
 def validate(req: object) -> ValidatedRequest:
@@ -1007,79 +1145,7 @@ def drop_pr_opened_notification(repo_path: str, pr_url: str) -> None:
 
 
 def push_and_open_pr(req: ValidatedRequest) -> str:
-    """Returns the PR URL."""
-    push_url = f"https://github.com/{req.owner}/{req.repo}.git"
-
-    # `git push`: token reaches git ONLY via the askpass helper. Not in argv, not in env.
-    push_env = broker_git_env(req.repo_path)
-    log.info("rid=%s push %s -> %s", req.request_id, req.repo_path, req.branch)
-    audit_event(
-        "push_attempted",
-        request_id=req.request_id,
-        repo=f"{req.owner}/{req.repo}",
-        repo_path_slug=repo_slug(req.repo_path),
-        branch=req.branch,
-        base_branch=req.base_branch,
-        actor="broker",
-        transport="github",
-    )
-    subprocess.run(
-        ["git", "-C", req.repo_path, "push", "--no-verify", push_url, f"HEAD:refs/heads/{req.branch}"],
-        env=push_env, check=True, timeout=120, capture_output=True,
-    )
-
-    # `gh pr create`: GH_TOKEN works for gh.
-    gh_env = {**push_env, "GH_TOKEN": broker_token()}
-    log.info(
-        "rid=%s gh pr create %s/%s base=%s head=%s",
-        req.request_id, req.owner, req.repo, req.base_branch, req.branch,
-    )
-    out = subprocess.run(
-        ["gh", "pr", "create", "--repo", f"{req.owner}/{req.repo}",
-         "--base", req.base_branch, "--head", req.branch,
-         "--title", req.title, "--body", req.body],
-        env=gh_env, check=True, timeout=120, capture_output=True, text=True,
-    )
-    pr_url = out.stdout.strip().splitlines()[-1]
-    audit_event(
-        "pr_opened",
-        request_id=req.request_id,
-        repo=f"{req.owner}/{req.repo}",
-        repo_path_slug=repo_slug(req.repo_path),
-        branch=req.branch,
-        base_branch=req.base_branch,
-        actor="broker",
-        transport="github",
-        pr_url=pr_url,
-    )
-    notify_lifecycle(
-        "pr_opened",
-        repo_slug_value=repo_slug(req.repo_path),
-        request_id=req.request_id,
-        branch=req.branch,
-        pr_url=pr_url,
-    )
-
-    # Apply the "ready for review" label. The broker is the only entity in the
-    # delivery flow that holds a gh write credential, so the labelling step
-    # belongs here rather than in the agent. A label failure (label missing
-    # on the repo, transient gh error, etc.) is non-fatal: the PR is already
-    # open and review can proceed without it.
-    try:
-        subprocess.run(
-            ["gh", "pr", "edit", pr_url, "--add-label", "ready for review"],
-            env=gh_env, check=True, timeout=30, capture_output=True, text=True,
-        )
-        log.info("rid=%s label_applied pr=%s label=%s", req.request_id, pr_url, "ready for review")
-    except subprocess.CalledProcessError as exc:
-        log.warning(
-            "rid=%s label_apply_failed pr=%s stderr=%s",
-            req.request_id, pr_url, subprocess_stream_text(getattr(exc, "stderr", "")),
-        )
-    except subprocess.TimeoutExpired:
-        log.warning("rid=%s label_apply_failed pr=%s reason=timeout", req.request_id, pr_url)
-
-    return pr_url
+    return forge_backend().push_and_open_pr(req)
 
 
 def subprocess_stream_text(value: object) -> str:
