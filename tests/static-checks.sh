@@ -1605,8 +1605,8 @@ case "$seen_onboard_args" in
   *"--with-approval-gate"*) ;;
   *) echo "missing --with-approval-gate"; exit 1 ;;
 esac
-setup_ledger="$HOME/.config/fieldwork/quickstart/test-profile/setup.state"
-onboard_ledger="$HOME/.config/fieldwork/quickstart/test-profile/owner_repo.state"
+setup_ledger="$(quickstart_ledger_path setup)"
+onboard_ledger="$(quickstart_ledger_path owner/repo)"
 test -f "$setup_ledger"
 test -f "$onboard_ledger"
 grep -q '^setup=done$' "$setup_ledger"
