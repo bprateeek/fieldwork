@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-FIELDWORK_TEST_FINGERPRINT_FILES="bin/fieldwork install.sh AGENTS.md lib/cli/config.sh lib/cli/messaging.sh lib/cli/health.sh lib/cli/ssh-config.sh lib/cli/setup.sh lib/cli/onboard.sh lib/cli/provision.sh lib/cli/verify-security.sh lib/cli/uninstall.sh lib/cli/developer-preview.sh lib/systemd/bootstrap-vps.sh lib/apparmor/fieldwork-bwrap lib/broker/install.sh lib/broker/standalone-install.sh lib/broker/fieldwork-pr-broker.service lib/broker/fieldwork-pr-broker.socket lib/broker/fieldwork-pr-approve.socket lib/broker/server.py schema/pr-request.schema.json schema/pr-prepare-request.schema.json lib/scripts/fieldwork-status lib/scripts/fieldwork-status-snapshot lib/scripts/fieldwork-dashboard-server lib/scripts/fieldwork-pr-submit lib/scripts/fieldwork-clone lib/scripts/fieldwork-init lib/scripts/fieldwork-launch lib/scripts/fieldwork-agent-session lib/scripts/fieldwork-event-poll lib/scripts/fieldwork-setup-probe lib/scripts/fieldwork-session-probe lib/scripts/fieldwork-codex-sandbox lib/scripts/fieldwork-bot lib/scripts/fieldwork-pr-prepare lib/scripts/fieldwork-pr-prepare-runner lib/scripts/fieldwork-pr-prepare-impl lib/agents/claude-remote-control lib/templates/repo/AGENTS.md lib/templates/repo/CLAUDE.md lib/templates/repo/.gitignore lib/templates/repo/.fieldwork/expected-origin lib/systemd/fieldwork-agent@.service lib/systemd/fieldwork-dashboard.service lib/systemd/fieldwork-event-poll.service lib/systemd/fieldwork-event-poll.timer lib/systemd/fieldwork-bot.service lib/systemd/fieldwork-pr-prepare-runner.socket lib/systemd/fieldwork-pr-prepare-runner@.service lib/systemd/fieldwork-verify-runner.socket lib/systemd/fieldwork-verify-runner@.service examples/eval/docker-compose.yml examples/eval/Dockerfile examples/eval/eval-smoke.sh examples/eval/fake-gh examples/eval/fake-gitleaks examples/eval/gh examples/eval/gitleaks examples/eval/README.md"
+FIELDWORK_TEST_FINGERPRINT_FILES="bin/fieldwork install.sh AGENTS.md lib/cli/config.sh lib/cli/messaging.sh lib/cli/health.sh lib/cli/ssh-config.sh lib/cli/setup.sh lib/cli/onboard.sh lib/cli/quickstart.sh lib/cli/provision.sh lib/cli/verify-security.sh lib/cli/uninstall.sh lib/cli/developer-preview.sh lib/systemd/bootstrap-vps.sh lib/apparmor/fieldwork-bwrap lib/broker/install.sh lib/broker/standalone-install.sh lib/broker/fieldwork-pr-broker.service lib/broker/fieldwork-pr-broker.socket lib/broker/fieldwork-pr-approve.socket lib/broker/server.py schema/pr-request.schema.json schema/pr-prepare-request.schema.json lib/scripts/fieldwork-status lib/scripts/fieldwork-status-snapshot lib/scripts/fieldwork-dashboard-server lib/scripts/fieldwork-pr-submit lib/scripts/fieldwork-clone lib/scripts/fieldwork-init lib/scripts/fieldwork-launch lib/scripts/fieldwork-agent-session lib/scripts/fieldwork-event-poll lib/scripts/fieldwork-setup-probe lib/scripts/fieldwork-session-probe lib/scripts/fieldwork-codex-sandbox lib/scripts/fieldwork-bot lib/scripts/fieldwork-pr-prepare lib/scripts/fieldwork-pr-prepare-runner lib/scripts/fieldwork-pr-prepare-impl lib/agents/claude-remote-control lib/templates/repo/AGENTS.md lib/templates/repo/CLAUDE.md lib/templates/repo/.gitignore lib/templates/repo/.fieldwork/expected-origin lib/systemd/fieldwork-agent@.service lib/systemd/fieldwork-dashboard.service lib/systemd/fieldwork-event-poll.service lib/systemd/fieldwork-event-poll.timer lib/systemd/fieldwork-bot.service lib/systemd/fieldwork-pr-prepare-runner.socket lib/systemd/fieldwork-pr-prepare-runner@.service lib/systemd/fieldwork-verify-runner.socket lib/systemd/fieldwork-verify-runner@.service examples/eval/docker-compose.yml examples/eval/Dockerfile examples/eval/eval-smoke.sh examples/eval/fake-gh examples/eval/fake-gitleaks examples/eval/gh examples/eval/gitleaks examples/eval/README.md"
 TMP_DIRS=""
 cleanup() {
   local dir
@@ -317,6 +317,7 @@ echo "[checks] fieldwork help"
 "$ROOT/bin/fieldwork" --help >${TMPDIR:-/tmp}/fieldwork-help.out
 grep -q "^Fieldwork .*self-hosted mobile-to-PR workflows" ${TMPDIR:-/tmp}/fieldwork-help.out
 grep -q "^Getting started$" ${TMPDIR:-/tmp}/fieldwork-help.out
+grep -q "quickstart \\[repo\\] .*resumable setup" ${TMPDIR:-/tmp}/fieldwork-help.out
 grep -q "setup .*install and configure Fieldwork locally" ${TMPDIR:-/tmp}/fieldwork-help.out
 grep -q "onboard <repo> .*prepare a GitHub repo for Fieldwork" ${TMPDIR:-/tmp}/fieldwork-help.out
 grep -q "start <repo> .*begin a phone-driven session on a repo" ${TMPDIR:-/tmp}/fieldwork-help.out
@@ -1549,6 +1550,72 @@ echo "[checks] setup help"
 "$ROOT/bin/fieldwork" setup --help >${TMPDIR:-/tmp}/fieldwork-setup-help.out
 grep -q "usage: fieldwork setup" ${TMPDIR:-/tmp}/fieldwork-setup-help.out
 grep -q "main first-run entrypoint" ${TMPDIR:-/tmp}/fieldwork-setup-help.out
+
+echo "[checks] quickstart help and resume ledger"
+"$ROOT/bin/fieldwork" quickstart --help >${TMPDIR:-/tmp}/fieldwork-quickstart-help.out
+grep -q "usage: fieldwork quickstart" ${TMPDIR:-/tmp}/fieldwork-quickstart-help.out
+grep -q -- "--status" ${TMPDIR:-/tmp}/fieldwork-quickstart-help.out
+grep -q -- "--reset-state" ${TMPDIR:-/tmp}/fieldwork-quickstart-help.out
+tmp_quickstart_home="$(mktemp_dir)"
+ROOT="$ROOT" HOME="$tmp_quickstart_home" bash >${TMPDIR:-/tmp}/fieldwork-quickstart-resume.out <<'SH'
+set -euo pipefail
+FIELDWORK_ROOT="$ROOT"
+FIELDWORK_PROFILE=test-profile
+FIELDWORK_FORGE=github
+FIELDWORK_SSH_HOST=fake-vps
+FIELDWORK_REMOTE_USER=fieldwork
+FIELDWORK_PROJECTS_DIR=/home/fieldwork/projects
+FIELDWORK_DEFAULT_BRANCH=main
+phase_section() { echo "$1"; }
+info_row() { printf '%s=%s\n' "$1" "$2"; }
+setup_status_line() { printf '%s:%s\n' "$1" "$2"; }
+status_ok_line() { printf 'ok:%s\n' "$1"; }
+label_line() { printf '%s:\n' "$1"; }
+valid_owner_repo() { case "$1" in */*) return 0 ;; *) return 1 ;; esac; }
+setup_calls=0
+onboard_calls=0
+seen_setup_args=""
+seen_onboard_args=""
+setup_fieldwork() {
+  setup_calls=$((setup_calls + 1))
+  seen_setup_args="$*"
+}
+source "$ROOT/lib/cli/quickstart.sh"
+quickstart_run_onboard() {
+  onboard_calls=$((onboard_calls + 1))
+  seen_onboard_args="$*"
+}
+quickstart_fieldwork owner/repo --yes --agent codex --no-workflows --with-approval-gate --branch fieldwork/init
+quickstart_fieldwork owner/repo --yes --agent codex --no-workflows --with-approval-gate --branch fieldwork/init
+[ "$setup_calls" = "1" ]
+[ "$onboard_calls" = "1" ]
+case "$seen_setup_args" in
+  *"--yes"*"--agent codex"*|*"--agent codex"*"--yes"*) ;;
+  *) echo "missing setup args"; exit 1 ;;
+esac
+case "$seen_onboard_args" in
+  *"owner/repo"*) ;;
+  *) echo "missing onboard repo"; exit 1 ;;
+esac
+case "$seen_onboard_args" in
+  *"--no-workflows"*) ;;
+  *) echo "missing --no-workflows"; exit 1 ;;
+esac
+case "$seen_onboard_args" in
+  *"--with-approval-gate"*) ;;
+  *) echo "missing --with-approval-gate"; exit 1 ;;
+esac
+setup_ledger="$(quickstart_ledger_path setup)"
+onboard_ledger="$(quickstart_ledger_path owner/repo)"
+test -f "$setup_ledger"
+test -f "$onboard_ledger"
+grep -q '^setup=done$' "$setup_ledger"
+grep -q '^onboard=done$' "$onboard_ledger"
+quickstart_fieldwork owner/repo --status
+SH
+grep -q "setup phase already completed" ${TMPDIR:-/tmp}/fieldwork-quickstart-resume.out
+grep -q "onboarding phase already completed" ${TMPDIR:-/tmp}/fieldwork-quickstart-resume.out
+grep -q "setup=done" ${TMPDIR:-/tmp}/fieldwork-quickstart-resume.out
 grep -q 'label_line "Next action"' "$ROOT/bin/fieldwork"
 
 echo "[checks] setup checklist output"
@@ -3705,6 +3772,8 @@ grep -q 'server display name' "$ROOT/bin/fieldwork"
 grep -q 'Available from signed-in devices' "$ROOT/docs/quickstart.md"
 grep -q 'configured VPS SSH' "$ROOT/docs/quickstart.md"
 grep -q 'may display as the server name' "$ROOT/docs/quickstart.md"
+grep -q "fieldwork quickstart <owner>/<repo>" "$ROOT/docs/quickstart.md"
+grep -q "fieldwork quickstart" "$ROOT/docs/cli-reference.md"
 if grep -q 'phase_section "Manual checkpoints"' "$ROOT/lib/scripts/fieldwork-onboard"; then
   echo "onboard should not dump a separate manual-checkpoints phase" >&2
   exit 1
@@ -3880,6 +3949,11 @@ grep -q "fieldwork refresh <slug>" "$ROOT/docs/runbook.md"
 grep -q 'fieldwork refresh $SLUG' "$ROOT/lib/scripts/fieldwork-onboard"
 
 echo "[checks] invalid setup/sync args reject"
+if "$ROOT/bin/fieldwork" quickstart --wat >${TMPDIR:-/tmp}/fieldwork-invalid-quickstart.out 2>&1; then
+  echo "invalid quickstart argument unexpectedly succeeded" >&2
+  exit 1
+fi
+grep -q "unknown quickstart argument" ${TMPDIR:-/tmp}/fieldwork-invalid-quickstart.out
 if "$ROOT/bin/fieldwork" setup --wat >${TMPDIR:-/tmp}/fieldwork-invalid-setup.out 2>&1; then
   echo "invalid setup argument unexpectedly succeeded" >&2
   exit 1

@@ -141,6 +141,8 @@ source "$FIELDWORK_ROOT/lib/cli/ssh-config.sh"
 source "$FIELDWORK_ROOT/lib/cli/setup.sh"
 # shellcheck source=lib/cli/onboard.sh
 source "$FIELDWORK_ROOT/lib/cli/onboard.sh"
+# shellcheck source=lib/cli/quickstart.sh
+source "$FIELDWORK_ROOT/lib/cli/quickstart.sh"
 # shellcheck source=lib/cli/provision.sh
 source "$FIELDWORK_ROOT/lib/cli/provision.sh"
 # shellcheck source=lib/cli/verify-security.sh
@@ -153,7 +155,7 @@ source "$FIELDWORK_ROOT/lib/cli/developer-preview.sh"
 # Resolve the control-plane config object (host, user, projects root, default
 # branch, notify provider, forge, identity). Owns the defaults; see lib/cli/config.sh.
 fieldwork_load_config
-FIELDWORK_FINGERPRINT_FILES="bin/fieldwork install.sh AGENTS.md lib/cli/config.sh lib/cli/messaging.sh lib/cli/health.sh lib/cli/ssh-config.sh lib/cli/setup.sh lib/cli/onboard.sh lib/cli/provision.sh lib/cli/verify-security.sh lib/cli/uninstall.sh lib/cli/developer-preview.sh lib/systemd/bootstrap-vps.sh lib/apparmor/fieldwork-bwrap lib/broker/install.sh lib/broker/standalone-install.sh lib/broker/fieldwork-pr-broker.service lib/broker/fieldwork-pr-broker.socket lib/broker/fieldwork-pr-approve.socket lib/broker/server.py schema/pr-request.schema.json schema/pr-prepare-request.schema.json lib/scripts/fieldwork-status lib/scripts/fieldwork-status-snapshot lib/scripts/fieldwork-dashboard-server lib/scripts/fieldwork-pr-submit lib/scripts/fieldwork-clone lib/scripts/fieldwork-init lib/scripts/fieldwork-launch lib/scripts/fieldwork-agent-session lib/scripts/fieldwork-event-poll lib/scripts/fieldwork-setup-probe lib/scripts/fieldwork-session-probe lib/scripts/fieldwork-codex-sandbox lib/scripts/fieldwork-bot lib/scripts/fieldwork-pr-prepare lib/scripts/fieldwork-pr-prepare-runner lib/scripts/fieldwork-pr-prepare-impl lib/agents/claude-remote-control lib/templates/repo/AGENTS.md lib/templates/repo/CLAUDE.md lib/templates/repo/.gitignore lib/templates/repo/.fieldwork/expected-origin lib/systemd/fieldwork-agent@.service lib/systemd/fieldwork-dashboard.service lib/systemd/fieldwork-event-poll.service lib/systemd/fieldwork-event-poll.timer lib/systemd/fieldwork-bot.service lib/systemd/fieldwork-pr-prepare-runner.socket lib/systemd/fieldwork-pr-prepare-runner@.service lib/systemd/fieldwork-verify-runner.socket lib/systemd/fieldwork-verify-runner@.service examples/eval/docker-compose.yml examples/eval/Dockerfile examples/eval/eval-smoke.sh examples/eval/fake-gh examples/eval/fake-gitleaks examples/eval/gh examples/eval/gitleaks examples/eval/README.md"
+FIELDWORK_FINGERPRINT_FILES="bin/fieldwork install.sh AGENTS.md lib/cli/config.sh lib/cli/messaging.sh lib/cli/health.sh lib/cli/ssh-config.sh lib/cli/setup.sh lib/cli/onboard.sh lib/cli/quickstart.sh lib/cli/provision.sh lib/cli/verify-security.sh lib/cli/uninstall.sh lib/cli/developer-preview.sh lib/systemd/bootstrap-vps.sh lib/apparmor/fieldwork-bwrap lib/broker/install.sh lib/broker/standalone-install.sh lib/broker/fieldwork-pr-broker.service lib/broker/fieldwork-pr-broker.socket lib/broker/fieldwork-pr-approve.socket lib/broker/server.py schema/pr-request.schema.json schema/pr-prepare-request.schema.json lib/scripts/fieldwork-status lib/scripts/fieldwork-status-snapshot lib/scripts/fieldwork-dashboard-server lib/scripts/fieldwork-pr-submit lib/scripts/fieldwork-clone lib/scripts/fieldwork-init lib/scripts/fieldwork-launch lib/scripts/fieldwork-agent-session lib/scripts/fieldwork-event-poll lib/scripts/fieldwork-setup-probe lib/scripts/fieldwork-session-probe lib/scripts/fieldwork-codex-sandbox lib/scripts/fieldwork-bot lib/scripts/fieldwork-pr-prepare lib/scripts/fieldwork-pr-prepare-runner lib/scripts/fieldwork-pr-prepare-impl lib/agents/claude-remote-control lib/templates/repo/AGENTS.md lib/templates/repo/CLAUDE.md lib/templates/repo/.gitignore lib/templates/repo/.fieldwork/expected-origin lib/systemd/fieldwork-agent@.service lib/systemd/fieldwork-dashboard.service lib/systemd/fieldwork-event-poll.service lib/systemd/fieldwork-event-poll.timer lib/systemd/fieldwork-bot.service lib/systemd/fieldwork-pr-prepare-runner.socket lib/systemd/fieldwork-pr-prepare-runner@.service lib/systemd/fieldwork-verify-runner.socket lib/systemd/fieldwork-verify-runner@.service examples/eval/docker-compose.yml examples/eval/Dockerfile examples/eval/eval-smoke.sh examples/eval/fake-gh examples/eval/fake-gitleaks examples/eval/gh examples/eval/gitleaks examples/eval/README.md"
 FIELDWORK_UI_COLOR=0
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
   FIELDWORK_UI_COLOR=1
@@ -398,6 +400,7 @@ Usage
   fieldwork <command> --help     details for a specific command
 
 Getting started
+  quickstart [repo]    resumable setup + repo onboarding path
   setup               install and configure Fieldwork locally
   provision <prov>    create a VPS (Hetzner) and wire up SSH
   onboard <repo>      prepare a GitHub repo for Fieldwork
@@ -4869,6 +4872,7 @@ esac
 
 case "$cmd" in
   --help|-h|help) usage ;;
+  quickstart) shift; quickstart_fieldwork "$@" ;;
   setup) shift; setup_fieldwork "$@" ;;
   uninstall) shift; uninstall_fieldwork "$@" ;;
   health) shift; health "$@" ;;

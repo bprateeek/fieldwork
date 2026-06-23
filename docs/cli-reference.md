@@ -2,12 +2,14 @@
 
 One-line index of every `fieldwork` subcommand and where to read more. Commands that are not covered in another doc (`dashboard`, `report`, `start`, `status`) get a full section here.
 
-For the guided path, start with `fieldwork setup` and follow what it prints. Most commands here are invoked by `setup` for you.
+For the guided path, start with `fieldwork quickstart` and follow what it prints.
+Use `fieldwork setup` directly when you want the step-by-step setup-only path.
 
 ## Index
 
 | Command           | One line                                                                                                        | Authoritative doc                                                                  |
 | ----------------- | --------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------- |
+| `quickstart`      | Resumable public setup + repo onboarding path; skips completed phases from its local phase ledger.              | [quickstart.md](quickstart.md), [§ `fieldwork quickstart`](#fieldwork-quickstart-ownerrepo) below |
 | `setup`           | First-run command center; connects the VPS, prepares the server, and prints the next action when it needs help. | [setup.md](setup.md)                                                               |
 | `provision`       | Create a VPS (Hetzner) via the `hcloud` CLI + cloud-init, write the SSH alias, and hand off to `setup`.         | [first-time-infrastructure.md](first-time-infrastructure.md)                       |
 | `uninstall`       | Guided teardown for Fieldwork-managed local, remote, broker, and approval-bot assets.                           | [uninstall.md](uninstall.md)                                                       |
@@ -31,6 +33,51 @@ For the guided path, start with `fieldwork setup` and follow what it prints. Mos
 | `bot-status`      | Inspect the Telegram approval bot pipeline: polling, pending queue, sockets, and config.                        | [§ `fieldwork bot-status`](#fieldwork-bot-status) below                            |
 
 `fieldwork --help` prints the same surface with full argument syntax.
+
+---
+
+## `fieldwork quickstart [owner/repo]`
+
+```text
+usage: fieldwork quickstart [owner/repo] [options]
+```
+
+Public, resumable first-run path. It is intentionally a thin orchestrator over
+the existing commands: setup still owns local/VPS readiness and account prompts,
+and onboarding still owns repo cloning, templates, init PR creation, and its
+repo-side checkpoint.
+
+Quickstart adds one local phase ledger under
+`~/.config/fieldwork/quickstart/<profile>/`. Once setup succeeds, later
+quickstart runs skip setup. Once onboarding succeeds for a repo, later
+quickstart runs skip onboarding for that repo. Use `--status` to inspect the
+ledger without changing anything, or `--reset-state` to remove quickstart's
+phase ledger before running again.
+
+Common forms:
+
+```sh
+fieldwork quickstart --agent codex
+fieldwork quickstart <owner>/<repo> --agent codex --with-approval-gate
+fieldwork quickstart <owner>/<repo> --status
+```
+
+Flags:
+
+| Flag | Meaning |
+|---|---|
+| `--agent claude\|codex\|both` | Passed to `fieldwork setup`. |
+| `--yes` | Passed to `fieldwork setup`. |
+| `--skip-sync` | Passed to `fieldwork setup`. |
+| `--force-install` | Passed to `fieldwork setup`. |
+| `--branch fieldwork/init` | Passed to `fieldwork onboard`. Requires `<owner/repo>`. |
+| `--no-workflows` | Passed to `fieldwork onboard`. Requires `<owner/repo>`. |
+| `--with-approval-gate` | Passed to `fieldwork onboard`. Requires `<owner/repo>`. |
+| `--reseed-templates` | Passed to `fieldwork onboard`. Requires `<owner/repo>`. |
+| `--status` | Print quickstart phase state without running setup or onboarding. |
+| `--reset-state` | Remove quickstart's local phase ledger before continuing. |
+
+See [quickstart.md](quickstart.md).
 
 ---
 

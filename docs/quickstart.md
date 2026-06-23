@@ -1,7 +1,21 @@
 # Quickstart
 
-This is the short guided VPS path. Run `fieldwork setup` first; for a no-VPS
-demo, start with [evaluation.md](evaluation.md).
+This is the short guided VPS path. For a no-VPS demo, start with
+[evaluation.md](evaluation.md).
+
+The public command is resumable:
+
+```sh
+fieldwork quickstart --agent codex
+fieldwork quickstart <owner>/<repo> --agent codex --with-approval-gate
+```
+
+Quickstart records only phase completion under
+`~/.config/fieldwork/quickstart/`: setup completion is per Fieldwork profile,
+and onboarding completion is per repo. It skips completed phases on later runs
+and delegates the real work to the existing setup and onboarding flows.
+
+Run `fieldwork setup` first only if you want the step-by-step command path.
 
 For developer preview fit and support boundaries, read [developer-preview.md](developer-preview.md).
 
@@ -12,7 +26,8 @@ The VPS path assumes you either already have, or are ready to create:
 - a GitHub repo
 - a Claude Code account for `--agent claude`, or an OpenAI/Codex account for `--agent codex`
 
-If you do not have the VPS user, SSH alias, or GitHub token yet, `fieldwork setup` will guide the next step.
+If you do not have the VPS user, SSH alias, or GitHub token yet, quickstart's
+setup phase will guide the next step.
 
 ## Infrastructure Overview
 
@@ -163,6 +178,14 @@ fieldwork verify-security
 ## 5. Onboard a Repo
 
 On your local machine:
+
+```sh
+fieldwork quickstart <owner>/<repo> --with-approval-gate
+```
+
+This resumes from the first incomplete quickstart phase. If setup has already
+completed through quickstart, it will not run setup again. If you prefer to drive
+only the repo onboarding phase directly, use:
 
 ```sh
 fieldwork onboard <owner>/<repo> --with-approval-gate
