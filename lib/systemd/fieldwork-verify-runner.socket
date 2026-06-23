@@ -13,9 +13,9 @@ Description=Fieldwork verify runner socket
 ListenStream=%t/fieldwork-verify.sock
 SocketMode=0600
 Accept=yes
-# Cap per-instance concurrency. Verify pipelines are heavy (npm test, semgrep)
-# so two in flight is plenty for one agent host; a third connection waits.
-MaxConnections=2
+# Cap per-instance concurrency. Verify pipelines are heavy (npm test, semgrep);
+# four lets small capacity bumps work without turning one VPS into a test farm.
+MaxConnections=4
 
 [Install]
 WantedBy=default.target

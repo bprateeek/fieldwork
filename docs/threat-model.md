@@ -65,8 +65,10 @@ The agent cannot, by Fieldwork design:
 Claude and Codex have different process lifecycles in this developer preview.
 
 Claude is launched by Fieldwork through `fieldwork-agent@<slug>.service` and
-`claude remote-control --sandbox --spawn=worktree --capacity=1`. Fieldwork owns
-the service lifecycle, and Claude work happens in per-task worktrees.
+`claude remote-control --sandbox --spawn=worktree --capacity=<N>`. Fieldwork
+owns the service lifecycle, and Claude work happens in per-task worktrees. The
+capacity value defaults to `2` and is bounded by non-secret
+`~/.fieldwork/agent.conf` config parsed by `fieldwork-agent-session`.
 
 Codex is launched by the official Codex Desktop app over SSH as the `fieldwork`
 Linux user. Fieldwork does not wrap the `codex` binary or run a Codex systemd
@@ -117,7 +119,8 @@ Defenses:
 - current `origin` must match `.fieldwork/expected-origin`.
 - worktree must be clean.
 - PR body is scanned by gitleaks.
-- in-memory per-repo rate limit.
+- in-memory per-repo rate limit (`FIELDWORK_BROKER_RATE_LIMIT_PER_HOUR`,
+  default 12/hour, clamped to `1..120`).
 - Git push uses `GIT_ASKPASS`; token is not passed in git argv.
 - `gh pr create` gets `GH_TOKEN` only in the broker process environment.
 

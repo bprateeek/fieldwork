@@ -1122,8 +1122,8 @@ if agent_enabled claude; then
     "Enable Claude remote control for Fieldwork session vps-$SLUG." \
     "" \
     "Answer y if asked. Fieldwork already sets isolated worktrees; stop with Ctrl-C after the URL/session appears." \
-    "cd $REMOTE_REPO_DIR && ~/.local/bin/claude remote-control --name 'vps-$SLUG' --remote-control-session-name-prefix 'vps-$SLUG' --sandbox --spawn=worktree --capacity=1" \
-    "ssh -t $SSH_HOST 'cd $REMOTE_REPO_DIR && ~/.local/bin/claude remote-control --name vps-$SLUG --remote-control-session-name-prefix vps-$SLUG --sandbox --spawn=worktree --capacity=1'"
+    "cd $REMOTE_REPO_DIR && ~/.local/bin/claude remote-control --name 'vps-$SLUG' --remote-control-session-name-prefix 'vps-$SLUG' --sandbox --spawn=worktree --capacity=2" \
+    "ssh -t $SSH_HOST 'cd $REMOTE_REPO_DIR && ~/.local/bin/claude remote-control --name vps-$SLUG --remote-control-session-name-prefix vps-$SLUG --sandbox --spawn=worktree --capacity=2'"
 fi
 
 phase_section "Initialization PR"

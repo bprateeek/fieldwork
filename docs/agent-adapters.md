@@ -87,6 +87,17 @@ The adapter receives exactly two positional arguments (`<slug>`, `<repo-dir>`)
 and inherits the agent user's environment plus `FIELDWORK_*` variables set by
 the session wrapper. There is no other implicit input.
 
+`fieldwork-agent-session` also reads non-secret capacity config from
+`~/.fieldwork/agent.conf`:
+
+```text
+capacity=3
+```
+
+The value is parsed as plain `key=value`, never sourced as shell, defaults to
+`2`, and is clamped to `1..4`. The validated value is exported to adapters as
+`FIELDWORK_AGENT_CAPACITY`.
+
 ## Adding a new adapter: checklist
 
 A PR adding an adapter should include:
@@ -123,12 +134,13 @@ the minimum viable adapter:
 exec "$HOME/.local/bin/claude" remote-control \
   --name "vps-$slug" \
   --remote-control-session-name-prefix "vps-$slug" \
-  --sandbox --spawn=worktree --capacity=1
+  --sandbox --spawn=worktree --capacity="$FIELDWORK_AGENT_CAPACITY"
 ```
 
 That is the entire adapter. The Claude binary is the long-running foreground
 process; the slug becomes the remote-control instance name; sandbox/worktree
-flags constrain Claude to a fresh worktree per task and one concurrent task.
+flags constrain Claude to a fresh worktree per task, while
+`FIELDWORK_AGENT_CAPACITY` bounds concurrent tasks for that repo service.
 Branch prefix and hook skipping are handled by the surrounding Fieldwork
 infrastructure, not the adapter.
 

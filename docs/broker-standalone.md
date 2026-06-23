@@ -172,9 +172,10 @@ client is the smallest correct implementation worth copying.
   reasons. **Does not include the PAT.**
 - **Replay ledger:** `/var/lib/fieldwork-pr-broker/requests/<request_id>.json`,
   one file per accepted request, mode 0600.
-- **Rate limit:** 6 PRs per hour per `owner/repo`, in-memory; resets on broker
-  restart. Adjust by editing `RATE_LIMIT_PER_HOUR` in
-  `/usr/local/lib/fieldwork-pr-broker/server.py` and restarting the service.
+- **Rate limit:** 12 PRs per hour per `owner/repo`, in-memory; resets on broker
+  restart. Adjust with `FIELDWORK_BROKER_RATE_LIMIT_PER_HOUR` in the broker
+  service environment. Bad values fall back to the default; values are clamped
+  to `1..120`.
 - **PAT rotation:** `sudo /usr/local/sbin/rotate-pat` prompts for the new PAT
   and writes it atomically; the broker re-reads on the next request.
 - **Re-install:** `lib/broker/standalone-install.sh` is idempotent; rerun it

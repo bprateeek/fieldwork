@@ -35,6 +35,23 @@ import time
 import uuid
 from pathlib import Path
 
+
+def bounded_env_int(name: str, default: int, minimum: int | None = None, maximum: int | None = None) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        value = default
+    else:
+        try:
+            value = int(raw)
+        except ValueError:
+            value = default
+    if minimum is not None and value < minimum:
+        value = minimum
+    if maximum is not None and value > maximum:
+        value = maximum
+    return value
+
+
 LOG_PATH = os.environ.get("FIELDWORK_BROKER_LOG_PATH", "/var/log/fieldwork-pr-broker.log")
 TOKEN_PATH = os.environ.get("FIELDWORK_BROKER_TOKEN_PATH", "/etc/fieldwork-pr-broker/gh-token")
 ASKPASS_PATH = os.environ.get("FIELDWORK_BROKER_ASKPASS_PATH", "/usr/local/lib/fieldwork-pr-broker/git-askpass")
@@ -75,7 +92,7 @@ APPROVE_SOCKET_PATH = os.environ.get(
     "FIELDWORK_BROKER_APPROVE_SOCKET_PATH",
     "/run/fieldwork-pr-broker/fieldwork-pr-approve.sock",
 )
-RATE_LIMIT_PER_HOUR = 6
+RATE_LIMIT_PER_HOUR = bounded_env_int("FIELDWORK_BROKER_RATE_LIMIT_PER_HOUR", 12, minimum=1, maximum=120)
 # Branch prefix the broker will accept. Agents commit under <prefix>/... ; the
 # broker refuses anything else (including the default branch).
 BRANCH_PREFIX = os.environ.get("FIELDWORK_BROKER_BRANCH_PREFIX", "fieldwork")

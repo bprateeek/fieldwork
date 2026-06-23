@@ -32,6 +32,54 @@ repo_dir="$HOME/projects/$slug"
 # Branch prefix the agent commits under; the broker enforces the same prefix.
 export FIELDWORK_BRANCH_PREFIX="${FIELDWORK_BRANCH_PREFIX:-fieldwork}"
 
+FIELDWORK_AGENT_CAPACITY_DEFAULT=2
+FIELDWORK_AGENT_CAPACITY_MAX=4
+
+fieldwork_agent_capacity_from_file() {
+  local config="$HOME/.fieldwork/agent.conf"
+  [ -f "$config" ] || return 1
+  awk '
+    /^[[:space:]]*($|#)/ { next }
+    /^[[:space:]]*capacity[[:space:]]*=/ {
+      sub(/^[^=]*=/, "")
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "")
+      print
+      exit
+    }
+  ' "$config"
+}
+
+fieldwork_agent_capacity_normalize() {
+  local raw="${1:-}"
+  local default="$FIELDWORK_AGENT_CAPACITY_DEFAULT"
+  local max="${FIELDWORK_AGENT_CAPACITY_MAX:-4}"
+  case "$max" in ''|*[!0-9]*) max=4 ;; esac
+  [ "$max" -ge 1 ] 2>/dev/null || max=4
+  case "$raw" in
+    '') printf '%s\n' "$default"; return 0 ;;
+    *[!0-9]*)
+      echo "[fieldwork-agent-session] invalid capacity '$raw'; using $default" >&2
+      printf '%s\n' "$default"
+      return 0
+      ;;
+  esac
+  if [ "$raw" -lt 1 ] 2>/dev/null; then
+    printf '1\n'
+  elif [ "$raw" -gt "$max" ] 2>/dev/null; then
+    echo "[fieldwork-agent-session] capacity $raw exceeds max $max; using $max" >&2
+    printf '%s\n' "$max"
+  else
+    printf '%s\n' "$raw"
+  fi
+}
+
+capacity_raw="${FIELDWORK_AGENT_CAPACITY:-}"
+if [ -z "$capacity_raw" ]; then
+  capacity_raw="$(fieldwork_agent_capacity_from_file 2>/dev/null || true)"
+fi
+FIELDWORK_AGENT_CAPACITY="$(fieldwork_agent_capacity_normalize "$capacity_raw")"
+export FIELDWORK_AGENT_CAPACITY
+
 # While the checkout sits on the onboarding init branch the init PR has not
 # been merged: serving sessions here would dirty the main checkout and base
 # PRs on the init branch. Exit 0 so Restart=on-failure does not crash-loop;

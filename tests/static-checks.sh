@@ -208,6 +208,8 @@ echo "[checks] pr-prepare runner unit hardening"
 grep -Fxq "SocketMode=0600" "$ROOT/lib/systemd/fieldwork-pr-prepare-runner.socket"
 grep -Fxq "Accept=yes"      "$ROOT/lib/systemd/fieldwork-pr-prepare-runner.socket"
 grep -Fxq "ListenStream=%t/fieldwork-pr-prepare.sock" "$ROOT/lib/systemd/fieldwork-pr-prepare-runner.socket"
+grep -Fxq "MaxConnections=4" "$ROOT/lib/systemd/fieldwork-pr-prepare-runner.socket"
+grep -Fxq "MaxConnections=4" "$ROOT/lib/systemd/fieldwork-verify-runner.socket"
 # Service: explicitly NO NoNewPrivileges=true (only the explanatory comment).
 if grep -E '^\s*NoNewPrivileges\s*=\s*true' "$ROOT/lib/systemd/fieldwork-pr-prepare-runner@.service" >/dev/null; then
   echo "fieldwork-pr-prepare-runner@.service must not set NoNewPrivileges=true (see comment in unit)" >&2
@@ -3673,9 +3675,12 @@ grep -q "Mark .* complete" "$ROOT/lib/scripts/fieldwork-onboard"
 grep -q "manual_step_marker_exists" "$ROOT/lib/scripts/fieldwork-onboard"
 grep -q "remote_service_active" "$ROOT/lib/scripts/fieldwork-onboard"
 grep -q "Claude may take a moment to draw its UI" "$ROOT/lib/scripts/fieldwork-onboard"
-grep -q -- "--name 'vps-\$SLUG' --remote-control-session-name-prefix 'vps-\$SLUG' --sandbox --spawn=worktree --capacity=1" "$ROOT/lib/scripts/fieldwork-onboard"
+grep -q -- "--name 'vps-\$SLUG' --remote-control-session-name-prefix 'vps-\$SLUG' --sandbox --spawn=worktree --capacity=2" "$ROOT/lib/scripts/fieldwork-onboard"
 grep -q "CLAUDE_REMOTE_CONTROL_SESSION_NAME_PREFIX" "$ROOT/lib/agents/claude-remote-control"
 grep -q -- "--remote-control-session-name-prefix" "$ROOT/lib/agents/claude-remote-control"
+grep -q 'FIELDWORK_AGENT_CAPACITY_DEFAULT=2' "$ROOT/lib/scripts/fieldwork-agent-session"
+grep -q 'FIELDWORK_AGENT_CAPACITY_MAX=4' "$ROOT/lib/scripts/fieldwork-agent-session"
+grep -q 'FIELDWORK_AGENT_CAPACITY' "$ROOT/lib/agents/claude-remote-control"
 if grep -q "pick 2 for worktree" "$ROOT/lib/scripts/fieldwork-onboard"; then
   echo "remote-control consent should preselect worktree mode instead of asking users to choose 2" >&2
   exit 1
@@ -4805,9 +4810,19 @@ printf '%s\n' "$gate_err" | grep -q "refusing to serve sessions from the init br
 printf '%s\n' "$gate_err" | grep -q "fieldwork refresh smoke"
 git -C "$gate_home/projects/smoke" checkout -q -
 mkdir -p "$gate_home/.fieldwork/infra/agents"
-printf '#!/usr/bin/env bash\necho ADAPTER_RAN "$@"\n' > "$gate_home/.fieldwork/infra/agents/claude-remote-control"
+printf '#!/usr/bin/env bash\necho ADAPTER_RAN "$@" capacity="$FIELDWORK_AGENT_CAPACITY"\n' > "$gate_home/.fieldwork/infra/agents/claude-remote-control"
 chmod +x "$gate_home/.fieldwork/infra/agents/claude-remote-control"
-HOME="$gate_home" "$ROOT/lib/scripts/fieldwork-agent-session" smoke | grep -q "ADAPTER_RAN smoke"
+HOME="$gate_home" "$ROOT/lib/scripts/fieldwork-agent-session" smoke | grep -q "ADAPTER_RAN smoke .*capacity=2"
+printf 'capacity=9\n' > "$gate_home/.fieldwork/agent.conf"
+HOME="$gate_home" "$ROOT/lib/scripts/fieldwork-agent-session" smoke | grep -q "ADAPTER_RAN smoke .*capacity=4"
+
+echo "[checks] bounded capacity and rate-limit docs"
+grep -q 'FIELDWORK_BROKER_RATE_LIMIT_PER_HOUR' "$ROOT/lib/broker/server.py"
+grep -q 'bounded_env_int("FIELDWORK_BROKER_RATE_LIMIT_PER_HOUR", 12, minimum=1, maximum=120)' "$ROOT/lib/broker/server.py"
+grep -q '`~/.fieldwork/agent.conf`' "$ROOT/docs/agent-adapters.md"
+grep -q 'clamped to `1..4`' "$ROOT/docs/agent-adapters.md"
+grep -q '12 PRs per hour' "$ROOT/docs/broker-standalone.md"
+grep -q 'MaxConnections=4' "$ROOT/docs/runner-architecture.md"
 
 echo "[checks] cage flow string pins"
 # the gate marker is greped by onboard's remote-service check; keep them in sync
