@@ -59,6 +59,7 @@ Common forms:
 ```sh
 fieldwork quickstart --agent codex
 fieldwork quickstart <owner>/<repo> --agent codex --with-approval-gate
+fieldwork quickstart <owner>/<repo> --dry-run
 fieldwork quickstart <owner>/<repo> --status
 ```
 
@@ -74,6 +75,7 @@ Flags:
 | `--no-workflows` | Passed to `fieldwork onboard`. Requires `<owner/repo>`. |
 | `--with-approval-gate` | Passed to `fieldwork onboard`. Requires `<owner/repo>`. |
 | `--reseed-templates` | Passed to `fieldwork onboard`. Requires `<owner/repo>`. |
+| `--dry-run` | Run a read-only doctor preflight for quickstart without setup, onboarding, or ledger writes. |
 | `--status` | Print quickstart phase state without running setup or onboarding. |
 | `--reset-state` | Remove quickstart's local phase ledger before continuing. |
 

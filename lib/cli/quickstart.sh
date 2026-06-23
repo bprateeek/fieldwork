@@ -9,7 +9,8 @@ usage: fieldwork quickstart [owner/repo] [options]
 Resumable public first-run path. It runs the existing setup flow, records setup
 completion under ~/.config/fieldwork/quickstart/, and when owner/repo is supplied
 runs the existing onboarding flow. Completed quickstart phases are skipped on
-later runs unless --reset-state is used.
+later runs unless --reset-state is used. Use --dry-run to report remaining
+friction through doctor without running setup or onboarding.
 
 Options:
   --agent claude|codex|both   pass through to setup
@@ -20,6 +21,7 @@ Options:
   --no-workflows              pass through to onboard
   --with-approval-gate        pass through to onboard
   --reseed-templates          pass through to onboard
+  --dry-run                   read-only preflight; do not mutate or update ledgers
   --status                    show quickstart phase state without changing it
   --reset-state               remove quickstart's phase ledger before running
 EOF
@@ -94,6 +96,49 @@ quickstart_print_status() {
   fi
 }
 
+quickstart_preflight() {
+  local owner_repo="$1" setup_ledger="$2" onboard_ledger="${3:-}"
+  local repo_slug="" doctor_status=0
+
+  if [ -n "$owner_repo" ]; then
+    repo_slug="${owner_repo#*/}"
+    valid_slug "$repo_slug" || { echo "invalid Fieldwork repo slug for doctor preflight: $repo_slug" >&2; return 2; }
+  fi
+
+  phase_section "Quickstart dry run"
+  info_row "mutations" "none"
+  info_row "setup ledger" "$setup_ledger"
+  info_row "setup" "$(quickstart_phase_label "$setup_ledger" setup)"
+  if [ -n "$owner_repo" ]; then
+    info_row "repo" "$owner_repo"
+    info_row "repo slug" "$repo_slug"
+    info_row "onboard ledger" "$onboard_ledger"
+    info_row "onboard" "$(quickstart_phase_label "$onboard_ledger" onboard)"
+  else
+    info_row "onboard" "not requested"
+  fi
+  status_info_line "running doctor preflight; setup and onboarding will not run"
+
+  set +e
+  if [ -n "$repo_slug" ]; then
+    doctor --remote "$repo_slug" --explain
+    doctor_status=$?
+  else
+    doctor --remote --explain
+    doctor_status=$?
+  fi
+  set -e
+
+  echo
+  label_line "Dry run result"
+  if [ "$doctor_status" = "0" ]; then
+    echo "  quickstart has no blocking doctor findings for the requested scope"
+  else
+    echo "  quickstart would stop at the doctor finding above"
+  fi
+  return "$doctor_status"
+}
+
 quickstart_run_onboard() {
   local control_path="" control_persist=""
   if fieldwork_ssh_prepare_mux; then
@@ -113,6 +158,7 @@ quickstart_run_onboard() {
 
 quickstart_fieldwork() {
   local owner_repo=""
+  local dry_run=0
   local show_status=0
   local reset_state=0
   local setup_ledger onboard_ledger
@@ -127,6 +173,10 @@ quickstart_fieldwork() {
         ;;
       --status)
         show_status=1
+        shift
+        ;;
+      --dry-run)
+        dry_run=1
         shift
         ;;
       --reset-state)
@@ -182,6 +232,15 @@ quickstart_fieldwork() {
   fi
   setup_ledger="$(quickstart_ledger_path setup)"
 
+  if [ "$dry_run" = "1" ] && [ "$reset_state" = "1" ]; then
+    echo "quickstart --dry-run cannot be combined with --reset-state" >&2
+    return 2
+  fi
+  if [ "$dry_run" = "1" ] && [ "$show_status" = "1" ]; then
+    echo "quickstart --dry-run cannot be combined with --status" >&2
+    return 2
+  fi
+
   if [ "$reset_state" = "1" ]; then
     quickstart_reset_ledger "$setup_ledger"
     [ -z "$onboard_ledger" ] || quickstart_reset_ledger "$onboard_ledger"
@@ -190,6 +249,11 @@ quickstart_fieldwork() {
   if [ "$show_status" = "1" ]; then
     quickstart_print_status "$owner_repo" "$setup_ledger" "$onboard_ledger"
     return 0
+  fi
+
+  if [ "$dry_run" = "1" ]; then
+    quickstart_preflight "$owner_repo" "$setup_ledger" "$onboard_ledger"
+    return $?
   fi
 
   phase_section "Quickstart"

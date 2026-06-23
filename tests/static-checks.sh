@@ -1554,6 +1554,7 @@ grep -q "main first-run entrypoint" ${TMPDIR:-/tmp}/fieldwork-setup-help.out
 echo "[checks] quickstart help and resume ledger"
 "$ROOT/bin/fieldwork" quickstart --help >${TMPDIR:-/tmp}/fieldwork-quickstart-help.out
 grep -q "usage: fieldwork quickstart" ${TMPDIR:-/tmp}/fieldwork-quickstart-help.out
+grep -q -- "--dry-run" ${TMPDIR:-/tmp}/fieldwork-quickstart-help.out
 grep -q -- "--status" ${TMPDIR:-/tmp}/fieldwork-quickstart-help.out
 grep -q -- "--reset-state" ${TMPDIR:-/tmp}/fieldwork-quickstart-help.out
 tmp_quickstart_home="$(mktemp_dir)"
@@ -1570,12 +1571,17 @@ phase_section() { echo "$1"; }
 info_row() { printf '%s=%s\n' "$1" "$2"; }
 setup_status_line() { printf '%s:%s\n' "$1" "$2"; }
 status_ok_line() { printf 'ok:%s\n' "$1"; }
+status_info_line() { printf 'info:%s\n' "$1"; }
 label_line() { printf '%s:\n' "$1"; }
 valid_owner_repo() { case "$1" in */*) return 0 ;; *) return 1 ;; esac; }
+valid_slug() { case "$1" in repo) return 0 ;; *) return 1 ;; esac; }
 setup_calls=0
 onboard_calls=0
+doctor_calls=0
+doctor_return=0
 seen_setup_args=""
 seen_onboard_args=""
+seen_doctor_args=""
 setup_fieldwork() {
   setup_calls=$((setup_calls + 1))
   seen_setup_args="$*"
@@ -1584,6 +1590,11 @@ source "$ROOT/lib/cli/quickstart.sh"
 quickstart_run_onboard() {
   onboard_calls=$((onboard_calls + 1))
   seen_onboard_args="$*"
+}
+doctor() {
+  doctor_calls=$((doctor_calls + 1))
+  seen_doctor_args="$*"
+  return "$doctor_return"
 }
 quickstart_fieldwork owner/repo --yes --agent codex --no-workflows --with-approval-gate --branch fieldwork/init
 quickstart_fieldwork owner/repo --yes --agent codex --no-workflows --with-approval-gate --branch fieldwork/init
@@ -1612,9 +1623,22 @@ test -f "$onboard_ledger"
 grep -q '^setup=done$' "$setup_ledger"
 grep -q '^onboard=done$' "$onboard_ledger"
 quickstart_fieldwork owner/repo --status
+doctor_return=7
+if quickstart_fieldwork owner/repo --dry-run --agent codex --with-approval-gate; then
+  echo "quickstart dry run unexpectedly succeeded"
+  exit 1
+else
+  [ "$?" = "7" ]
+fi
+[ "$setup_calls" = "1" ]
+[ "$onboard_calls" = "1" ]
+[ "$doctor_calls" = "1" ]
+[ "$seen_doctor_args" = "--remote repo --explain" ]
 SH
 grep -q "setup phase already completed" ${TMPDIR:-/tmp}/fieldwork-quickstart-resume.out
 grep -q "onboarding phase already completed" ${TMPDIR:-/tmp}/fieldwork-quickstart-resume.out
+grep -q "running doctor preflight" ${TMPDIR:-/tmp}/fieldwork-quickstart-resume.out
+grep -q "quickstart would stop at the doctor finding above" ${TMPDIR:-/tmp}/fieldwork-quickstart-resume.out
 grep -q "setup=done" ${TMPDIR:-/tmp}/fieldwork-quickstart-resume.out
 grep -q 'label_line "Next action"' "$ROOT/bin/fieldwork"
 
@@ -3773,7 +3797,9 @@ grep -q 'Available from signed-in devices' "$ROOT/docs/quickstart.md"
 grep -q 'configured VPS SSH' "$ROOT/docs/quickstart.md"
 grep -q 'may display as the server name' "$ROOT/docs/quickstart.md"
 grep -q "fieldwork quickstart <owner>/<repo>" "$ROOT/docs/quickstart.md"
+grep -q "fieldwork quickstart <owner>/<repo> --dry-run" "$ROOT/docs/quickstart.md"
 grep -q "fieldwork quickstart" "$ROOT/docs/cli-reference.md"
+grep -q "read-only doctor preflight" "$ROOT/docs/cli-reference.md"
 if grep -q 'phase_section "Manual checkpoints"' "$ROOT/lib/scripts/fieldwork-onboard"; then
   echo "onboard should not dump a separate manual-checkpoints phase" >&2
   exit 1
@@ -3954,6 +3980,11 @@ if "$ROOT/bin/fieldwork" quickstart --wat >${TMPDIR:-/tmp}/fieldwork-invalid-qui
   exit 1
 fi
 grep -q "unknown quickstart argument" ${TMPDIR:-/tmp}/fieldwork-invalid-quickstart.out
+if "$ROOT/bin/fieldwork" quickstart --dry-run --reset-state >${TMPDIR:-/tmp}/fieldwork-invalid-quickstart-dry-reset.out 2>&1; then
+  echo "quickstart --dry-run --reset-state unexpectedly succeeded" >&2
+  exit 1
+fi
+grep -q "cannot be combined with --reset-state" ${TMPDIR:-/tmp}/fieldwork-invalid-quickstart-dry-reset.out
 if "$ROOT/bin/fieldwork" setup --wat >${TMPDIR:-/tmp}/fieldwork-invalid-setup.out 2>&1; then
   echo "invalid setup argument unexpectedly succeeded" >&2
   exit 1
