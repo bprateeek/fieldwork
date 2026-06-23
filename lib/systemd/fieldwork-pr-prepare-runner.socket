@@ -15,10 +15,9 @@ Description=Fieldwork PR-prepare runner socket
 ListenStream=%t/fieldwork-pr-prepare.sock
 SocketMode=0600
 Accept=yes
-# A prepare is short (one git checkout + add + commit), so cap concurrency
-# low. The skill issues one prepare per /pr-delivery, so two-in-flight is
-# already paranoid.
-MaxConnections=2
+# A prepare is short (one git checkout + add + commit), so allow enough
+# concurrency for the bounded agent capacity while still capping fan-out.
+MaxConnections=4
 
 [Install]
 WantedBy=default.target

@@ -230,7 +230,7 @@ fieldwork-<role>-runner.socket
   ListenStream=%t/fieldwork-<role>.sock
   SocketMode=0600
   Accept=yes
-  MaxConnections=2
+  MaxConnections=4
 
 fieldwork-<role>-runner@.service
   ExecStart=%h/.local/bin/fieldwork-<role>-runner
@@ -240,6 +240,11 @@ fieldwork-<role>-runner@.service
 ```
 
 The per-connection service files intentionally do not set `NoNewPrivileges=true`. The whole point is to run outside the agent's NNP/userns context. The boundary is socket ownership plus request validation.
+
+`MaxConnections=4` is intentionally small: it keeps bounded agent capacity from
+silently queueing at two connections while still limiting verify/prepare fan-out
+on a single VPS. Heavy verify pipelines may need a VPS with at least 4 GB RAM
+when capacity is raised.
 
 ## AppArmor And bwrap
 

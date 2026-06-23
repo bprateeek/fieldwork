@@ -322,6 +322,35 @@ class BrokerValidationTests(unittest.TestCase):
         self.assertEqual(ctx.exception.status, 429)
         self.assertIn("rate limit hit", ctx.exception.message)
 
+    def test_rate_limit_env_int_is_bounded(self) -> None:
+        old = os.environ.get("FIELDWORK_BROKER_RATE_LIMIT_PER_HOUR")
+        try:
+            os.environ["FIELDWORK_BROKER_RATE_LIMIT_PER_HOUR"] = "9"
+            self.assertEqual(
+                self.server.bounded_env_int("FIELDWORK_BROKER_RATE_LIMIT_PER_HOUR", 12, minimum=1, maximum=120),
+                9,
+            )
+            os.environ["FIELDWORK_BROKER_RATE_LIMIT_PER_HOUR"] = "bad"
+            self.assertEqual(
+                self.server.bounded_env_int("FIELDWORK_BROKER_RATE_LIMIT_PER_HOUR", 12, minimum=1, maximum=120),
+                12,
+            )
+            os.environ["FIELDWORK_BROKER_RATE_LIMIT_PER_HOUR"] = "0"
+            self.assertEqual(
+                self.server.bounded_env_int("FIELDWORK_BROKER_RATE_LIMIT_PER_HOUR", 12, minimum=1, maximum=120),
+                1,
+            )
+            os.environ["FIELDWORK_BROKER_RATE_LIMIT_PER_HOUR"] = "999"
+            self.assertEqual(
+                self.server.bounded_env_int("FIELDWORK_BROKER_RATE_LIMIT_PER_HOUR", 12, minimum=1, maximum=120),
+                120,
+            )
+        finally:
+            if old is None:
+                os.environ.pop("FIELDWORK_BROKER_RATE_LIMIT_PER_HOUR", None)
+            else:
+                os.environ["FIELDWORK_BROKER_RATE_LIMIT_PER_HOUR"] = old
+
     def test_workflow_push_error_is_actionable(self) -> None:
         err = subprocess.CalledProcessError(
             1,

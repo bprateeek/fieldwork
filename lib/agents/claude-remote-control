@@ -22,9 +22,13 @@ set -euo pipefail
 
 slug="${1:?agent adapter requires a repo slug}"
 session_name="vps-$slug"
+capacity="${FIELDWORK_AGENT_CAPACITY:-2}"
+case "$capacity" in
+  ''|*[!0-9]*) capacity=2 ;;
+esac
 
 export CLAUDE_REMOTE_CONTROL_SESSION_NAME_PREFIX="$session_name"
 exec "$HOME/.local/bin/claude" remote-control \
   --name "$session_name" \
   --remote-control-session-name-prefix "$session_name" \
-  --sandbox --spawn=worktree --capacity=1
+  --sandbox --spawn=worktree --capacity="$capacity"
