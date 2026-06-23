@@ -6,6 +6,7 @@ After=fieldwork-pr-broker.socket fieldwork-pr-approve.socket network-online.targ
 [Service]
 User=fieldwork-pr-broker
 Group=fieldwork-pr-broker
+Environment=FIELDWORK_BROKER_AUDIT_READ_USER=fieldwork
 Sockets=fieldwork-pr-broker.socket fieldwork-pr-approve.socket
 ExecStart=/usr/bin/python3 /usr/local/lib/fieldwork-pr-broker/server.py
 Restart=on-failure

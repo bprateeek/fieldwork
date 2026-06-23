@@ -185,6 +185,8 @@ See [approval-gate.md](approval-gate.md).
 
 The agent service does not load notification secrets into its environment. Hooks call wrapper scripts that load notification config at execution time. The Telegram bot token is owned by `fieldwork-bot`; the broker PAT is owned by `fieldwork-pr-broker`.
 
+The agent/dashboard user gets direct read ACL access to the broker audit log only. It does not join `fieldwork-bot`, cannot enter `pending/` or `requests/`, and cannot call the approve socket. The notifications directory is a deliberate drop path: the agent may write outbound notification files, the bot may read/delete them, and the broker may write lifecycle drops via a direct ACL.
+
 ## Telemetry And Outbound Calls
 
 Fieldwork has no Fieldwork-operated telemetry. Outbound calls are limited to

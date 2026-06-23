@@ -658,6 +658,48 @@ class BrokerValidationTests(unittest.TestCase):
         # The label call was still attempted.
         self.assertTrue(any(c[:3] == ["gh", "pr", "edit"] for c in calls))
 
+    def test_notify_lifecycle_writes_versioned_envelope(self) -> None:
+        notifications = self.tmp / "notifications"
+        notifications.mkdir(exist_ok=True)
+        for item in notifications.glob("*"):
+            item.unlink()
+        saved = (
+            self.server.NOTIFICATIONS_DIR,
+            self.server.NOTIFY_LIFECYCLE_RAW,
+            self.server.NOTIFY_ON_PR_OPENED,
+        )
+        self.server.NOTIFICATIONS_DIR = str(notifications)
+        self.server.NOTIFY_LIFECYCLE_RAW = "1"
+        self.server.NOTIFY_ON_PR_OPENED = False
+        try:
+            self.server.notify_lifecycle(
+                "request_queued",
+                repo_slug_value="fieldwork-smoke",
+                request_id="11111111-1111-4111-8111-111111111111",
+                branch="fieldwork/test",
+            )
+        finally:
+            (
+                self.server.NOTIFICATIONS_DIR,
+                self.server.NOTIFY_LIFECYCLE_RAW,
+                self.server.NOTIFY_ON_PR_OPENED,
+            ) = saved
+
+        drops = list(notifications.glob("*.json"))
+        self.assertEqual(len(drops), 1)
+        payload = json.loads(drops[0].read_text())
+        self.assertEqual(payload["schema"], 1)
+        self.assertEqual(payload["kind"], "broker_lifecycle")
+        self.assertEqual(payload["source"], "broker")
+        self.assertEqual(payload["event"], "request_queued")
+        self.assertEqual(payload["repo_slug"], "fieldwork-smoke")
+        self.assertEqual(payload["request_id"], "11111111-1111-4111-8111-111111111111")
+        self.assertEqual(payload["branch"], "fieldwork/test")
+        self.assertIn("dedupe_key", payload)
+        rendered = json.dumps(payload)
+        self.assertNotIn("github_pat_", rendered)
+        self.assertNotIn("ghp_", rendered)
+
     def test_runs_with_neutral_user_and_arbitrary_projects_root(self) -> None:
         # The whole test class already runs the broker module with a tmpdir
         # projects root and no privileged identities. This is the standalone
@@ -719,6 +761,8 @@ class AuditLogRotationTests(unittest.TestCase):
             (tmp / "audit.jsonl.3").exists(),
             "backups must be capped at AUDIT_LOG_BACKUPS",
         )
+        self.assertEqual(audit.stat().st_mode & 0o777, 0o640)
+        self.assertEqual((tmp / "audit.jsonl.1").stat().st_mode & 0o777, 0o640)
 
 
 if __name__ == "__main__":

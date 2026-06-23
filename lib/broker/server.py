@@ -44,6 +44,7 @@ AUDIT_LOG_PATH = os.environ.get(
     "FIELDWORK_BROKER_AUDIT_LOG_PATH",
     "/var/lib/fieldwork-pr-broker/audit.jsonl",
 )
+AUDIT_READ_USER = os.environ.get("FIELDWORK_BROKER_AUDIT_READ_USER", "fieldwork").strip()
 AUDIT_LOG_MAX_BYTES = int(
     os.environ.get("FIELDWORK_BROKER_AUDIT_LOG_MAX_BYTES", str(10 * 1024 * 1024))
 )
@@ -57,17 +58,16 @@ PENDING_EXPIRY_SECONDS = int(os.environ.get("FIELDWORK_BROKER_PENDING_EXPIRY", "
 # Best-effort chown. Failure is logged and ignored so the broker still starts
 # on hosts where the bot has not been installed yet.
 BOT_GROUP = os.environ.get("FIELDWORK_BROKER_BOT_GROUP", "fieldwork-bot")
-# Optional: drop a "PR opened" message into the bot's notifications dir after
-# a successful approve+push, so the operator sees the URL in the same channel
-# as the original approval prompt. Default off because the bot already edits
-# the approval message in place to "✅ Approved by @x: <url>", so an extra
-# drop would duplicate when both prompts go to the same chat. Flip on when
-# the approval chat and the notifications-fallback chat are distinct.
+# Optional broker lifecycle drops into the bot's notifications dir. Default
+# off because approval decisions already edit the original Telegram prompt;
+# enable a conservative event set with FIELDWORK_BROKER_NOTIFY_LIFECYCLE=1.
 NOTIFICATIONS_DIR = os.environ.get(
     "FIELDWORK_BROKER_NOTIFICATIONS_DIR",
     "/var/lib/fieldwork-pr-broker/notifications",
 )
+NOTIFY_LIFECYCLE_RAW = os.environ.get("FIELDWORK_BROKER_NOTIFY_LIFECYCLE", "").strip()
 NOTIFY_ON_PR_OPENED = os.environ.get("FIELDWORK_BROKER_NOTIFY_ON_PR_OPENED", "0") == "1"
+NOTIFICATION_SCHEMA = 1
 # Approve-socket path used to identify the second systemd-passed listening
 # socket. Connections on any other listening socket are treated as agent
 # requests and never see the /approve route.
@@ -110,6 +110,8 @@ log = logging.getLogger("fieldwork-pr-broker")
 
 _recent_requests: dict[str, list[float]] = {}
 _schema_cache: dict | None = None
+_setfacl_available: bool | None = None
+_audit_read_user_exists: bool | None = None
 
 
 class RequestError(Exception):
@@ -150,6 +152,65 @@ def repo_slug(repo_path: str | None) -> str | None:
         return None
 
 
+def _setfacl(path: Path, acl: str, *, default: bool = False) -> None:
+    """Best-effort POSIX ACL grant for audit/notification read contracts."""
+    global _setfacl_available
+    if not AUDIT_READ_USER:
+        return
+    if _setfacl_available is False:
+        return
+    cmd = ["setfacl"]
+    if default:
+        cmd.append("-d")
+    cmd.extend(["-m", acl, str(path)])
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        _setfacl_available = True
+    except FileNotFoundError:
+        _setfacl_available = False
+    except (OSError, subprocess.CalledProcessError):
+        log.debug("setfacl failed path=%s acl=%s default=%s", path, acl, default)
+
+
+def _audit_reader_exists() -> bool:
+    global _audit_read_user_exists
+    if not AUDIT_READ_USER:
+        return False
+    if _audit_read_user_exists is not None:
+        return _audit_read_user_exists
+    try:
+        subprocess.run(
+            ["id", "-u", AUDIT_READ_USER],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        _audit_read_user_exists = True
+    except (FileNotFoundError, OSError, subprocess.CalledProcessError):
+        _audit_read_user_exists = False
+    return _audit_read_user_exists
+
+
+def _harden_audit_dir(path: Path) -> None:
+    if not _audit_reader_exists():
+        return
+    # The agent/dashboard user may traverse the broker state dir to the known
+    # audit path, but it must not gain list/read access to pending or requests.
+    _setfacl(path, f"u:{AUDIT_READ_USER}:--x")
+    # New audit.jsonl files created after rotation inherit read access; the
+    # explicit chmod/ACL pass below keeps existing files aligned too.
+    _setfacl(path, f"u:{AUDIT_READ_USER}:r--", default=True)
+
+
+def _harden_audit_file(path: Path) -> None:
+    try:
+        os.chmod(path, 0o640)
+    except OSError:
+        pass
+    if _audit_reader_exists():
+        _setfacl(path, f"u:{AUDIT_READ_USER}:r--")
+
+
 def audit_event(event: str, **fields: object) -> None:
     """Append a redacted broker audit event.
 
@@ -184,10 +245,12 @@ def audit_event(event: str, **fields: object) -> None:
     path = Path(AUDIT_LOG_PATH)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
+        _harden_audit_dir(path.parent)
         _rotate_audit_log(path)
         with open(path, "a") as f:
             json.dump(record, f, sort_keys=True)
             f.write("\n")
+        _harden_audit_file(path)
     except OSError as e:
         log.warning("audit write failed event=%s: %s", event, e)
 
@@ -215,6 +278,10 @@ def _rotate_audit_log(path: Path) -> None:
             if os.path.exists(src):
                 os.replace(src, f"{base}.{i + 1}")
         os.replace(base, f"{base}.1")
+        for i in range(1, AUDIT_LOG_BACKUPS + 1):
+            rotated = Path(f"{base}.{i}")
+            if rotated.exists():
+                _harden_audit_file(rotated)
     except OSError as e:
         log.warning("audit rotate failed: %s", e)
 
@@ -582,6 +649,85 @@ def _chgrp_best_effort(path: Path, group: str) -> None:
         log.info("pending chown to group %s failed: %s", group, e)
 
 
+def _notify_lifecycle_events() -> set[str]:
+    raw = NOTIFY_LIFECYCLE_RAW.lower()
+    if raw in ("", "0", "false", "no", "off"):
+        events: set[str] = set()
+    elif raw in ("1", "true", "yes", "on", "minimal"):
+        events = {"request_queued", "pr_opened"}
+    elif raw == "all":
+        events = {"request_queued", "request_approved", "request_denied", "pr_opened"}
+    else:
+        events = {part.strip() for part in raw.split(",") if part.strip()}
+    if NOTIFY_ON_PR_OPENED:
+        events.add("pr_opened")
+    return events
+
+
+def notify_lifecycle(
+    event: str,
+    *,
+    repo_slug_value: str | None = None,
+    request_id: str | None = None,
+    branch: str | None = None,
+    pr_url: str | None = None,
+    force: bool = False,
+) -> None:
+    """Best-effort broker lifecycle notification drop.
+
+    The bot accepts this versioned envelope and still accepts legacy
+    ``{"text": "..."}`` drops. Notification failure must not affect broker
+    request handling.
+    """
+    if not force and event not in _notify_lifecycle_events():
+        return
+    slug = repo_slug_value or "unknown"
+    if event == "pr_opened" and pr_url:
+        text = f"🚀 {slug} PR opened: {pr_url}"
+    elif event == "request_queued":
+        text = f"Approval queued: {slug} @ {branch or '?'}"
+    elif event == "request_approved":
+        text = f"Approval approved: {slug} @ {branch or '?'}"
+    elif event == "request_denied":
+        text = f"Approval denied: {slug} @ {branch or '?'}"
+    else:
+        text = f"{event}: {slug} @ {branch or '?'}"
+    dedupe_parts = [event, slug]
+    if request_id:
+        dedupe_parts.append(request_id)
+    elif branch:
+        dedupe_parts.append(branch)
+    dedupe_key = ":".join(dedupe_parts)
+    payload = {
+        "schema": NOTIFICATION_SCHEMA,
+        "kind": "broker_lifecycle",
+        "source": "broker",
+        "event": event,
+        "repo_slug": slug,
+        "request_id": request_id,
+        "branch": branch,
+        "dedupe_key": dedupe_key,
+        "text": text,
+    }
+    try:
+        out_dir = Path(NOTIFICATIONS_DIR)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        uid = uuid.uuid4().hex
+        tmp = out_dir / f".tmp-{uid}"
+        final = out_dir / f"{uid}.json"
+        with open(tmp, "w") as f:
+            json.dump(payload, f, sort_keys=True)
+            f.write("\n")
+        try:
+            os.chmod(tmp, 0o660)
+        except OSError:
+            pass
+        os.replace(tmp, final)
+        _chgrp_best_effort(final, BOT_GROUP)
+    except (OSError, ValueError) as e:
+        log.info("lifecycle notification drop failed event=%s: %s", event, e)
+
+
 def queue_pending(req: ValidatedRequest) -> str:
     """Write the validated request to the pending dir; returns expires_at (UTC).
 
@@ -800,6 +946,12 @@ def approve(req: object) -> dict:
             transport="approve-socket",
             decision="deny",
         )
+        notify_lifecycle(
+            "request_denied",
+            repo_slug_value=repo_slug(record.get("repo_path")),
+            request_id=request_id,
+            branch=record.get("branch") if isinstance(record.get("branch"), str) else None,
+        )
         remove_pending(request_id)
         return {"ok": True, "request_id": request_id, "decision": "deny"}
 
@@ -815,36 +967,26 @@ def approve(req: object) -> dict:
         transport="approve-socket",
         decision="approve",
     )
+    notify_lifecycle(
+        "request_approved",
+        repo_slug_value=repo_slug(validated.repo_path),
+        request_id=request_id,
+        branch=validated.branch,
+    )
     pr_url = push_and_open_pr(validated)
     log.info("rid=%s approved -> %s", request_id, pr_url)
     remove_pending(request_id)
-    if NOTIFY_ON_PR_OPENED:
-        drop_pr_opened_notification(validated.repo_path, pr_url)
     return {"ok": True, "request_id": request_id, "decision": "approve", "url": pr_url}
 
 
 def drop_pr_opened_notification(repo_path: str, pr_url: str) -> None:
-    """Best-effort: write a `{"text": "..."}` file into NOTIFICATIONS_DIR.
-
-    The bot's process_notifications_dir loop forwards anything dropped here
-    to all allowed_chat_ids. We never raise. A failure to notify must not
-    abort the approve response (the PR has already opened).
-    """
-    try:
-        slug = Path(repo_path).name
-        msg = f"🚀 {slug} PR opened: {pr_url}"
-        out_dir = Path(NOTIFICATIONS_DIR)
-        out_dir.mkdir(parents=True, exist_ok=True)
-        uid = uuid.uuid4().hex
-        tmp = out_dir / f".tmp-{uid}"
-        final = out_dir / f"{uid}.json"
-        with open(tmp, "w") as f:
-            json.dump({"text": msg}, f)
-            f.write("\n")
-        os.replace(tmp, final)
-        _chgrp_best_effort(final, BOT_GROUP)
-    except (OSError, ValueError) as e:
-        log.info("pr-opened notification drop failed: %s", e)
+    """Compatibility wrapper for the old PR-opened-only broker notifier."""
+    notify_lifecycle(
+        "pr_opened",
+        repo_slug_value=repo_slug(repo_path),
+        pr_url=pr_url,
+        force=True,
+    )
 
 
 def push_and_open_pr(req: ValidatedRequest) -> str:
@@ -891,6 +1033,13 @@ def push_and_open_pr(req: ValidatedRequest) -> str:
         base_branch=req.base_branch,
         actor="broker",
         transport="github",
+        pr_url=pr_url,
+    )
+    notify_lifecycle(
+        "pr_opened",
+        repo_slug_value=repo_slug(req.repo_path),
+        request_id=req.request_id,
+        branch=req.branch,
         pr_url=pr_url,
     )
 
@@ -1050,6 +1199,12 @@ def handle(conn: socket.socket, socket_type: str = "agent") -> None:
                     **audit_context,
                     status="queued",
                     expires_at=expires_at,
+                )
+                notify_lifecycle(
+                    "request_queued",
+                    repo_slug_value=repo_slug(validated.repo_path),
+                    request_id=request_id,
+                    branch=validated.branch,
                 )
                 resp = json.dumps({
                     "ok": True,

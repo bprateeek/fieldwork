@@ -58,11 +58,16 @@ HEALTH_PATH = os.environ.get(
     "FIELDWORK_BOT_HEALTH_PATH",
     "/var/lib/fieldwork-bot/bot-health.json",
 )
+DEDUPE_STORE_PATH = os.environ.get(
+    "FIELDWORK_BOT_DEDUPE_STORE_PATH",
+    "/var/lib/fieldwork-bot/notification-dedupe.json",
+)
 
 SCAN_INTERVAL_SECONDS = float(os.environ.get("FIELDWORK_BOT_SCAN_INTERVAL", "2"))
 POLL_TIMEOUT_SECONDS = int(os.environ.get("FIELDWORK_BOT_POLL_TIMEOUT", "30"))
 TELEGRAM_API = os.environ.get("FIELDWORK_BOT_TELEGRAM_API", "https://api.telegram.org")
 HEALTH_PENDING_LIMIT = int(os.environ.get("FIELDWORK_BOT_HEALTH_PENDING_LIMIT", "20"))
+DEDUPE_TTL_SECONDS = int(os.environ.get("FIELDWORK_BOT_DEDUPE_TTL_SECONDS", str(24 * 60 * 60)))
 
 logging.basicConfig(
     filename=LOG_PATH,
@@ -260,6 +265,66 @@ def list_notifications() -> list[Path]:
         return []
 
 
+def parse_notification_payload(payload: object) -> tuple[str | None, str | None]:
+    """Return (text, dedupe_key) for legacy and versioned notification drops."""
+    if not isinstance(payload, dict):
+        return None, None
+    text = payload.get("text")
+    if not isinstance(text, str) or not text:
+        return None, None
+    schema = payload.get("schema")
+    if schema is None:
+        return text, None
+    if schema != 1:
+        return None, None
+    dedupe_key = payload.get("dedupe_key")
+    if not isinstance(dedupe_key, str) or not dedupe_key:
+        dedupe_key = None
+    return text, dedupe_key
+
+
+def load_dedupe_store(now: float | None = None) -> dict[str, float]:
+    now = time.time() if now is None else now
+    try:
+        with open(DEDUPE_STORE_PATH) as f:
+            raw = json.load(f)
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    store: dict[str, float] = {}
+    for key, value in raw.items():
+        if not isinstance(key, str) or not key:
+            continue
+        if not isinstance(value, (int, float)):
+            continue
+        ts = float(value)
+        if now - ts <= DEDUPE_TTL_SECONDS:
+            store[key] = ts
+    return store
+
+
+def save_dedupe_store(store: dict[str, float]) -> None:
+    path = Path(DEDUPE_STORE_PATH)
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(tmp, "w") as f:
+            json.dump(store, f, sort_keys=True)
+            f.write("\n")
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        os.replace(tmp, path)
+    except OSError as e:
+        log.debug("dedupe store write failed at %s: %s", path, e)
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
 def _parse_utc_iso(value: object) -> datetime | None:
     if not isinstance(value, str) or not value:
         return None
@@ -384,11 +449,15 @@ def process_pending_dir(cfg: dict, secret: bytes) -> int:
 def process_notifications_dir(cfg: dict) -> int:
     """Forward outbound notification drop-offs from the agent user.
 
-    File shape: ``{"text": "..."}`` (one JSON file per message). The bot
-    deletes the file after sending so notifications are at-least-once: a
-    crash mid-delivery may resend, but never silently drop.
+    File shape: versioned notification envelope or legacy ``{"text": "..."}``
+    (one JSON file per message). The bot deletes the file after sending.
+    Versioned envelopes may carry a ``dedupe_key`` so a restart after a
+    successful delivery does not resend the same drop.
     """
     sent = 0
+    dedupe = load_dedupe_store()
+    dedupe_changed = False
+    now = time.time()
     for path in list_notifications():
         try:
             with open(path) as f:
@@ -399,8 +468,14 @@ def process_notifications_dir(cfg: dict) -> int:
             except OSError:
                 pass
             continue
-        text = payload.get("text") if isinstance(payload, dict) else None
-        if not isinstance(text, str) or not text:
+        text, dedupe_key = parse_notification_payload(payload)
+        if text is None:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            continue
+        if dedupe_key and dedupe_key in dedupe:
             try:
                 path.unlink()
             except OSError:
@@ -417,10 +492,15 @@ def process_notifications_dir(cfg: dict) -> int:
                 log.warning("notification forward to %s failed: %s", chat_id, e)
         if delivered:
             sent += 1
+        if dedupe_key and delivered == len(cfg["allowed_chat_ids"]):
+            dedupe[dedupe_key] = now
+            dedupe_changed = True
         try:
             path.unlink()
         except OSError:
             pass
+    if dedupe_changed:
+        save_dedupe_store(dedupe)
     return sent
 
 

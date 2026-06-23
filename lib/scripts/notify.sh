@@ -62,10 +62,42 @@ if [ -f /etc/fieldwork-bot/config.toml ] && [ -d "$bot_drop" ] && [ -w "$bot_dro
   uuid="$(cat /proc/sys/kernel/random/uuid 2>/dev/null || openssl rand -hex 16)"
   tmp="$bot_drop/.tmp-$uuid"
   out="$bot_drop/$uuid.json"
-  # Quote msg as JSON: escape backslashes then double-quotes.
-  esc="${msg//\\/\\\\}"
-  esc="${esc//\"/\\\"}"
-  printf '{"text":"%s"}\n' "$esc" >"$tmp" 2>/dev/null && mv -f "$tmp" "$out" 2>/dev/null || rm -f "$tmp"
+  if FW_NOTIFY_TEXT="$msg" \
+    FW_NOTIFY_EVENT="$event" \
+    FW_NOTIFY_REPO_SLUG="$project" \
+    FW_NOTIFY_BRANCH="$branch" \
+    FW_NOTIFY_UUID="$uuid" \
+    python3 - "$tmp" <<'PY'
+import json
+import os
+import sys
+
+out = sys.argv[1]
+event = os.environ.get("FW_NOTIFY_EVENT") or "unknown"
+repo_slug = os.environ.get("FW_NOTIFY_REPO_SLUG") or "unknown"
+branch = os.environ.get("FW_NOTIFY_BRANCH") or "-"
+uid = os.environ.get("FW_NOTIFY_UUID") or "unknown"
+payload = {
+    "schema": 1,
+    "kind": "agent_lifecycle",
+    "source": "claude_hook",
+    "event": event,
+    "repo_slug": repo_slug,
+    "request_id": None,
+    "branch": branch,
+    "dedupe_key": f"agent_lifecycle:{repo_slug}:{branch}:{event}:{uid}",
+    "text": os.environ.get("FW_NOTIFY_TEXT") or "",
+}
+with open(out, "w") as f:
+    json.dump(payload, f, sort_keys=True)
+    f.write("\n")
+PY
+  then
+    chmod 660 "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$out" 2>/dev/null || rm -f "$tmp"
+  else
+    rm -f "$tmp"
+  fi
   exit 0
 fi
 

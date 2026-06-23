@@ -274,8 +274,9 @@ setup_users_groups() {
 }
 
 setup_directories() {
-  local agent_home
+  local agent_home audit_path
   install -o "$BROKER_USER" -g "$BROKER_USER" -m 700 -d "$CONFIG_DIR"
+  install -o "$BROKER_USER" -g "$BROKER_USER" -m 700 -d "$STATE_DIR"
   install -o "$BROKER_USER" -g "$BROKER_USER" -m 700 -d "$STATE_DIR/requests"
   # Pending requests directory is shared between broker (writes pending files)
   # and bot (writes .notified sidecars + deletes after decisions). Both are
@@ -285,6 +286,26 @@ setup_directories() {
   # bot user reads and deletes. Owner=agent + group=bot + setgid so files
   # created by the agent inherit the bot group and are deletable by the bot.
   install -o "$AGENT_USER" -g "$BROKER_BOT_GROUP" -m 2770 -d "$STATE_DIR/notifications"
+  if [ ! -f "$STATE_DIR/audit.jsonl" ]; then
+    install -o "$BROKER_USER" -g "$BROKER_USER" -m 640 /dev/null "$STATE_DIR/audit.jsonl"
+  fi
+  for audit_path in "$STATE_DIR"/audit.jsonl "$STATE_DIR"/audit.jsonl.[0-9]*; do
+    [ -e "$audit_path" ] || continue
+    chown "$BROKER_USER:$BROKER_USER" "$audit_path"
+    chmod 640 "$audit_path"
+  done
+  if command -v setfacl >/dev/null 2>&1; then
+    setfacl -m "u:$AGENT_USER:--x" "$STATE_DIR"
+    setfacl -d -m "u:$AGENT_USER:r--" "$STATE_DIR"
+    for audit_path in "$STATE_DIR"/audit.jsonl "$STATE_DIR"/audit.jsonl.[0-9]*; do
+      [ -e "$audit_path" ] || continue
+      setfacl -m "u:$AGENT_USER:r--" "$audit_path"
+    done
+    setfacl -m "u:$BROKER_USER:rwx" "$STATE_DIR/notifications"
+    setfacl -d -m "u:$BROKER_USER:rwx" "$STATE_DIR/notifications"
+  else
+    echo "setfacl unavailable; audit/dashboard read access and broker lifecycle drops need manual ACL setup" >&2
+  fi
   install -o root -g root -m 755 -d "$LIB_DIR"
   # The broker reads each repo checkout under the agent user's home; that home
   # and projects root need traversal bits so the broker user can reach the
@@ -306,6 +327,7 @@ install_unit() {
   sed \
     -e "s|^User=fieldwork-pr-broker$|User=$BROKER_USER|" \
     -e "s|^Group=fieldwork-pr-broker$|Group=$BROKER_USER|" \
+    -e "s|^Environment=FIELDWORK_BROKER_AUDIT_READ_USER=fieldwork$|Environment=FIELDWORK_BROKER_AUDIT_READ_USER=$AGENT_USER|" \
     -e "s|^SocketUser=fieldwork-pr-broker$|SocketUser=$BROKER_USER|" \
     -e "s|^SocketGroup=fieldwork-pr$|SocketGroup=$BROKER_SOCKET_GROUP|" \
     -e "s|^SocketGroup=fieldwork-bot$|SocketGroup=$BROKER_BOT_GROUP|" \
@@ -356,6 +378,8 @@ verify_installation() {
   test "$(stat -c '%U:%G %a' /run/fieldwork-pr-broker/fieldwork-pr.sock)" = "$BROKER_USER:$BROKER_SOCKET_GROUP 660"
   test -S /run/fieldwork-pr-broker/fieldwork-pr-approve.sock
   test "$(stat -c '%U:%G %a' /run/fieldwork-pr-broker/fieldwork-pr-approve.sock)" = "$BROKER_USER:$BROKER_BOT_GROUP 660"
+  test -f "$STATE_DIR/audit.jsonl"
+  test "$(stat -c '%U:%G %a' "$STATE_DIR/audit.jsonl")" = "$BROKER_USER:$BROKER_USER 640"
   id "$AGENT_USER" | grep -qw "$BROKER_SOCKET_GROUP"
   if id "$AGENT_USER" | grep -qw "$BROKER_BOT_GROUP"; then
     echo "agent user '$AGENT_USER' must NOT be in '$BROKER_BOT_GROUP' (would let it fabricate /approve traffic)" >&2
