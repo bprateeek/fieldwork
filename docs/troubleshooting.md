@@ -464,10 +464,11 @@ Do not paste ntfy topics into public logs.
 Run:
 
 ```sh
-ssh -t fieldwork-vps 'gh auth login'
+ssh -t fieldwork-vps 'gh auth login --hostname github.com --git-protocol ssh --web --skip-ssh-key'
 ```
 
-This is for onboarding preflights. It is not the broker PAT.
+This is for onboarding preflights. It preselects browser/device login and skips
+SSH-key upload. It is not the broker PAT.
 
 ## `fieldwork smoke` Fails
 

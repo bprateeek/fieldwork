@@ -125,10 +125,10 @@ SSH session for you and then continue after the account prompt exits:
 
 ```sh
 ssh -t fieldwork-vps '~/.local/bin/claude login'
-ssh -t fieldwork-vps 'gh auth login'
+ssh -t fieldwork-vps 'gh auth login --hostname github.com --git-protocol ssh --web --skip-ssh-key'
 ```
 
-These commands authenticate Claude Code on the VPS and authenticate GitHub CLI for repo-resolution preflights. For Codex, setup guides `codex login`, verifies Codex resolves on the SSH login PATH, enables linger/runner sockets, and checks the Codex sandbox Unix-socket allowlist. For `gh auth login`, choose GitHub.com, SSH as the preferred Git protocol, skip SSH key upload/generation unless you want gh to manage a key, choose browser login, and do not paste the broker PAT. Browser login still gives GitHub CLI its own token after you approve the device code; on a headless VPS, `gh` may warn that credentials were saved in plain text because no OS keychain is available. That token is separate from the broker PAT, which is checked later through the broker socket, without sudo impersonation. Bootstrap installs the `fieldwork-agent@` systemd user unit template for Claude and the runner socket units used by both agents.
+These commands authenticate Claude Code on the VPS and authenticate GitHub CLI for repo-resolution preflights. For Codex, setup guides `codex login`, verifies Codex resolves on the SSH login PATH, enables linger/runner sockets, and checks the Codex sandbox Unix-socket allowlist. Fieldwork preselects GitHub.com, SSH git protocol, browser/device auth, and skip-SSH-key upload for `gh auth login`; do not paste the broker PAT there. Browser login still gives GitHub CLI its own token after you approve the device code; on a headless VPS, `gh` may warn that credentials were saved in plain text because no OS keychain is available. That token is separate from the broker PAT, which is checked later through the broker socket, without sudo impersonation. Bootstrap installs the `fieldwork-agent@` systemd user unit template for Claude and the runner socket units used by both agents.
 
 When a command shows `[sudo] VPS Linux password for fieldwork:`, enter the VPS
 Linux password for the `fieldwork` user. It is not your Claude account password or
@@ -216,8 +216,8 @@ installation id, and the App private key PEM.
 In Claude mode, the command pauses for three manual actions:
 
 - paste a read-only deploy key into GitHub
-- run Claude's workspace-trust prompt
-- run Claude's remote-control consent prompt
+- run Claude's workspace-trust prompt; Fieldwork cannot safely automate this
+- run Claude's remote-control consent prompt; Fieldwork cannot safely automate this
 
 In Codex mode, Codex Desktop owns the SSH session lifecycle and remote-project picker, so there is no per-repo Codex service to start. The command opens an init PR through the broker and writes a non-secret checkpoint under `.fieldwork/local/` in the VPS checkout, so rerunning the same command resumes from the next incomplete step.
 

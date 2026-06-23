@@ -1055,7 +1055,7 @@ $preflight_json
 Diagnose:
   ssh $SSH_HOST gh auth status
 If logged out:
-  ssh -t $SSH_HOST gh auth login
+  ssh -t $SSH_HOST 'gh auth login --hostname github.com --git-protocol ssh --web --skip-ssh-key'
 EOF
   exit 1
 }
@@ -1120,6 +1120,11 @@ mark_step "clone_deploy_key_completed"
 # workspace-trust / remote-control automatically. Codex has no Fieldwork-driven
 # trust or consent dialog; it connects per-SSH via Codex Desktop.
 if agent_enabled claude; then
+  phase_section "Claude manual consent"
+  echo "  Claude requires two interactive confirmations that Fieldwork cannot safely automate:"
+  echo "  workspace trust for this checkout and remote-control consent for vps-$SLUG."
+  echo "  They are one-time per repo/session surface and reruns resume after each checkpoint."
+
   run_interactive_checkpoint \
     "workspace_trust_confirmed" \
     "Workspace Trust" \

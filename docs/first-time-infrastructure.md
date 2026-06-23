@@ -240,21 +240,20 @@ on:
 
 ```sh
 ssh -t fieldwork-vps '~/.local/bin/claude login'
-ssh -t fieldwork-vps 'gh auth login'
+ssh -t fieldwork-vps 'gh auth login --hostname github.com --git-protocol ssh --web --skip-ssh-key'
 ```
 
 What each follow-up is for:
 
 - `~/.local/bin/claude login` authenticates Claude Code on the VPS so the long-running remote sessions can start.
-- `gh auth login` authenticates GitHub CLI on the VPS for read-only preflight checks such as resolving repositories. This is separate from the broker PAT used for PR pushes; onboarding checks that PAT through the broker socket after setup hardening, not through sudo.
+- `gh auth login --hostname github.com --git-protocol ssh --web --skip-ssh-key` authenticates GitHub CLI on the VPS for read-only preflight checks such as resolving repositories. This is separate from the broker PAT used for PR pushes; onboarding checks that PAT through the broker socket after setup hardening, not through sudo.
 
 When a command shows `[sudo] VPS Linux password for fieldwork:`, enter the VPS
 Linux password for the `fieldwork` user. It is not your Claude account password or
 the GitHub PAT.
 
-For `gh auth login`, use GitHub.com, choose SSH as the preferred protocol for
-Git operations, skip SSH key upload or generation unless you explicitly want gh
-to manage a key, and choose browser login. Do not paste the broker PAT into gh;
+Fieldwork preselects GitHub.com, SSH as the preferred Git protocol, browser
+login, and skip-SSH-key upload for `gh auth login`. Do not paste the broker PAT into gh;
 the broker PAT belongs only to the `fieldwork-pr-broker` service user. Browser
 login still gives GitHub CLI its own token after you approve the device code. On
 a headless VPS, `gh` may say it could not open a browser; copy the printed code
