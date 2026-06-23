@@ -6,7 +6,7 @@ Notifications and the Telegram approval bot are optional integrations. `fieldwor
 
 Mobile notifications send a push when a Claude session needs input, finishes, or fails. They are a status convenience, not a safety control.
 
-Codex preview note: Claude hooks do not run under Codex, so Fieldwork does not send Codex session lifecycle notifications in this milestone. Broker and Telegram approval notifications still work because they are emitted by the broker/bot path, not by agent hooks.
+Codex preview note: Claude hooks do not run under Codex, so Fieldwork still cannot send Codex in-session "needs input" or "turn done" notifications. The VPS event poller does provide agent-agnostic git-state journaling, resume-context artifacts, PR merge checks, and optional notification drops based on observable broker audit + git state.
 
 Configure them with:
 
@@ -47,9 +47,11 @@ The bot still accepts legacy `{"text":"..."}` drops. If a versioned drop has a `
 
 Broker lifecycle drops use the same envelope with `kind: "broker_lifecycle"` and `source: "broker"`. They are controlled by `FIELDWORK_BROKER_NOTIFY_LIFECYCLE`; the default is off. Values `1`, `true`, `yes`, `on`, or `minimal` enable `request_queued` and `pr_opened`; `all` also enables `request_approved` and `request_denied`; a comma-separated event list enables only those events. The older `FIELDWORK_BROKER_NOTIFY_ON_PR_OPENED=1` remains a compatibility alias for `pr_opened`.
 
-## Loop State Contracts
+## Event Poller And Loop State
 
-The agent-agnostic event layer uses this local state contract:
+`fieldwork-event-poll.timer` runs as a systemd user timer about every 30 seconds. It scans canonical repos under `$HOME/projects`, asks each repo for `git worktree list --porcelain`, and records all linked worktrees, including Claude `--spawn=worktree` checkouts under `$HOME/worktrees`. It does not hold broker tokens, read pending approval requests, call the approve socket, or write broker state.
+
+The poller uses this local state contract:
 
 ```text
 ~/.fieldwork/state/
@@ -62,6 +64,8 @@ Journals remain at:
 ```text
 ~/.fieldwork/project-journals/<repo-slug>.md
 ```
+
+The poller appends journal entries from git state only: branch plus latest commit subject. Claude transcript scraping is no longer part of durable journaling.
 
 `events/<repo-slug>.json` is schema-versioned. The initial shape is:
 
@@ -77,7 +81,9 @@ Journals remain at:
       "ahead_of_base": 2,
       "staged_count": 0,
       "dirty_count": 1,
-      "untracked_count": 0
+      "untracked_count": 0,
+      "latest_commit_subject": "add feature",
+      "last_seen": "2026-06-23T12:00:00Z"
     }
   },
   "prs": {
@@ -85,14 +91,21 @@ Journals remain at:
       "number": 12,
       "url": "https://github.com/owner/example/pull/12",
       "base_branch": "main",
+      "repo": "owner/example",
       "last_checked": "2026-06-23T12:00:00Z"
     }
+  },
+  "open_prs": {
+    "last_checked": "2026-06-23T12:00:00Z",
+    "lines": ["#12 Add feature [fieldwork/change]"]
   },
   "last_throttled_checks": {
     "fieldwork/change:pr_state": "2026-06-23T12:00:00Z"
   }
 }
 ```
+
+Base branch resolution is `.fieldwork/default-branch`, then broker audit `base_branch`, then `origin/HEAD`. When audit entries contain `pr_opened`, the poller stores the PR number by branch and checks merge state by PR number, not by branch head, so branch deletion after merge does not hide the merge.
 
 ## Telegram approval bot
 

@@ -88,8 +88,8 @@ require the Telegram approval path before push.
 Codex preview gaps:
 
 - Claude hooks do not run under Codex.
-- No Codex journaling or resume-context in this milestone.
-- No Fieldwork activity notifications from Codex session lifecycle.
+- Codex journaling and resume-context are git-derived from the VPS event poller, not from in-session hooks.
+- No Fieldwork "needs input" or "turn done" notifications from Codex session lifecycle.
 - Broker and approval notifications still work.
 - Codex works directly in the canonical checkout, so concurrent Codex tasks or
   simultaneous Claude+Codex work on that checkout are unsupported.
