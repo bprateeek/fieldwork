@@ -1,6 +1,6 @@
 # CLI Reference
 
-One-line index of every `fieldwork` subcommand and where to read more. Commands that are not covered in another doc (`report`, `start`, `status`) get a full section here.
+One-line index of every `fieldwork` subcommand and where to read more. Commands that are not covered in another doc (`dashboard`, `report`, `start`, `status`) get a full section here.
 
 For the guided path, start with `fieldwork setup` and follow what it prints. Most commands here are invoked by `setup` for you.
 
@@ -12,6 +12,7 @@ For the guided path, start with `fieldwork setup` and follow what it prints. Mos
 | `provision`       | Create a VPS (Hetzner) via the `hcloud` CLI + cloud-init, write the SSH alias, and hand off to `setup`.         | [first-time-infrastructure.md](first-time-infrastructure.md)                       |
 | `uninstall`       | Guided teardown for Fieldwork-managed local, remote, broker, and approval-bot assets.                           | [uninstall.md](uninstall.md)                                                       |
 | `health`          | One-glance OK/not-OK across local, VPS, agents, broker, sockets, token, approvals. Soft daily check.            | [§ `fieldwork health`](#fieldwork-health) below                                    |
+| `dashboard`       | Open a read-only localhost dashboard backed by VPS Fieldwork state.                                             | [§ `fieldwork dashboard`](#fieldwork-dashboard) below                              |
 | `doctor`          | Diagnose local + remote state; prints next action and remaining follow-ups.                                     | [troubleshooting.md](troubleshooting.md)                                           |
 | `setup-notify`    | Configure optional mobile notifications (ntfy by default; `--telegram-bot` for the approval-gate bot).          | [notifications.md](notifications.md), [approval-gate.md](approval-gate.md)         |
 | `sync-vps`        | Sync the local Fieldwork checkout to the VPS over `rsync`.                                                      | [setup.md](setup.md)                                                               |
@@ -172,6 +173,34 @@ Pass a repo slug with `--remote` to include verify dependency readiness for that
 `--session-probe` (requires `--remote`) runs claude headless inside a synthetic cage on the VPS (NoNewPrivs + a fresh user namespace, the same runtime the agent gets from `remote-control --sandbox`) and confirms `sandbox.excludedCommands` still rescue the fieldwork socket clients on the installed claude version. It is opt-in because it spends model tokens and needs a confirmed Claude login; run it after claude CLI updates.
 
 Use this before manually debugging SSH, broker, notification, service, or Codex Desktop SSH failures. Codex checks include safe local Desktop state booleans, remote Codex CLI version/auth status, and sanitized app-server signals such as stale socket or ended app session. Doctor never prints Codex auth files, device codes, raw app-server logs, or token-shaped values.
+
+---
+
+## `fieldwork dashboard`
+
+```text
+usage: fieldwork dashboard [--local-port <port>] [--remote-port <port>] [--no-open]
+```
+
+Starts `fieldwork-dashboard.service` as a user service on the VPS, forwards it over SSH to `http://127.0.0.1:<local-port>/`, and opens that local URL in your browser. Keep the command running while using the dashboard; Ctrl-C closes the tunnel.
+
+The remote server binds only to `127.0.0.1` and exposes read-only GET routes:
+
+```text
+/            browser dashboard
+/api/status  JSON snapshot
+/healthz     health probe
+```
+
+The snapshot comes from `fieldwork-status-snapshot`, which reads `~/.fieldwork/state/events`, `~/.fieldwork/state/resume-context`, `~/.fieldwork/project-journals`, and the broker audit JSONL log when the agent user's audit-read ACL allows it. It does not SSH, call `fieldwork status`, or invoke shell renderers.
+
+Flags:
+
+| Flag | Meaning |
+|---|---|
+| `--local-port <port>` | Local loopback port for the SSH tunnel. Default: `8765`. |
+| `--remote-port <port>` | VPS loopback port used by the dashboard service. Default: `8765`. |
+| `--no-open` | Print the URL without launching a browser. |
 
 ---
 

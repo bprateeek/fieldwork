@@ -1,0 +1,12 @@
+[Unit]
+Description=Fieldwork dashboard
+
+[Service]
+Type=simple
+ExecStart=%h/.fieldwork/scripts/fieldwork-dashboard-server
+Environment=FIELDWORK_DASHBOARD_HOST=127.0.0.1
+Environment=FIELDWORK_DASHBOARD_PORT=8765
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

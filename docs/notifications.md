@@ -107,6 +107,12 @@ The poller appends journal entries from git state only: branch plus latest commi
 
 Base branch resolution is `.fieldwork/default-branch`, then broker audit `base_branch`, then `origin/HEAD`. When audit entries contain `pr_opened`, the poller stores the PR number by branch and checks merge state by PR number, not by branch head, so branch deletion after merge does not hide the merge.
 
+## Dashboard Snapshot
+
+`fieldwork dashboard` uses the same durable state files as the event poller. The VPS service runs `fieldwork-status-snapshot` locally and serves the result through a loopback-only HTTP server reached by an SSH tunnel from your workstation.
+
+The snapshot is read-only. It includes repo event files, resume-context presence, recent journal lines, PR/worktree state, and the latest broker audit event per repo when the agent user's audit-read ACL can read the audit JSONL log. It does not read Telegram bot secrets, broker PAT files, pending approval request bodies, or notification transport secrets.
+
 ## Telegram approval bot
 
 The Telegram approval bot is one optional transport for the per-repo approval gate. PR approval also works directly through the broker's approve socket without Telegram.

@@ -396,6 +396,7 @@ print_uninstall_plan() {
       echo "  - fieldwork-verify-runner.socket/service"
       echo "  - fieldwork-pr-prepare-runner.socket/service"
       echo "  - fieldwork-event-poll.timer/service"
+      echo "  - fieldwork-dashboard.service"
       echo "  - remote Fieldwork scripts and synced checkout"
       [ "$purge" = "1" ] && echo "  - remote Fieldwork cache/log state"
     else
@@ -1167,6 +1168,8 @@ uninstall_local_files() {
     "$HOME/.local/bin/fieldwork-setup-probe" \
     "$HOME/.local/bin/fieldwork-codex-sandbox" \
     "$HOME/.local/bin/fieldwork-pr-submit" \
+    "$HOME/.fieldwork/scripts/fieldwork-status-snapshot" \
+    "$HOME/.fieldwork/scripts/fieldwork-dashboard-server" \
     "$HOME/.fieldwork/scripts/fieldwork-clone" \
     "$HOME/.fieldwork/scripts/fieldwork-init" \
     "$HOME/.fieldwork/scripts/fieldwork-launch" \
@@ -1186,6 +1189,7 @@ uninstall_local_files() {
     "$HOME/.claude/settings.json" \
     "$HOME/.fieldwork/templates/repo" \
     "$HOME/.fieldwork/infra/fieldwork-agent@.service" \
+    "$HOME/.fieldwork/infra/fieldwork-dashboard.service" \
     "$HOME/.fieldwork/infra/fieldwork-verify-runner.socket" \
     "$HOME/.fieldwork/infra/fieldwork-verify-runner@.service" \
     "$HOME/.fieldwork/infra/fieldwork-event-poll.service" \
@@ -1399,12 +1403,12 @@ EOF
   fi
 }
 
-if systemctl --user disable --now fieldwork-verify-runner.socket fieldwork-pr-prepare-runner.socket fieldwork-event-poll.timer >/dev/null 2>&1; then
-  ok "remote user runner sockets and event timer"
-elif [ -f "$HOME/.config/systemd/user/fieldwork-verify-runner.socket" ] || [ -f "$HOME/.config/systemd/user/fieldwork-pr-prepare-runner.socket" ] || [ -f "$HOME/.config/systemd/user/fieldwork-event-poll.timer" ]; then
-  failed "remote user runner sockets and event timer" "systemctl failed"
+if systemctl --user disable --now fieldwork-verify-runner.socket fieldwork-pr-prepare-runner.socket fieldwork-event-poll.timer fieldwork-dashboard.service >/dev/null 2>&1; then
+  ok "remote user runner sockets, event timer, and dashboard"
+elif [ -f "$HOME/.config/systemd/user/fieldwork-verify-runner.socket" ] || [ -f "$HOME/.config/systemd/user/fieldwork-pr-prepare-runner.socket" ] || [ -f "$HOME/.config/systemd/user/fieldwork-event-poll.timer" ] || [ -f "$HOME/.config/systemd/user/fieldwork-dashboard.service" ]; then
+  failed "remote user runner sockets, event timer, and dashboard" "systemctl failed"
 else
-  skipped "remote user runner sockets and event timer" "not present"
+  skipped "remote user runner sockets, event timer, and dashboard" "not present"
 fi
 agents_tmp="$(mktemp "${TMPDIR:-/tmp}/fieldwork-uninstall-agents.XXXXXX")" || agents_tmp=""
 if [ -n "$agents_tmp" ] && systemctl --user list-units --all 'fieldwork-agent@*.service' --no-legend --no-pager >"$agents_tmp" 2>/dev/null; then
@@ -1447,6 +1451,8 @@ for path in \
   "$HOME/.local/bin/fieldwork-setup-probe" \
   "$HOME/.local/bin/fieldwork-codex-sandbox" \
   "$HOME/.local/bin/fieldwork-pr-submit" \
+  "$HOME/.fieldwork/scripts/fieldwork-status-snapshot" \
+  "$HOME/.fieldwork/scripts/fieldwork-dashboard-server" \
   "$HOME/.fieldwork/scripts/fieldwork-clone" \
   "$HOME/.fieldwork/scripts/fieldwork-init" \
   "$HOME/.fieldwork/scripts/fieldwork-launch" \
@@ -1466,6 +1472,7 @@ for path in \
   "$HOME/.claude/settings.json" \
   "$HOME/.fieldwork/templates/repo" \
   "$HOME/.fieldwork/infra/fieldwork-agent@.service" \
+  "$HOME/.fieldwork/infra/fieldwork-dashboard.service" \
   "$HOME/.fieldwork/infra/fieldwork-verify-runner.socket" \
   "$HOME/.fieldwork/infra/fieldwork-verify-runner@.service" \
   "$HOME/.fieldwork/infra/fieldwork-event-poll.service" \
@@ -1478,6 +1485,8 @@ for path in \
 done
 
 remove_file "remote fieldwork-agent unit" "$HOME/.config/systemd/user/fieldwork-agent@.service"
+remove_file "remote dashboard unit" "$HOME/.config/systemd/user/fieldwork-dashboard.service"
+remove_tree "remote dashboard unit drop-ins" "$HOME/.config/systemd/user/fieldwork-dashboard.service.d" "$HOME"
 remove_file "remote verify socket unit" "$HOME/.config/systemd/user/fieldwork-verify-runner.socket"
 remove_file "remote verify service unit" "$HOME/.config/systemd/user/fieldwork-verify-runner@.service"
 remove_file "remote event poll service unit" "$HOME/.config/systemd/user/fieldwork-event-poll.service"

@@ -153,7 +153,7 @@ source "$FIELDWORK_ROOT/lib/cli/developer-preview.sh"
 # Resolve the control-plane config object (host, user, projects root, default
 # branch, notify provider, forge, identity). Owns the defaults; see lib/cli/config.sh.
 fieldwork_load_config
-FIELDWORK_FINGERPRINT_FILES="bin/fieldwork install.sh AGENTS.md lib/cli/config.sh lib/cli/messaging.sh lib/cli/health.sh lib/cli/ssh-config.sh lib/cli/setup.sh lib/cli/onboard.sh lib/cli/provision.sh lib/cli/verify-security.sh lib/cli/uninstall.sh lib/cli/developer-preview.sh lib/systemd/bootstrap-vps.sh lib/apparmor/fieldwork-bwrap lib/broker/install.sh lib/broker/standalone-install.sh lib/broker/fieldwork-pr-broker.service lib/broker/fieldwork-pr-broker.socket lib/broker/fieldwork-pr-approve.socket lib/broker/server.py schema/pr-request.schema.json schema/pr-prepare-request.schema.json lib/scripts/fieldwork-status lib/scripts/fieldwork-pr-submit lib/scripts/fieldwork-clone lib/scripts/fieldwork-init lib/scripts/fieldwork-launch lib/scripts/fieldwork-agent-session lib/scripts/fieldwork-event-poll lib/scripts/fieldwork-setup-probe lib/scripts/fieldwork-session-probe lib/scripts/fieldwork-codex-sandbox lib/scripts/fieldwork-bot lib/scripts/fieldwork-pr-prepare lib/scripts/fieldwork-pr-prepare-runner lib/scripts/fieldwork-pr-prepare-impl lib/agents/claude-remote-control lib/templates/repo/AGENTS.md lib/templates/repo/CLAUDE.md lib/templates/repo/.gitignore lib/templates/repo/.fieldwork/expected-origin lib/systemd/fieldwork-agent@.service lib/systemd/fieldwork-event-poll.service lib/systemd/fieldwork-event-poll.timer lib/systemd/fieldwork-bot.service lib/systemd/fieldwork-pr-prepare-runner.socket lib/systemd/fieldwork-pr-prepare-runner@.service lib/systemd/fieldwork-verify-runner.socket lib/systemd/fieldwork-verify-runner@.service examples/eval/docker-compose.yml examples/eval/Dockerfile examples/eval/eval-smoke.sh examples/eval/fake-gh examples/eval/fake-gitleaks examples/eval/gh examples/eval/gitleaks examples/eval/README.md"
+FIELDWORK_FINGERPRINT_FILES="bin/fieldwork install.sh AGENTS.md lib/cli/config.sh lib/cli/messaging.sh lib/cli/health.sh lib/cli/ssh-config.sh lib/cli/setup.sh lib/cli/onboard.sh lib/cli/provision.sh lib/cli/verify-security.sh lib/cli/uninstall.sh lib/cli/developer-preview.sh lib/systemd/bootstrap-vps.sh lib/apparmor/fieldwork-bwrap lib/broker/install.sh lib/broker/standalone-install.sh lib/broker/fieldwork-pr-broker.service lib/broker/fieldwork-pr-broker.socket lib/broker/fieldwork-pr-approve.socket lib/broker/server.py schema/pr-request.schema.json schema/pr-prepare-request.schema.json lib/scripts/fieldwork-status lib/scripts/fieldwork-status-snapshot lib/scripts/fieldwork-dashboard-server lib/scripts/fieldwork-pr-submit lib/scripts/fieldwork-clone lib/scripts/fieldwork-init lib/scripts/fieldwork-launch lib/scripts/fieldwork-agent-session lib/scripts/fieldwork-event-poll lib/scripts/fieldwork-setup-probe lib/scripts/fieldwork-session-probe lib/scripts/fieldwork-codex-sandbox lib/scripts/fieldwork-bot lib/scripts/fieldwork-pr-prepare lib/scripts/fieldwork-pr-prepare-runner lib/scripts/fieldwork-pr-prepare-impl lib/agents/claude-remote-control lib/templates/repo/AGENTS.md lib/templates/repo/CLAUDE.md lib/templates/repo/.gitignore lib/templates/repo/.fieldwork/expected-origin lib/systemd/fieldwork-agent@.service lib/systemd/fieldwork-dashboard.service lib/systemd/fieldwork-event-poll.service lib/systemd/fieldwork-event-poll.timer lib/systemd/fieldwork-bot.service lib/systemd/fieldwork-pr-prepare-runner.socket lib/systemd/fieldwork-pr-prepare-runner@.service lib/systemd/fieldwork-verify-runner.socket lib/systemd/fieldwork-verify-runner@.service examples/eval/docker-compose.yml examples/eval/Dockerfile examples/eval/eval-smoke.sh examples/eval/fake-gh examples/eval/fake-gitleaks examples/eval/gh examples/eval/gitleaks examples/eval/README.md"
 FIELDWORK_UI_COLOR=0
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
   FIELDWORK_UI_COLOR=1
@@ -405,6 +405,7 @@ Getting started
 
 Day to day
   refresh <repo>      update the VPS checkout after merge
+  dashboard           open read-only VPS dashboard
   status [repo]       show session and PR status
   log [repo]          tail the audit log
   report [repo]       generate a redacted support bundle
@@ -477,6 +478,13 @@ valid_projects_dir() {
   [[ "$path" =~ ^/[A-Za-z0-9._/-]+$ ]] || return 1
 }
 
+valid_port() {
+  local port="${1:-}"
+  [[ "$port" =~ ^[0-9]+$ ]] || return 1
+  [ "$port" -ge 1 ] 2>/dev/null || return 1
+  [ "$port" -le 65535 ] 2>/dev/null
+}
+
 shell_quote() {
   printf "'"
   printf '%s' "${1:-}" | sed "s/'/'\\\\''/g"
@@ -507,6 +515,23 @@ display_shell_local_path() {
       ;;
     *) shell_quote "$path" ;;
   esac
+}
+
+fieldwork_open_url() {
+  local url="$1"
+  if command -v open >/dev/null 2>&1; then
+    open "$url" >/dev/null 2>&1
+    return $?
+  fi
+  if command -v xdg-open >/dev/null 2>&1; then
+    xdg-open "$url" >/dev/null 2>&1
+    return $?
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -m webbrowser "$url" >/dev/null 2>&1
+    return $?
+  fi
+  return 1
 }
 
 FIELDWORK_SSH_MUX_READY=0
@@ -3597,6 +3622,139 @@ REMOTE_EOF
   fi
 }
 
+dashboard_fieldwork() {
+  local local_port="${FIELDWORK_DASHBOARD_LOCAL_PORT:-8765}"
+  local remote_port="${FIELDWORK_DASHBOARD_REMOTE_PORT:-8765}"
+  local open_browser=1
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --local-port)
+        [ -n "${2:-}" ] || { echo "--local-port requires a port" >&2; return 2; }
+        local_port="$2"
+        shift 2
+        ;;
+      --local-port=*)
+        local_port="${1#--local-port=}"
+        shift
+        ;;
+      --remote-port)
+        [ -n "${2:-}" ] || { echo "--remote-port requires a port" >&2; return 2; }
+        remote_port="$2"
+        shift 2
+        ;;
+      --remote-port=*)
+        remote_port="${1#--remote-port=}"
+        shift
+        ;;
+      --no-open)
+        open_browser=0
+        shift
+        ;;
+      --help|-h)
+        cat <<'EOF'
+usage: fieldwork dashboard [--local-port <port>] [--remote-port <port>] [--no-open]
+
+Start the read-only dashboard service on the VPS, open an SSH tunnel bound to
+127.0.0.1 on this machine, and open the local browser URL.
+
+The dashboard server itself binds only to 127.0.0.1 on the VPS. Keep this
+command running while you use the dashboard; Ctrl-C closes the SSH tunnel.
+EOF
+        return 0
+        ;;
+      --*) echo "unknown dashboard argument: $1" >&2; return 2 ;;
+      *) echo "fieldwork dashboard does not accept positional arguments" >&2; return 2 ;;
+    esac
+  done
+
+  valid_port "$local_port" || { echo "invalid --local-port: $local_port" >&2; return 2; }
+  valid_port "$remote_port" || { echo "invalid --remote-port: $remote_port" >&2; return 2; }
+
+  dashboard_start_remote() {
+    local remote_port_q
+    remote_port_q="$(shell_quote "$remote_port")"
+    ssh "$FIELDWORK_SSH_HOST" "remote_port=$remote_port_q bash -s" <<'REMOTE'
+set -eu
+case "$remote_port" in
+  ''|*[!0-9]*) exit 2 ;;
+esac
+if [ "$remote_port" -lt 1 ] || [ "$remote_port" -gt 65535 ]; then
+  exit 2
+fi
+test -x "$HOME/.fieldwork/scripts/fieldwork-dashboard-server"
+test -x "$HOME/.fieldwork/scripts/fieldwork-status-snapshot"
+test -f "$HOME/.fieldwork/infra/fieldwork-dashboard.service"
+mkdir -p "$HOME/.config/systemd/user/fieldwork-dashboard.service.d"
+cp "$HOME/.fieldwork/infra/fieldwork-dashboard.service" "$HOME/.config/systemd/user/fieldwork-dashboard.service"
+{
+  printf '[Service]\n'
+  printf 'Environment=FIELDWORK_DASHBOARD_HOST=127.0.0.1\n'
+  printf 'Environment=FIELDWORK_DASHBOARD_PORT=%s\n' "$remote_port"
+} > "$HOME/.config/systemd/user/fieldwork-dashboard.service.d/port.conf"
+systemctl --user daemon-reload
+systemctl --user restart fieldwork-dashboard.service
+systemctl --user is-active --quiet fieldwork-dashboard.service
+REMOTE
+  }
+
+  phase_section "Dashboard"
+  info_row "VPS" "$FIELDWORK_SSH_HOST"
+  info_row "remote bind" "127.0.0.1:$remote_port"
+  info_row "local URL" "http://127.0.0.1:$local_port/"
+
+  if ! progress_run "starting remote dashboard service" "remote dashboard service is active" dashboard_start_remote; then
+    echo
+    label_line "Fix"
+    echo "  fieldwork sync-vps --force-install"
+    echo "  fieldwork doctor --remote --explain"
+    return 1
+  fi
+
+  local url="http://127.0.0.1:$local_port/"
+  local tunnel_status=0
+  fieldwork_status_start "opening SSH tunnel"
+  set +e
+  ssh -N -o ExitOnForwardFailure=yes -L "127.0.0.1:${local_port}:127.0.0.1:${remote_port}" "$FIELDWORK_SSH_HOST" &
+  FIELDWORK_ACTIVE_PID=$!
+  sleep 1
+  if kill -0 "$FIELDWORK_ACTIVE_PID" 2>/dev/null; then
+    fieldwork_status_succeed "SSH tunnel open"
+  else
+    wait "$FIELDWORK_ACTIVE_PID"
+    tunnel_status=$?
+    FIELDWORK_ACTIVE_PID=""
+    fieldwork_status_fail ""
+    set -e
+    echo
+    label_line "Fix"
+    echo "  choose another local port: fieldwork dashboard --local-port 8766"
+    return "$tunnel_status"
+  fi
+  set -e
+
+  echo
+  label_line "Open"
+  echo "  $url"
+  if [ "$open_browser" = "1" ]; then
+    if fieldwork_open_url "$url"; then
+      status_ok_line "browser opened"
+    else
+      info_note "Could not open a browser automatically; paste the URL above."
+    fi
+  fi
+  echo
+  label_line "Tunnel"
+  echo "  keep this command running; press Ctrl-C to close the tunnel"
+
+  set +e
+  wait "$FIELDWORK_ACTIVE_PID"
+  tunnel_status=$?
+  FIELDWORK_ACTIVE_PID=""
+  set -e
+  return "$tunnel_status"
+}
+
 status_repo() {
   local slug=""
   local verbose=0
@@ -4721,6 +4879,7 @@ case "$cmd" in
   report) shift; report_fieldwork "$@" ;;
   smoke) shift; smoke_repo "$@" ;;
   refresh) shift; refresh_repo "$@" ;;
+  dashboard) shift; dashboard_fieldwork "$@" ;;
   eval) shift; fieldwork_eval "$@" ;;
   log) shift; fieldwork_log "$@" ;;
   adapter) shift; fieldwork_adapter "$@" ;;
