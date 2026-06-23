@@ -15,6 +15,16 @@ Quickstart records only phase completion under
 and onboarding completion is per repo. It skips completed phases on later runs
 and delegates the real work to the existing setup and onboarding flows.
 
+To preview remaining setup friction without changing the VPS, repo, or local
+quickstart ledger, run:
+
+```sh
+fieldwork quickstart <owner>/<repo> --dry-run
+```
+
+The dry run delegates to `fieldwork doctor --remote --explain`, so it reports the
+same readiness rows and next action that setup would use before mutating.
+
 Run `fieldwork setup` first only if you want the step-by-step command path.
 
 For developer preview fit and support boundaries, read [developer-preview.md](developer-preview.md).
