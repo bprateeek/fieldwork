@@ -3690,6 +3690,9 @@ grep -q "broker sockets reopened" "$ROOT/lib/broker/install.sh"
 grep -q "resolve_socket_group_for_display()" "$ROOT/lib/broker/install.sh"
 grep -q "systemctl stop fieldwork-pr-broker.service fieldwork-pr-broker.socket fieldwork-pr-approve.socket" "$ROOT/lib/broker/install.sh"
 grep -q 'install -o "$AGENT_USER" -g "$AGENT_USER" -m 755 -d "$PROJECTS_ROOT"' "$ROOT/lib/broker/install.sh"
+grep -q 'setfacl -m "u:$AGENT_USER:--x" "$STATE_DIR"' "$ROOT/lib/broker/install.sh"
+grep -q 'setfacl -m "u:$AGENT_USER:r--" "$audit_path"' "$ROOT/lib/broker/install.sh"
+grep -q 'setfacl -m "u:$BROKER_USER:rwx" "$STATE_DIR/notifications"' "$ROOT/lib/broker/install.sh"
 grep -q "def preflight" "$ROOT/lib/broker/server.py"
 grep -q "GIT_CONFIG_KEY_0.*safe.directory" "$ROOT/lib/broker/server.py"
 grep -q "GIT_CONFIG_KEY_1.*core.hooksPath" "$ROOT/lib/broker/server.py"
@@ -4617,6 +4620,7 @@ grep -Fx "ListenStream=/run/fieldwork-pr-broker/fieldwork-pr-approve.sock" "$ROO
 grep -Fx "SocketGroup=fieldwork-bot" "$ROOT/lib/broker/fieldwork-pr-approve.socket" >/dev/null
 grep -Fx "SocketMode=0660" "$ROOT/lib/broker/fieldwork-pr-approve.socket" >/dev/null
 grep -Fx "Sockets=fieldwork-pr-broker.socket fieldwork-pr-approve.socket" "$ROOT/lib/broker/fieldwork-pr-broker.service" >/dev/null
+grep -Fx "Environment=FIELDWORK_BROKER_AUDIT_READ_USER=fieldwork" "$ROOT/lib/broker/fieldwork-pr-broker.service" >/dev/null
 
 echo "[checks] fieldwork-pr-submit handles queued response"
 grep -q "queued for human approval" "$ROOT/lib/scripts/fieldwork-pr-submit"
@@ -4645,6 +4649,10 @@ grep -q "FIELDWORK_BOT_HEALTH_PATH" "$ROOT/lib/scripts/fieldwork-bot"
 echo "[checks] notify.sh hands off to bot when config present"
 grep -q "/etc/fieldwork-bot/config.toml" "$ROOT/lib/scripts/notify.sh"
 grep -q 'FIELDWORK_NOTIFICATIONS_DIR' "$ROOT/lib/scripts/notify.sh"
+grep -q '"schema": 1' "$ROOT/lib/scripts/notify.sh"
+grep -q 'json.dump(payload' "$ROOT/lib/scripts/notify.sh"
+grep -q "dedupe_key" "$ROOT/lib/scripts/fieldwork-bot"
+grep -q "FIELDWORK_BOT_DEDUPE_STORE_PATH" "$ROOT/lib/scripts/fieldwork-bot"
 
 echo "[checks] setup-notify --telegram-bot help + verify-security bot checks"
 "$ROOT/bin/fieldwork" setup-notify --help >${TMPDIR:-/tmp}/fieldwork-setup-notify-help.out
@@ -4661,6 +4669,7 @@ grep -q "submit_socket_group" "$ROOT/lib/cli/setup.sh"
 grep -q 'broker_state="/var/lib/fieldwork-pr-broker"' "$ROOT/lib/cli/setup.sh"
 grep -q 'install -o "$broker_user" -g fieldwork-bot -m 2770 -d "$broker_state/pending"' "$ROOT/lib/cli/setup.sh"
 grep -q 'install -o "$agent_user" -g fieldwork-bot -m 2770 -d "$broker_state/notifications"' "$ROOT/lib/cli/setup.sh"
+grep -q 'setfacl -m "u:$broker_user:rwx" "$broker_state/notifications"' "$ROOT/lib/cli/setup.sh"
 grep -q "that is the bot ID from the token, not an approver chat ID" "$ROOT/lib/cli/setup.sh"
 grep -q "agent user's primary group" "$ROOT/examples/broker-client.py"
 

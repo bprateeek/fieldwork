@@ -29,6 +29,7 @@ def _load_bot_module(tmp: Path):
     os.environ["FIELDWORK_BOT_SECRET_PATH"] = str(tmp / "secret")
     os.environ["FIELDWORK_BOT_LOG_PATH"] = str(tmp / "bot.log")
     os.environ["FIELDWORK_BOT_HEALTH_PATH"] = str(tmp / "bot-health.json")
+    os.environ["FIELDWORK_BOT_DEDUPE_STORE_PATH"] = str(tmp / "notification-dedupe.json")
     os.environ["FIELDWORK_BOT_TELEGRAM_API"] = "http://localhost.invalid"
 
     from importlib.machinery import SourceFileLoader
@@ -103,6 +104,9 @@ class BotPendingScanTests(unittest.TestCase):
             p.unlink()
         for p in Path(self.bot.NOTIFICATIONS_DIR).glob("*"):
             p.unlink()
+        dedupe = Path(self.bot.DEDUPE_STORE_PATH)
+        if dedupe.exists():
+            dedupe.unlink()
 
     def _write_pending(self, rid: str) -> None:
         record = {
@@ -180,6 +184,42 @@ class BotPendingScanTests(unittest.TestCase):
             self.bot.process_notifications_dir(self.cfg)
 
         self.assertEqual([c["text"] for c in calls], ["hello mobile", "hello mobile"])
+        self.assertEqual(list(Path(self.bot.NOTIFICATIONS_DIR).glob("*")), [])
+
+    def test_process_notifications_dir_accepts_envelope_and_dedups(self) -> None:
+        payload = {
+            "schema": 1,
+            "kind": "broker_lifecycle",
+            "source": "broker",
+            "event": "request_queued",
+            "repo_slug": "fieldwork-smoke",
+            "request_id": "11111111-1111-4111-8111-111111111111",
+            "branch": "fieldwork/test",
+            "dedupe_key": "request_queued:fieldwork-smoke:11111111-1111-4111-8111-111111111111",
+            "text": "Approval queued: fieldwork-smoke @ fieldwork/test",
+        }
+        Path(self.bot.NOTIFICATIONS_DIR, "a.json").write_text(json.dumps(payload))
+
+        calls: list[dict] = []
+
+        def fake_telegram_call(token, method, payload, timeout=15):
+            calls.append(payload)
+            return {"ok": True}
+
+        with patch.object(self.bot, "telegram_call", side_effect=fake_telegram_call):
+            sent = self.bot.process_notifications_dir(self.cfg)
+
+        self.assertEqual(sent, 1)
+        self.assertEqual([c["text"] for c in calls], [payload["text"], payload["text"]])
+        self.assertTrue(Path(self.bot.DEDUPE_STORE_PATH).exists())
+
+        Path(self.bot.NOTIFICATIONS_DIR, "b.json").write_text(json.dumps(payload))
+        calls.clear()
+        with patch.object(self.bot, "telegram_call", side_effect=fake_telegram_call):
+            sent = self.bot.process_notifications_dir(self.cfg)
+
+        self.assertEqual(sent, 0)
+        self.assertEqual(calls, [])
         self.assertEqual(list(Path(self.bot.NOTIFICATIONS_DIR).glob("*")), [])
 
 

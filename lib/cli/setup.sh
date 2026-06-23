@@ -2455,6 +2455,12 @@ if [ -d "$broker_state" ]; then
   id "$broker_user" >/dev/null 2>&1 || { echo "broker state owner '$broker_user' is not a user" >&2; exit 1; }
   install -o "$broker_user" -g fieldwork-bot -m 2770 -d "$broker_state/pending"
   install -o "$agent_user" -g fieldwork-bot -m 2770 -d "$broker_state/notifications"
+  if command -v setfacl >/dev/null 2>&1; then
+    setfacl -m "u:$broker_user:rwx" "$broker_state/notifications"
+    setfacl -d -m "u:$broker_user:rwx" "$broker_state/notifications"
+  else
+    echo "setfacl unavailable; broker lifecycle notifications need manual ACL setup for $broker_state/notifications" >&2
+  fi
 fi
 
 systemctl daemon-reload

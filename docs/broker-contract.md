@@ -142,6 +142,14 @@ The broker logs to:
 
 Logs include request IDs, validation results, push attempts, PR creation attempts, and rejection reasons. They do not include the GitHub token.
 
+The structured audit log lives at:
+
+```text
+/var/lib/fieldwork-pr-broker/audit.jsonl
+```
+
+`audit.jsonl` and rotated `audit.jsonl.N` files are owned by the broker user and group, mode `0640`. On ACL-capable systems the installer grants the agent user a direct read ACL on those files plus traverse-only access to `/var/lib/fieldwork-pr-broker`. That lets the future event poller and local dashboard open the known audit path without joining `fieldwork-bot` or reading `pending/` and `requests/`. The broker re-applies mode and the direct read ACL after audit writes and rotation.
+
 Accepted request IDs are also recorded in the replay ledger:
 
 ```text
