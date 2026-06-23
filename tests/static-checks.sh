@@ -3723,18 +3723,28 @@ grep -q 'setfacl -m "u:$BROKER_USER:rwx" "$STATE_DIR/notifications"' "$ROOT/lib/
 grep -q "def preflight" "$ROOT/lib/broker/server.py"
 grep -q "FIELDWORK_FORGE" "$ROOT/lib/broker/server.py"
 grep -q "FIELDWORK_GITHUB_CREDENTIAL_MODE" "$ROOT/lib/broker/server.py"
+grep -q "FIELDWORK_GITHUB_APP_PRIVATE_KEY_PATH" "$ROOT/lib/broker/server.py"
+grep -q "class AppCredentialProvider" "$ROOT/lib/broker/server.py"
 grep -q "class CredentialProvider" "$ROOT/lib/broker/server.py"
 grep -q "class PatCredentialProvider" "$ROOT/lib/broker/server.py"
 grep -q "class ForgeBackend" "$ROOT/lib/broker/server.py"
 grep -q "class GitHubBackend" "$ROOT/lib/broker/server.py"
 grep -q "github_credential_provider" "$ROOT/lib/broker/server.py"
+grep -q "write_request_token_file" "$ROOT/lib/broker/server.py"
+grep -q "FIELDWORK_BROKER_TOKEN_PATH" "$ROOT/lib/broker/git-askpass"
+grep -q "EnvironmentFile=-/etc/fieldwork-pr-broker/credential.env" "$ROOT/lib/broker/fieldwork-pr-broker.service"
+grep -q "FIELDWORK_GITHUB_CREDENTIAL_MODE" "$ROOT/lib/broker/rotate-pat"
+grep -q "github-app-private-key.pem" "$ROOT/lib/broker/rotate-pat"
+grep -q "GitHub App private key" "$ROOT/lib/cli/verify-security.sh"
 grep -q "GIT_CONFIG_KEY_0.*safe.directory" "$ROOT/lib/broker/server.py"
 grep -q "GIT_CONFIG_KEY_1.*core.hooksPath" "$ROOT/lib/broker/server.py"
 grep -q '"push", "--no-verify"' "$ROOT/lib/broker/server.py"
 grep -q "broker cannot read repo checkout" "$ROOT/lib/broker/server.py"
 grep -q "FIELDWORK_GITHUB_CREDENTIAL_MODE=pat" "$ROOT/docs/broker-standalone.md"
-grep -q "future GitHub App provider" "$ROOT/docs/broker-standalone.md"
+grep -q "FIELDWORK_GITHUB_CREDENTIAL_MODE=app" "$ROOT/docs/broker-standalone.md"
+grep -q "one-hour installation tokens" "$ROOT/docs/broker-standalone.md"
 grep -q "The credential provider chooses the GitHub token source" "$ROOT/docs/threat-model.md"
+grep -q "FIELDWORK_GITHUB_CREDENTIAL_MODE=app" "$ROOT/docs/setup.md"
 if grep -v '^[[:space:]]*#' "$ROOT/lib/scripts/fieldwork-onboard" | grep -Eq 'sudo([[:space:]]+-[^[:space:]]+)*[[:space:]]+-u[[:space:]]+fieldwork-pr-broker'; then
   echo "onboard must not require sudo to impersonate the broker after setup hardening" >&2
   exit 1
@@ -4020,6 +4030,36 @@ FIELDWORK_FAKE_SOCKET_GROUP=pr-submitters FIELDWORK_FAKE_SOCKET_UNIT_GROUP=pr-su
   "$ROOT/bin/fieldwork" verify-security >${TMPDIR:-/tmp}/fieldwork-verify-custom-socket.out
 grep -q "broker socket owner/mode is fieldwork-pr-broker:pr-submitters 660" ${TMPDIR:-/tmp}/fieldwork-verify-custom-socket.out
 grep -q "custom groups must remain visible inside the agent sandbox" ${TMPDIR:-/tmp}/fieldwork-verify-custom-socket.out
+
+echo "[checks] verify-security accepts GitHub App credential mode"
+fake_verify_app_bin="$(mktemp_dir)"
+cat > "$fake_verify_app_bin/ssh" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  *"fieldwork-vps true"*) exit 0 ;;
+  *"test -f '/etc/sudoers.d/fieldwork-fieldwork'"*) exit 1 ;;
+  *"FIELDWORK_GITHUB_CREDENTIAL_MODE"*) printf '%s' "app" ;;
+  *"FIELDWORK_GITHUB_APP_PRIVATE_KEY_PATH"*) printf '%s' "/etc/fieldwork-pr-broker/github-app-private-key.pem" ;;
+  *"stat -c '%U:%G %a'"*"github-app-private-key.pem"*) printf '%s\n' "fieldwork-pr-broker:fieldwork-pr-broker 600" ;;
+  *"test ! -r"*"github-app-private-key.pem"*) exit 0 ;;
+  *"test ! -e /etc/fieldwork-pr-broker/gh-token || test ! -r /etc/fieldwork-pr-broker/gh-token"*) exit 0 ;;
+  *"id -gn 'fieldwork'"*) printf '%s\n' "fieldwork" ;;
+  *"sed -n 's/^SocketGroup=//p' /etc/systemd/system/fieldwork-pr-broker.socket"*) exit 0 ;;
+  *"stat -c '%U:%G %a' /run/fieldwork-pr-broker/fieldwork-pr.sock"*) printf '%s\n' "fieldwork-pr-broker:fieldwork 660" ;;
+  *"test -w /run/fieldwork-pr-broker/fieldwork-pr.sock"*) exit 0 ;;
+  *"stat -c '%U:%G %a' /var/lib/fieldwork-pr-broker/requests"*) printf '%s\n' "fieldwork-pr-broker:fieldwork-pr-broker 700" ;;
+  *"systemctl cat fieldwork-pr-broker.service"*) exit 0 ;;
+  *"test -f /etc/systemd/system/fieldwork-bot.service"*) exit 1 ;;
+  *"sudo -n ufw status"*) printf '%s\n' "Status: inactive" ;;
+  *"notify\\.env|NTFY_TOPIC|TG_BOT_TOKEN"*) exit 0 ;;
+  *) exit 1 ;;
+esac
+SH
+chmod +x "$fake_verify_app_bin/ssh"
+PATH="$fake_verify_app_bin:$PATH" "$ROOT/bin/fieldwork" verify-security >${TMPDIR:-/tmp}/fieldwork-verify-app-mode.out
+grep -q "broker credential mode is GitHub App" ${TMPDIR:-/tmp}/fieldwork-verify-app-mode.out
+grep -q "GitHub App private key owner/mode is fieldwork-pr-broker:fieldwork-pr-broker 600" ${TMPDIR:-/tmp}/fieldwork-verify-app-mode.out
+grep -q "stale broker PAT is absent or unreadable by the agent" ${TMPDIR:-/tmp}/fieldwork-verify-app-mode.out
 
 echo "[checks] verify-security UFW filter recognises public vs private 22/tcp rules"
 ufw_filter() {

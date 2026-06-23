@@ -2,7 +2,7 @@
 
 The PR broker is Fieldwork's write boundary.
 
-Claude can edit and commit in the repo workspace, but it does not receive the GitHub write token. To open a pull request, Claude writes a structured request under the repo and sends it through a tokenless Unix-socket client. The broker validates the request, pushes a branch with its own PAT, and opens the PR.
+Claude can edit and commit in the repo workspace, but it does not receive the GitHub write token. To open a pull request, Claude writes a structured request under the repo and sends it through a tokenless Unix-socket client. The broker validates the request, pushes a branch with its own GitHub credential, and opens the PR.
 
 ## Request Location
 
@@ -50,13 +50,13 @@ The client sends the request to:
 
 The checked-in systemd template uses `SocketGroup=fieldwork-pr`, but the installer rewrites the installed socket group. By default the installed socket is owned by `fieldwork-pr-broker:<agent-primary-group>` with mode `0660` (for the standard install, usually `fieldwork-pr-broker:fieldwork`).
 
-The agent's primary group is preserved by the user namespace that `claude remote-control --sandbox` puts the agent into. A dedicated supplementary group would be stripped from the agent's effective group set inside the sandbox and the kernel would deny `connect()` against the 0660 group-gated socket. The broker user owns the socket and the GitHub PAT, but the agent user cannot read the PAT (`/etc/fieldwork-pr-broker/gh-token` is mode `0600`, owned by the broker user).
+The agent's primary group is preserved by the user namespace that `claude remote-control --sandbox` puts the agent into. A dedicated supplementary group would be stripped from the agent's effective group set inside the sandbox and the kernel would deny `connect()` against the 0660 group-gated socket. The broker user owns the socket and the GitHub credential, but the agent user cannot read the PAT or GitHub App private key (`/etc/fieldwork-pr-broker/gh-token` and `/etc/fieldwork-pr-broker/github-app-private-key.pem` are mode `0600`, owned by the broker user when present).
 
 An operator who wants to gate the socket with a dedicated group can override the default via `FIELDWORK_BROKER_SOCKET_GROUP=<group>` in `lib/broker/install.sh`, but must then arrange for the agent's userns mapping to preserve that group. Otherwise this kind of regression resurfaces.
 
 ## Preflight Endpoint
 
-Onboarding can ask the broker to prove PAT reachability before it creates a checkout:
+Onboarding can ask the broker to prove credential reachability before it creates a checkout:
 
 ```text
 POST /preflight
@@ -70,7 +70,7 @@ Request:
 }
 ```
 
-The broker validates the owner/repo shape, reads its own PAT, and runs `gh repo view` in the broker environment. Success means the token can resolve the repo. A `404` response means the fine-grained PAT probably does not include that selected repository. This endpoint does not push, open a PR, or expose the token to the caller.
+The broker validates the owner/repo shape, obtains its own PAT or GitHub App installation token, and runs `gh repo view` in the broker environment. Success means the token can resolve the repo. A `404` response means the fine-grained PAT probably does not include that selected repository, or the GitHub App is not installed on it. This endpoint does not push, open a PR, or expose the token to the caller.
 
 ## Broker Validations
 

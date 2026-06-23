@@ -73,7 +73,7 @@ GitHub branch + pull request
 | `fieldwork-pr-prepare`        |                       `fieldwork` | Thin client from the agent to the prepare runner socket.                      |
 | `fieldwork-pr-prepare-runner` | `fieldwork`, systemd user manager | Runs branch/stage/commit outside the agent's cage.                            |
 | `fieldwork-pr-submit`         |                       `fieldwork` | Tokenless broker client.                                                      |
-| `fieldwork-pr-broker`         |             `fieldwork-pr-broker` | Owns GitHub PAT, validates requests, pushes, creates PRs.                     |
+| `fieldwork-pr-broker`         |             `fieldwork-pr-broker` | Owns GitHub credential, validates requests, pushes, creates PRs.              |
 | `fieldwork-bot`               |                   `fieldwork-bot` | Owns Telegram token, prompts for approval, posts decisions to approve socket. |
 | `lib/templates/repo`          |        committed into target repo | AGENTS.md, Claude guidance/hooks/skills, review templates, optional workflows.|
 
@@ -147,7 +147,8 @@ The broker:
 
 `FIELDWORK_FORGE=github` selects the GitHub backend. GitHub credential source is
 a separate axis: `FIELDWORK_GITHUB_CREDENTIAL_MODE=pat` is the current default,
-and `app` is reserved for a future GitHub App provider.
+and `app` uses a broker-owned GitHub App private key to mint short-lived
+installation tokens.
 
 The broker pushes to a URL derived from `.fieldwork/expected-origin`; it does not trust `origin` for push authentication.
 
@@ -170,7 +171,7 @@ Approval is repo-scoped. A committed `.fieldwork/approval-gate` marker tells the
   -> approve pushes and opens PR, deny deletes pending request
 ```
 
-The bot cannot submit PR requests because it is not in the submit socket group. The agent cannot approve requests because it is not in the approve socket group. The bot and agent do not hold the GitHub PAT.
+The bot cannot submit PR requests because it is not in the submit socket group. The agent cannot approve requests because it is not in the approve socket group. The bot and agent do not hold the GitHub credential.
 
 See [approval-gate.md](approval-gate.md).
 
@@ -211,7 +212,7 @@ The broker is the most reusable component. Advanced operators can install it sta
 
 Claude Code remote control is the current full control adapter: it is how Claude mobile instructions reach the long-running Fieldwork-managed agent session. Codex support intentionally bypasses adapters because Codex Desktop owns the SSH-launched process lifecycle and remote-project picker.
 
-Optional approval transports are intentionally narrow control surfaces. They may present Approve/Deny actions for approval-gated PRs, but they do not hold the GitHub PAT and do not inject free text into the agent session. The broker remains the component that validates requests and performs GitHub operations.
+Optional approval transports are intentionally narrow control surfaces. They may present Approve/Deny actions for approval-gated PRs, but they do not hold the GitHub credential and do not inject free text into the agent session. The broker remains the component that validates requests and performs GitHub operations.
 
 ## Current Constraints
 

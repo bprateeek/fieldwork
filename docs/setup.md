@@ -15,7 +15,8 @@ You need:
 - Codex CLI authenticated on the VPS when using `--agent codex` or `--agent both`.
 - GitHub CLI authenticated on the VPS for repo-resolution preflights.
 - A GitHub repo. Fieldwork records the repo's default branch during onboarding.
-- A fine-grained GitHub PAT for the broker.
+- A fine-grained GitHub PAT for the broker by default, or a GitHub App id,
+  installation id, and private key for App credential mode.
 
 Fieldwork assumes project checkouts live under `/home/fieldwork/projects/<slug>` unless you override config.
 
@@ -130,9 +131,9 @@ The broker installer creates:
 
 The installed submit socket defaults to the agent user's primary group, not a dedicated supplementary group. That matters because sandboxed agent sessions can strip supplementary groups.
 
-## 5. Store The Broker PAT
+## 5. Store The Broker GitHub Credential
 
-Create a fine-grained GitHub PAT for the broker. Required permissions:
+PAT mode is the default. Create a fine-grained GitHub PAT for the broker. Required permissions:
 
 - Contents: read/write.
 - Pull requests: read/write.
@@ -151,6 +152,12 @@ ssh -t fieldwork-vps "sudo -p '[sudo] VPS Linux password for fieldwork: ' env FI
 ```
 
 Paste the GitHub PAT only after `rotate-pat` prompts for it. The token is written to `/etc/fieldwork-pr-broker/gh-token`, owned by `fieldwork-pr-broker`, mode `600`.
+
+Advanced option: instead of a PAT, set `FIELDWORK_GITHUB_CREDENTIAL_MODE=app`
+when running `rotate-pat` and provide `FIELDWORK_GITHUB_APP_ID`,
+`FIELDWORK_GITHUB_APP_INSTALLATION_ID`, and the GitHub App private key PEM on
+stdin. The broker stores the private key and mints short-lived installation
+tokens for requests.
 
 ## 6. Verify The Host
 

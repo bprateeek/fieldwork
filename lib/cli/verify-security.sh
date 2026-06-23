@@ -85,20 +85,53 @@ EOF
     security_ok "temporary passwordless sudo rule is absent"
   fi
 
-  local pat_meta=""
-  pat_meta="$(ssh "$FIELDWORK_SSH_HOST" "sudo -n stat -c '%U:%G %a' /etc/fieldwork-pr-broker/gh-token 2>/dev/null" || true)"
-  if [ -z "$pat_meta" ]; then
-    security_manual "broker PAT file metadata needs sudo inspection" "Run: $(remote_sudo_ssh_command "stat -c '%U:%G %a' /etc/fieldwork-pr-broker/gh-token")"
-  elif [ "$pat_meta" = "fieldwork-pr-broker:fieldwork-pr-broker 600" ]; then
-    security_ok "broker PAT file owner/mode is fieldwork-pr-broker:fieldwork-pr-broker 600"
-  else
-    security_fail "broker PAT file owner/mode is $pat_meta" "Run: $(remote_sudo_ssh_command "env FIELDWORK_ROTATE_PAT_TTY=1 /usr/local/sbin/rotate-pat")"
-  fi
+  local credential_mode=""
+  local app_key_path="/etc/fieldwork-pr-broker/github-app-private-key.pem"
+  credential_mode="$(ssh "$FIELDWORK_SSH_HOST" "sudo -n sh -c '. /etc/fieldwork-pr-broker/credential.env 2>/dev/null || true; printf \"%s\" \"\${FIELDWORK_GITHUB_CREDENTIAL_MODE:-pat}\"' 2>/dev/null" || true)"
+  case "$credential_mode" in
+    app|pat) ;;
+    *) credential_mode="pat" ;;
+  esac
 
-  if ssh "$FIELDWORK_SSH_HOST" "test ! -r /etc/fieldwork-pr-broker/gh-token" >/dev/null 2>&1; then
-    security_ok "agent user cannot read broker PAT"
+  if [ "$credential_mode" = "app" ]; then
+    security_ok "broker credential mode is GitHub App"
+    app_key_path="$(ssh "$FIELDWORK_SSH_HOST" "sudo -n sh -c '. /etc/fieldwork-pr-broker/credential.env 2>/dev/null || true; printf \"%s\" \"\${FIELDWORK_GITHUB_APP_PRIVATE_KEY_PATH:-/etc/fieldwork-pr-broker/github-app-private-key.pem}\"' 2>/dev/null" || true)"
+    [ -n "$app_key_path" ] || app_key_path="/etc/fieldwork-pr-broker/github-app-private-key.pem"
+    local app_key_meta=""
+    app_key_meta="$(ssh "$FIELDWORK_SSH_HOST" "sudo -n stat -c '%U:%G %a' $(shell_quote "$app_key_path") 2>/dev/null" || true)"
+    if [ -z "$app_key_meta" ]; then
+      security_manual "GitHub App private key metadata needs sudo inspection" "Run: $(remote_sudo_ssh_command "stat -c '%U:%G %a' $(shell_quote "$app_key_path")")"
+    elif [ "$app_key_meta" = "fieldwork-pr-broker:fieldwork-pr-broker 600" ]; then
+      security_ok "GitHub App private key owner/mode is fieldwork-pr-broker:fieldwork-pr-broker 600"
+    else
+      security_fail "GitHub App private key owner/mode is $app_key_meta" "Run rotate-pat in App mode to reinstall the key: $(remote_sudo_ssh_command "env FIELDWORK_GITHUB_CREDENTIAL_MODE=app FIELDWORK_ROTATE_PAT_TTY=1 /usr/local/sbin/rotate-pat")"
+    fi
+    if ssh "$FIELDWORK_SSH_HOST" "test ! -r $(shell_quote "$app_key_path")" >/dev/null 2>&1; then
+      security_ok "agent user cannot read GitHub App private key"
+    else
+      security_fail "agent user can read GitHub App private key" "Run: $(remote_sudo_ssh_command "chown fieldwork-pr-broker:fieldwork-pr-broker $(shell_quote "$app_key_path") && $(remote_sudo_prefix) chmod 600 $(shell_quote "$app_key_path")")"
+    fi
+    if ssh "$FIELDWORK_SSH_HOST" "test ! -e /etc/fieldwork-pr-broker/gh-token || test ! -r /etc/fieldwork-pr-broker/gh-token" >/dev/null 2>&1; then
+      security_ok "stale broker PAT is absent or unreadable by the agent"
+    else
+      security_fail "agent user can read stale broker PAT" "Run: $(remote_sudo_ssh_command "chown fieldwork-pr-broker:fieldwork-pr-broker /etc/fieldwork-pr-broker/gh-token && $(remote_sudo_prefix) chmod 600 /etc/fieldwork-pr-broker/gh-token")"
+    fi
   else
-    security_fail "agent user can read broker PAT" "Run: $(remote_sudo_ssh_command "chown fieldwork-pr-broker:fieldwork-pr-broker /etc/fieldwork-pr-broker/gh-token && $(remote_sudo_prefix) chmod 600 /etc/fieldwork-pr-broker/gh-token")"
+    local pat_meta=""
+    pat_meta="$(ssh "$FIELDWORK_SSH_HOST" "sudo -n stat -c '%U:%G %a' /etc/fieldwork-pr-broker/gh-token 2>/dev/null" || true)"
+    if [ -z "$pat_meta" ]; then
+      security_manual "broker PAT file metadata needs sudo inspection" "Run: $(remote_sudo_ssh_command "stat -c '%U:%G %a' /etc/fieldwork-pr-broker/gh-token")"
+    elif [ "$pat_meta" = "fieldwork-pr-broker:fieldwork-pr-broker 600" ]; then
+      security_ok "broker PAT file owner/mode is fieldwork-pr-broker:fieldwork-pr-broker 600"
+    else
+      security_fail "broker PAT file owner/mode is $pat_meta" "Run: $(remote_sudo_ssh_command "env FIELDWORK_ROTATE_PAT_TTY=1 /usr/local/sbin/rotate-pat")"
+    fi
+
+    if ssh "$FIELDWORK_SSH_HOST" "test ! -r /etc/fieldwork-pr-broker/gh-token" >/dev/null 2>&1; then
+      security_ok "agent user cannot read broker PAT"
+    else
+      security_fail "agent user can read broker PAT" "Run: $(remote_sudo_ssh_command "chown fieldwork-pr-broker:fieldwork-pr-broker /etc/fieldwork-pr-broker/gh-token && $(remote_sudo_prefix) chmod 600 /etc/fieldwork-pr-broker/gh-token")"
+    fi
   fi
   if agents_include "$security_agents" codex; then
     if ssh "$FIELDWORK_SSH_HOST" "test \"\$(id -un)\" = $(shell_quote "$FIELDWORK_REMOTE_USER")" >/dev/null 2>&1; then
@@ -106,7 +139,13 @@ EOF
     else
       security_fail "Codex SSH identity is not $FIELDWORK_REMOTE_USER" "Fix Host $FIELDWORK_SSH_HOST User in ~/.ssh/config; Codex Desktop must connect as the Fieldwork Linux user."
     fi
-    if ssh "$FIELDWORK_SSH_HOST" "test ! -r /etc/fieldwork-pr-broker/gh-token" >/dev/null 2>&1; then
+    if [ "$credential_mode" = "app" ]; then
+      if ssh "$FIELDWORK_SSH_HOST" "test ! -r $(shell_quote "$app_key_path")" >/dev/null 2>&1; then
+        security_ok "Codex SSH identity cannot read GitHub App private key"
+      else
+        security_fail "Codex SSH identity can read GitHub App private key" "Run: $(remote_sudo_ssh_command "chown fieldwork-pr-broker:fieldwork-pr-broker $(shell_quote "$app_key_path") && $(remote_sudo_prefix) chmod 600 $(shell_quote "$app_key_path")")"
+      fi
+    elif ssh "$FIELDWORK_SSH_HOST" "test ! -r /etc/fieldwork-pr-broker/gh-token" >/dev/null 2>&1; then
       security_ok "Codex SSH identity cannot read broker PAT"
     else
       security_fail "Codex SSH identity can read broker PAT" "Run: $(remote_sudo_ssh_command "chown fieldwork-pr-broker:fieldwork-pr-broker /etc/fieldwork-pr-broker/gh-token && $(remote_sudo_prefix) chmod 600 /etc/fieldwork-pr-broker/gh-token")"
@@ -186,14 +225,14 @@ EOF
   echo
   echo "  Trust separation: the bot user must not be able to read the broker"
   if [ -n "$submit_socket_group" ]; then
-    echo "  GitHub PAT and must not be in the submit socket group ($submit_socket_group)."
+    echo "  GitHub credential and must not be in the submit socket group ($submit_socket_group)."
   else
-    echo "  GitHub PAT and must not be in the submit socket group."
+    echo "  GitHub credential and must not be in the submit socket group."
   fi
   echo
   info_row "Setup" "fieldwork setup-notify --telegram-bot  (or skip, this is optional)"
   echo
-  # When installed, we assert the trust separation: no GitHub PAT in the
+  # When installed, we assert the trust separation: no GitHub credential in the
   # bot user's reach, no submit-socket group membership, and tight perms on the
   # approve socket and HMAC secret.
   if ssh "$FIELDWORK_SSH_HOST" "test -f /etc/systemd/system/fieldwork-bot.service" >/dev/null 2>&1; then
@@ -253,7 +292,18 @@ EOF
     # user isn't asked to verify state for an account that hasn't been
     # created yet.
     if [ "$bot_user_exists" = "1" ]; then
-      if ssh "$FIELDWORK_SSH_HOST" "sudo -n -u fieldwork-bot test ! -r /etc/fieldwork-pr-broker/gh-token 2>/dev/null" >/dev/null 2>&1; then
+      if [ "$credential_mode" = "app" ]; then
+        if ssh "$FIELDWORK_SSH_HOST" "sudo -n -u fieldwork-bot test ! -r $(shell_quote "$app_key_path") 2>/dev/null" >/dev/null 2>&1; then
+          security_ok "bot user cannot read GitHub App private key"
+        else
+          security_manual "GitHub App key isolation needs manual sudo verification" "Run: ssh -t $FIELDWORK_SSH_HOST $(shell_double_quote "sudo -u fieldwork-bot cat $(shell_quote "$app_key_path")"). Expected: permission denied"
+        fi
+        if ssh "$FIELDWORK_SSH_HOST" "sudo -n -u fieldwork-bot sh -c 'test ! -e /etc/fieldwork-pr-broker/gh-token || test ! -r /etc/fieldwork-pr-broker/gh-token' 2>/dev/null" >/dev/null 2>&1; then
+          security_ok "bot user cannot read stale broker GitHub PAT"
+        else
+          security_manual "stale PAT-read isolation needs manual sudo verification" "Run: ssh -t $FIELDWORK_SSH_HOST $(shell_double_quote "sudo -u fieldwork-bot cat /etc/fieldwork-pr-broker/gh-token"). Expected: permission denied"
+        fi
+      elif ssh "$FIELDWORK_SSH_HOST" "sudo -n -u fieldwork-bot test ! -r /etc/fieldwork-pr-broker/gh-token 2>/dev/null" >/dev/null 2>&1; then
         security_ok "bot user cannot read broker GitHub PAT"
       else
         security_manual "PAT-read isolation needs manual sudo verification" "Run: ssh -t $FIELDWORK_SSH_HOST $(shell_double_quote "sudo -u fieldwork-bot cat /etc/fieldwork-pr-broker/gh-token"). Expected: permission denied"

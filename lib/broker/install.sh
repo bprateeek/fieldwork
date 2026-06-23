@@ -400,7 +400,7 @@ resolve_socket_group_for_display
 echo "PR broker install"
 echo
 echo "  Installs the root-owned broker daemon, socket, and rotate-pat helper."
-echo "  The GitHub PAT is stored in the next setup step, not by this installer."
+echo "  The GitHub credential is stored in the next setup step, not by this installer."
 echo
 echo "  Identities:"
 printf '    %-14s %s\n' "broker user:"  "$BROKER_USER"
@@ -440,5 +440,5 @@ ok "verification complete"
 
 echo
 ok "broker install complete"
-note "Next in setup: store the broker GitHub PAT with rotate-pat."
+note "Next in setup: store the broker GitHub credential with rotate-pat."
 note "If socket access is stale, reconnect to the VPS so the agent user sees the $BROKER_SOCKET_GROUP group."

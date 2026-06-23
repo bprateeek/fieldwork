@@ -7,6 +7,7 @@ GitHub, do not need a broker socket, and do not use a real PAT.
 
 from __future__ import annotations
 
+import base64
 import importlib.util
 import json
 import os
@@ -32,10 +33,12 @@ class BrokerValidationTests(unittest.TestCase):
         cls.ledger = cls.tmp / "ledger"
         cls.audit = cls.tmp / "audit.jsonl"
         cls.pending = cls.tmp / "pending"
+        cls.app_tokens = cls.tmp / "app-tokens"
         cls.fake_bin = cls.tmp / "bin"
         cls.projects.mkdir()
         cls.ledger.mkdir()
         cls.pending.mkdir()
+        cls.app_tokens.mkdir()
         cls.fake_bin.mkdir()
 
         gitleaks = cls.fake_bin / "gitleaks"
@@ -56,6 +59,7 @@ class BrokerValidationTests(unittest.TestCase):
         os.environ["FIELDWORK_BROKER_LOG_PATH"] = str(cls.tmp / "broker.log")
         os.environ["FIELDWORK_BROKER_TOKEN_PATH"] = str(cls.tmp / "gh-token")
         os.environ["FIELDWORK_BROKER_ASKPASS_PATH"] = str(cls.tmp / "git-askpass")
+        os.environ["FIELDWORK_GITHUB_APP_TOKEN_DIR"] = str(cls.app_tokens)
 
         spec = importlib.util.spec_from_file_location("fieldwork_broker_server", ROOT / "lib/broker/server.py")
         assert spec and spec.loader
@@ -79,8 +83,16 @@ class BrokerValidationTests(unittest.TestCase):
         token = self.tmp / "gh-token"
         if token.exists():
             token.unlink()
+        for item in self.app_tokens.glob("*"):
+            item.unlink()
         if self.audit.exists():
             self.audit.unlink()
+        self.server.GITHUB_CREDENTIAL_MODE = "pat"
+        self.server.GITHUB_API = "https://api.github.com"
+        self.server.GITHUB_APP_ID = ""
+        self.server.GITHUB_APP_INSTALLATION_ID = ""
+        self.server.GITHUB_APP_PRIVATE_KEY_PATH = "/etc/fieldwork-pr-broker/github-app-private-key.pem"
+        self.server._github_app_token_cache.clear()
 
     def git(self, *args: str, cwd: Path) -> None:
         subprocess.run(["git", *args], cwd=cwd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -199,16 +211,68 @@ class BrokerValidationTests(unittest.TestCase):
         self.assertEqual(ctx.exception.status, 503)
         self.assertIn("PAT is not stored", ctx.exception.message)
 
-    def test_github_app_mode_is_reserved(self) -> None:
+    def test_github_app_mode_selects_app_provider(self) -> None:
         old = self.server.GITHUB_CREDENTIAL_MODE
         self.server.GITHUB_CREDENTIAL_MODE = "app"
         try:
-            with self.assertRaises(self.server.RequestError) as ctx:
-                self.server.github_credential_provider().acquire_token()
+            provider = self.server.github_credential_provider()
         finally:
             self.server.GITHUB_CREDENTIAL_MODE = old
-        self.assertEqual(ctx.exception.status, 503)
-        self.assertIn("not implemented", ctx.exception.message)
+        self.assertIsInstance(provider, self.server.AppCredentialProvider)
+
+    def test_github_app_provider_mints_and_caches_installation_token(self) -> None:
+        key_path = self.tmp / "github-app.pem"
+        key_path.write_text("-----BEGIN PRIVATE KEY-----\ntest\n-----END PRIVATE KEY-----\n")
+        openssl = self.fake_bin / "openssl"
+        openssl.write_text("#!/usr/bin/env bash\ncat >/dev/null\nprintf test-signature\n")
+        openssl.chmod(0o755)
+        captured: list[dict] = []
+        from unittest.mock import patch
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return json.dumps({
+                    "token": "ghs_installation_token",
+                    "expires_at": "2099-01-01T00:00:00Z",
+                }).encode()
+
+        def fake_urlopen(request, timeout):
+            captured.append({
+                "url": request.full_url,
+                "auth": request.get_header("Authorization", ""),
+                "body": request.data.decode(),
+                "timeout": timeout,
+            })
+            return FakeResponse()
+
+        with patch.object(self.server.urllib.request, "urlopen", side_effect=fake_urlopen):
+            self.server.GITHUB_APP_ID = "12345"
+            self.server.GITHUB_APP_INSTALLATION_ID = "67890"
+            self.server.GITHUB_APP_PRIVATE_KEY_PATH = str(key_path)
+            self.server.GITHUB_API = "https://github.example.test/api/v3"
+            provider = self.server.AppCredentialProvider()
+            self.assertEqual(provider.acquire_token(), "ghs_installation_token")
+            self.assertEqual(provider.acquire_token(), "ghs_installation_token")
+
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(captured[0]["url"], "https://github.example.test/api/v3/app/installations/67890/access_tokens")
+        self.assertEqual(captured[0]["body"], "{}")
+        self.assertEqual(captured[0]["timeout"], 30)
+        auth = captured[0]["auth"]
+        self.assertTrue(auth.startswith("Bearer "))
+        header, payload, signature = auth[len("Bearer "):].split(".")
+        jwt_header = json.loads(base64.urlsafe_b64decode(header + "=" * (-len(header) % 4)))
+        jwt_payload = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+        self.assertEqual(jwt_header["alg"], "RS256")
+        self.assertEqual(jwt_payload["iss"], "12345")
+        self.assertGreater(jwt_payload["exp"], jwt_payload["iat"])
+        self.assertEqual(signature, self.server.base64url(b"test-signature"))
 
     def test_preflight_reports_selected_repo_scope(self) -> None:
         (self.tmp / "gh-token").write_text("github_pat_test\n")
@@ -734,6 +798,59 @@ class BrokerValidationTests(unittest.TestCase):
         self.assertNotIn("GH_TOKEN", push["env"])
         self.assertEqual(create["env"]["GH_TOKEN"], "github_pat_test")
         self.assertEqual(edit["env"]["GH_TOKEN"], "github_pat_test")
+
+    def test_github_backend_uses_temp_token_file_for_app_push(self) -> None:
+        repo = self.make_repo()
+        validated = self.server.validate(self.request(repo))
+        calls: list[dict] = []
+        token_paths: list[str] = []
+        from unittest.mock import patch
+
+        class StaticAppProvider:
+            mode = "app"
+
+            def acquire_token(self) -> str:
+                return "ghs_app_token"
+
+        def fake_run(argv, *args, **kwargs):
+            calls.append({"argv": list(argv), "env": dict(kwargs.get("env") or {})})
+
+            class _R:
+                returncode = 0
+                stdout = ""
+                stderr = ""
+
+            r = _R()
+            if argv[:2] == ["git", "-C"] and "push" in argv:
+                token_path = Path(kwargs["env"]["FIELDWORK_BROKER_TOKEN_PATH"])
+                token_paths.append(str(token_path))
+                self.assertTrue(token_path.is_file())
+                self.assertEqual(token_path.stat().st_mode & 0o777, 0o600)
+                self.assertEqual(token_path.read_text(), "ghs_app_token\n")
+                self.assertNotIn("ghs_app_token", " ".join(argv))
+                return r
+            if argv[:3] == ["gh", "pr", "create"]:
+                self.assertEqual(kwargs["env"]["GH_TOKEN"], "ghs_app_token")
+                self.assertNotIn("ghs_app_token", " ".join(argv))
+                r.stdout = "https://github.com/owner/fieldwork-smoke/pull/42\n"
+                return r
+            if argv[:3] == ["gh", "pr", "edit"]:
+                self.assertEqual(kwargs["env"]["GH_TOKEN"], "ghs_app_token")
+                self.assertNotIn("ghs_app_token", " ".join(argv))
+                return r
+            raise AssertionError(f"unexpected subprocess.run call: {argv}")
+
+        backend = self.server.GitHubBackend(StaticAppProvider())
+        with patch.object(self.server.subprocess, "run", side_effect=fake_run):
+            pr_url = backend.push_and_open_pr(validated)
+
+        self.assertEqual(pr_url, "https://github.com/owner/fieldwork-smoke/pull/42")
+        self.assertEqual(len(token_paths), 1)
+        self.assertFalse(Path(token_paths[0]).exists())
+        push = calls[0]
+        self.assertEqual(push["env"]["GIT_ASKPASS"], self.server.ASKPASS_PATH)
+        self.assertIn("FIELDWORK_BROKER_TOKEN_PATH", push["env"])
+        self.assertNotIn("GH_TOKEN", push["env"])
 
     def test_push_succeeds_when_label_apply_fails(self) -> None:
         # gh pr edit returns nonzero (e.g. label not defined on the repo).

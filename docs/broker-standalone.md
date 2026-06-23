@@ -4,12 +4,12 @@
 > Use this guide only when you are integrating the PR broker with a non-Fieldwork
 > agent or custom control plane.
 
-The Fieldwork PR broker is a small Linux daemon that owns a GitHub PAT, listens
-on a Unix socket for JSON PR requests from an unprivileged agent user, and
-opens the PR on the agent's behalf. **You don't need the rest of Fieldwork to
-use it.** Any coding agent (Claude, Codex, OpenAI Agent SDK, a CI runner, anything
-that can write a JSON request) can submit PRs through it without ever holding a
-GitHub token itself.
+The Fieldwork PR broker is a small Linux daemon that owns the GitHub write
+credential, listens on a Unix socket for JSON PR requests from an unprivileged
+agent user, and opens the PR on the agent's behalf. **You don't need the rest
+of Fieldwork to use it.** Any coding agent (Claude, Codex, OpenAI Agent SDK, a
+CI runner, anything that can write a JSON request) can submit PRs through it
+without ever holding a GitHub token itself.
 
 If you are running Fieldwork end-to-end, run `fieldwork setup` and use
 [`setup.md`](setup.md) instead. Setup handles broker install for you. This page
@@ -18,11 +18,11 @@ is for **broker-only** installs.
 ## What you get
 
 - A systemd-managed daemon (`fieldwork-pr-broker.service`) running as its own
-  user, with the PAT in a 0600 file only it can read.
+  user, with the PAT or GitHub App private key in a 0600 file only it can read.
 - A Unix socket at `/run/fieldwork-pr-broker/fieldwork-pr.sock`, group-writable
   by your agent user.
-- A `rotate-pat` helper to (re)store the PAT without it ever passing through
-  argv or environment.
+- A `rotate-pat` helper to (re)store the GitHub credential without it ever
+  passing through argv or environment.
 - A documented JSON request contract (see [`broker-contract.md`](broker-contract.md))
   and [`../schema/pr-request.schema.json`](../schema/pr-request.schema.json).
 - Replay protection (per-request UUID, stored ledger), per-repo rate limiting,
@@ -73,11 +73,22 @@ Flags (all optional except `--agent-user`):
 
 After the install completes:
 
-1. Store the broker's GitHub PAT (broker reads it from a 0600 file; this is the
-   only path the PAT takes into the broker):
+1. Store the broker's GitHub credential. PAT mode is the default: the broker
+   reads the PAT from a 0600 file; this is the only path the PAT takes into the
+   broker.
 
    ```bash
    sudo /usr/local/sbin/rotate-pat
+   ```
+
+   GitHub App mode stores the App private key instead and mints short-lived
+   installation tokens at request time:
+
+   ```bash
+   sudo env FIELDWORK_GITHUB_CREDENTIAL_MODE=app \
+     FIELDWORK_GITHUB_APP_ID=<app-id> \
+     FIELDWORK_GITHUB_APP_INSTALLATION_ID=<installation-id> \
+     /usr/local/sbin/rotate-pat < github-app-private-key.pem
    ```
 
 2. Confirm the broker is up:
@@ -178,17 +189,23 @@ client is the smallest correct implementation worth copying.
   to `1..120`.
 - **Forge and credentials:** `FIELDWORK_FORGE=github` is the only supported
   forge backend in this preview. `FIELDWORK_GITHUB_CREDENTIAL_MODE=pat` is the
-  default and only implemented GitHub credential provider; `app` is reserved for
-  a future GitHub App provider.
+  default credential provider. `FIELDWORK_GITHUB_CREDENTIAL_MODE=app` uses the
+  stored GitHub App private key to mint one-hour installation tokens, cached by
+  the broker and refreshed before expiry.
 - **PAT rotation:** `sudo /usr/local/sbin/rotate-pat` prompts for the new PAT
   and writes it atomically; the broker re-reads on the next request.
+- **GitHub App token files:** installation tokens are never written to
+  `/etc/fieldwork-pr-broker/gh-token`. For `git push`, the broker writes the
+  short-lived token to a broker-private file under `/run/fieldwork-pr-broker`,
+  points `FIELDWORK_BROKER_TOKEN_PATH` at it for `git-askpass`, and removes it
+  after the request.
 - **Re-install:** `lib/broker/standalone-install.sh` is idempotent; rerun it
   after a Fieldwork upgrade to pick up new daemon code. The ledger, log, and
   PAT are preserved.
 
 ## Trust model in one paragraph
 
-Two unix uids. The **broker user** holds the GitHub PAT and runs the daemon.
+Two unix uids. The **broker user** holds the GitHub credential and runs the daemon.
 The **agent user** writes commits to checkouts under `--projects-root` and
 submits JSON requests over a socket whose group it is in. Cross-uid auth is by
 filesystem group on the socket. There are no shared secrets in env vars or
