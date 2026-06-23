@@ -21,8 +21,9 @@ so you can decide whether it fits before investing setup time.
 
 - Claude and Codex are supported; other agents are not yet.
 - Codex parity is partial. Claude session hooks do not run under Codex, so Codex
-  sessions have no journaling, no resume-context briefing, and no ntfy/Telegram
-  session-activity notifications. Telegram approval-gate prompts still work
+  sessions still have no hook-derived "needs input" or "turn done" activity
+  notifications. Git-derived journaling and resume-context artifacts are
+  produced by the VPS event poller. Telegram approval-gate prompts still work
   because they are broker- and bot-driven, not agent-driven.
 - Codex uses the Codex Desktop + SSH remote-project path. ChatGPT mobile may
   show only the Mac/Windows Desktop host, not a separate VPS session, and

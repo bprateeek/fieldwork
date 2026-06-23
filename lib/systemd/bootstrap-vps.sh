@@ -622,6 +622,8 @@ step "Fieldwork systemd units"
 mkdir -p "$HOME/.config/systemd/user"
 units_installed=0
 units=(
+  fieldwork-event-poll.service
+  fieldwork-event-poll.timer
   fieldwork-verify-runner.socket
   fieldwork-verify-runner@.service
   fieldwork-pr-prepare-runner.socket
@@ -655,6 +657,11 @@ if [ -f "$HOME/.config/systemd/user/fieldwork-pr-prepare-runner.socket" ]; then
   run_optional "fieldwork-pr-prepare-runner.socket enabled" \
     systemctl --user enable --now fieldwork-pr-prepare-runner.socket \
     || note "could not enable fieldwork-pr-prepare-runner.socket; rerun: systemctl --user enable --now fieldwork-pr-prepare-runner.socket"
+fi
+if [ -f "$HOME/.config/systemd/user/fieldwork-event-poll.timer" ]; then
+  run_optional "fieldwork-event-poll.timer enabled" \
+    systemctl --user enable --now fieldwork-event-poll.timer \
+    || note "could not enable fieldwork-event-poll.timer; rerun: systemctl --user enable --now fieldwork-event-poll.timer"
 fi
 ok "Fieldwork systemd units installed"
 

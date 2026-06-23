@@ -5,6 +5,12 @@
 set -euo pipefail
 REPO_SLUG="$(basename "${CLAUDE_PROJECT_DIR:-$PWD}")"
 JOURNAL="$HOME/.fieldwork/project-journals/${REPO_SLUG}.md"
+ARTIFACT="$HOME/.fieldwork/state/resume-context/${REPO_SLUG}.md"
+
+if [ -f "$ARTIFACT" ]; then
+  cat "$ARTIFACT"
+  exit 0
+fi
 
 cd "${CLAUDE_PROJECT_DIR:-$PWD}" 2>/dev/null || true
 

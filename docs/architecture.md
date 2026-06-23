@@ -161,7 +161,7 @@ Onboarding applies `lib/templates/repo` to the target repository. Important piec
 
 - `.claude/skills/verify-before-pr/SKILL.md`: tells Claude to run `fieldwork-verify`.
 - `.claude/skills/pr-delivery/SKILL.md`: tells Claude to verify, prepare, write the broker request, and submit.
-- `.claude/hooks/`: resume context, bash guard, journal, and notification hooks.
+- `.claude/hooks/`: resume-context artifact injection, bash guard, and notification hooks.
 - `AGENTS.md`: tells Codex the same verify, prepare, submit, approval-gate, no-direct-push, and `fieldwork/...` branch rules.
 - `.fieldwork/expected-origin`: broker origin pin.
 - `.fieldwork/default-branch`: default branch captured during onboarding.

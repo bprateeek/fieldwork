@@ -22,7 +22,7 @@ Planned:
 - local shell evaluation mode
 - other forge brokers
 - additional approval transports
-- Codex journaling, resume-context, lifecycle notifications, and stronger
+- Codex in-session lifecycle notifications and stronger
   Fieldwork-managed sandbox parity
 - additional Fieldwork-launched coding-agent adapters
 - packages such as Homebrew and Debian
