@@ -142,11 +142,52 @@ class DashboardTests(unittest.TestCase):
         self.assertIn("replaceChildren", html)
         self.assertIn("textContent", html)
         self.assertNotIn("innerHTML", html)
+        self.assertIn("cursor: pointer", html)
 
         status, content_type, body = call("/api/status", method="POST")
         self.assertEqual(status, 405)
         self.assertEqual(content_type, "application/json; charset=utf-8")
         self.assertEqual(json.loads(body.decode("utf-8"))["error"], "GET only")
+
+    def test_dashboard_server_refuses_non_loopback_host(self) -> None:
+        env = os.environ.copy()
+        env.update({
+            "FIELDWORK_DASHBOARD_HOST": "0.0.0.0",
+            "FIELDWORK_DASHBOARD_PORT": "0",
+        })
+        result = subprocess.run(
+            [str(DASHBOARD)], env=env, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("127.0.0.1", result.stderr)
+
+    def test_snapshot_preserves_script_close_and_newline(self) -> None:
+        subject = 'fix </script><script>alert(1)</script>'
+        (self.events / "demo.json").write_text(json.dumps({
+            "schema_version": 1,
+            "repo_slug": "demo",
+            "worktrees": {
+                "/home/fieldwork/worktrees/demo-change": {
+                    "branch": "fieldwork/x",
+                    "latest_commit_subject": subject,
+                },
+            },
+            "prs": {},
+        }))
+        # The close-script sequence must survive verbatim through the JSON layer,
+        # across the commit subject and a separate (newline-delimited) journal line.
+        (self.journals / "demo.md").write_text(f"- 2026 | fieldwork/x | {subject}\nsecond </script> line\n")
+
+        snapshot = self.run_snapshot()
+
+        repo = snapshot["repos"][0]
+        self.assertEqual(
+            repo["worktrees"]["/home/fieldwork/worktrees/demo-change"]["latest_commit_subject"],
+            subject,
+        )
+        self.assertIn(f"- 2026 | fieldwork/x | {subject}", repo["journal_tail"])
+        self.assertIn("second </script> line", repo["journal_tail"])
 
 
 if __name__ == "__main__":

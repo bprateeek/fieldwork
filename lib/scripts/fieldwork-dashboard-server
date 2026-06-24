@@ -25,95 +25,382 @@ INDEX_HTML = """<!doctype html>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Fieldwork Dashboard</title>
   <style>
-    :root { color-scheme: light dark; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-    body { margin: 0; background: Canvas; color: CanvasText; }
-    header { padding: 18px 24px; border-bottom: 1px solid color-mix(in srgb, CanvasText 18%, transparent); display: flex; justify-content: space-between; gap: 16px; align-items: baseline; }
-    h1 { font-size: 20px; margin: 0; font-weight: 650; letter-spacing: 0; }
-    main { max-width: 1180px; margin: 0 auto; padding: 20px 24px 40px; }
-    .meta { color: color-mix(in srgb, CanvasText 62%, transparent); font-size: 13px; }
-    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 14px; }
-    .repo { border: 1px solid color-mix(in srgb, CanvasText 18%, transparent); border-radius: 8px; padding: 14px; background: color-mix(in srgb, Canvas 96%, CanvasText 4%); }
-    .repo h2 { margin: 0 0 10px; font-size: 17px; letter-spacing: 0; }
-    .row { display: flex; justify-content: space-between; gap: 12px; border-top: 1px solid color-mix(in srgb, CanvasText 10%, transparent); padding: 8px 0; font-size: 13px; }
-    .row:first-of-type { border-top: 0; }
-    .label { color: color-mix(in srgb, CanvasText 62%, transparent); }
-    .value { text-align: right; overflow-wrap: anywhere; }
-    ul { margin: 8px 0 0; padding-left: 18px; }
-    li { margin: 4px 0; overflow-wrap: anywhere; }
-    .empty { color: color-mix(in srgb, CanvasText 62%, transparent); padding: 28px 0; }
-    button { font: inherit; border: 1px solid color-mix(in srgb, CanvasText 22%, transparent); background: Canvas; color: CanvasText; border-radius: 6px; padding: 6px 10px; }
+    * { box-sizing: border-box; }
+    :root {
+      --bg: #0d0a15;
+      --panel: #161221;
+      --panel-2: #1b1628;
+      --card: #181423;
+      --line: rgba(255,255,255,.07);
+      --line-2: rgba(255,255,255,.10);
+      --text: #eceaf3;
+      --muted: #9b94ad;
+      --faint: #6c6580;
+      --accent: #8b5cff;
+      --hover: rgba(255,255,255,.04);
+      --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+      --amber: linear-gradient(135deg, #f8cf5b, #f0a93b);
+      --violet: linear-gradient(135deg, #a78bfa, #7c5cff);
+      --green: linear-gradient(135deg, #8ee6a3, #45c170);
+    }
+    html { -webkit-text-size-adjust: 100%; }
+    body {
+      margin: 0; min-height: 100vh; color: var(--text);
+      background:
+        radial-gradient(900px 500px at 12% -8%, rgba(139,92,255,.18), transparent 60%),
+        radial-gradient(900px 600px at 100% 0%, rgba(139,92,255,.10), transparent 55%),
+        var(--bg);
+      font: 13.5px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility;
+    }
+    .app { display: flex; min-height: 100vh; }
+    /* Sidebar */
+    .sidebar {
+      width: 248px; flex: none; position: sticky; top: 0; height: 100vh;
+      display: flex; flex-direction: column; gap: 18px;
+      padding: 22px 16px; border-right: 1px solid var(--line);
+      background: linear-gradient(180deg, var(--panel), color-mix(in srgb, var(--panel) 88%, #000));
+    }
+    .brand { display: flex; align-items: center; gap: 11px; padding: 4px 8px 8px; }
+    .brand-mark {
+      width: 34px; height: 34px; border-radius: 10px; flex: none;
+      display: grid; place-items: center; font-weight: 800; font-size: 16px; color: #1a1230;
+      background: var(--violet); box-shadow: 0 6px 18px -8px rgba(124,92,255,.9);
+    }
+    .brand-name { font-size: 16px; font-weight: 680; letter-spacing: -0.01em; }
+    .nav { display: flex; flex-direction: column; gap: 3px; }
+    .nav-item {
+      display: flex; align-items: center; gap: 11px; width: 100%; cursor: pointer;
+      padding: 9px 10px; border-radius: 11px; border: 0; background: transparent;
+      color: var(--muted); font: inherit; font-size: 13px; font-weight: 540; text-align: left;
+      transition: background .12s ease, color .12s ease;
+    }
+    .nav-item:hover { background: var(--hover); color: var(--text); }
+    .nav-item.active { background: color-mix(in srgb, var(--accent) 16%, transparent); color: var(--text); }
+    .nav-ico {
+      width: 26px; height: 26px; border-radius: 8px; flex: none; display: grid; place-items: center;
+      font-size: 12px; font-weight: 700; font-family: var(--mono);
+      background: color-mix(in srgb, var(--accent) 18%, transparent); color: color-mix(in srgb, var(--accent) 88%, var(--text));
+    }
+    .nav-item.active .nav-ico { background: var(--violet); color: #16102b; }
+    .nav-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .side-card {
+      margin-top: auto; padding: 14px; border-radius: 14px; border: 1px solid var(--line);
+      background: var(--panel-2);
+    }
+    .side-card-title { font-size: 12.5px; font-weight: 640; margin-bottom: 4px; }
+    .side-card-text { font-size: 12px; color: var(--muted); line-height: 1.5; }
+    .side-foot { display: flex; align-items: center; gap: 8px; padding: 2px 8px; font-size: 12px; color: var(--faint); }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: #43c170; box-shadow: 0 0 0 3px rgba(67,193,112,.18); flex: none; }
+    /* Content */
+    .content { flex: 1; min-width: 0; padding: 26px clamp(18px, 3vw, 40px) 60px; }
+    .topbar { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 22px; }
+    .greeting h1 { margin: 0; font-size: 22px; font-weight: 680; letter-spacing: -0.02em; }
+    .greeting .sub { margin: 4px 0 0; color: var(--muted); font-size: 13.5px; }
+    button#refresh {
+      cursor: pointer; font: inherit; font-size: 13px; font-weight: 580;
+      padding: 9px 18px; border-radius: 11px; color: #16102b;
+      border: 0; background: var(--violet); box-shadow: 0 8px 22px -10px rgba(124,92,255,.9);
+      transition: transform .05s ease, filter .14s ease;
+    }
+    button#refresh:hover { filter: brightness(1.06); }
+    button#refresh:active { transform: translateY(1px); }
+    button#refresh:disabled { cursor: default; opacity: .55; filter: none; }
+    /* Summary stat cards */
+    .summary { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-bottom: 20px; }
+    .stat { border-radius: 18px; padding: 18px 18px 16px; color: #1a1430; min-height: 132px; display: flex; flex-direction: column; box-shadow: 0 14px 30px -18px rgba(0,0,0,.7); }
+    .stat.amber { background: var(--amber); }
+    .stat.violet { background: var(--violet); }
+    .stat.green { background: var(--green); }
+    .stat-top { display: flex; align-items: flex-start; justify-content: space-between; }
+    .stat-label { font-size: 13.5px; font-weight: 640; opacity: .85; }
+    .stat-btn { width: 30px; height: 30px; border-radius: 50%; display: grid; place-items: center; background: rgba(20,12,40,.78); color: #fff; font-size: 14px; flex: none; }
+    .stat-value { margin-top: auto; font-size: 34px; font-weight: 740; letter-spacing: -0.02em; line-height: 1; }
+    .stat-sub { margin-top: 6px; font-size: 12.5px; font-weight: 560; opacity: .72; }
+    /* Layout */
+    .layout { display: grid; grid-template-columns: 1fr 320px; gap: 18px; align-items: start; }
+    .main-col { display: flex; flex-direction: column; gap: 18px; }
+    .panel { border: 1px solid var(--line); border-radius: 18px; background: var(--card); padding: 20px 22px; box-shadow: 0 1px 2px rgba(0,0,0,.3); }
+    .panel-head { display: flex; align-items: center; gap: 11px; flex-wrap: wrap; }
+    .panel-name { font-size: 16px; font-weight: 660; letter-spacing: -0.01em; }
+    .sec { margin-top: 18px; }
+    .sec-head { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+    .sec-title { margin: 0; font-size: 10.5px; font-weight: 720; text-transform: uppercase; letter-spacing: .1em; color: var(--faint); }
+    .sec-count { font-size: 11px; font-weight: 580; color: var(--muted); padding: 1px 8px; border-radius: 999px; background: rgba(255,255,255,.06); }
+    .mono { font-family: var(--mono); font-size: 12px; letter-spacing: -0.01em; }
+    .wt { padding: 9px 10px; border-radius: 10px; transition: background .1s ease; }
+    .wt:hover, .pr:hover { background: var(--hover); }
+    .wt-top { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .wt-path { margin-top: 2px; color: var(--faint); overflow-wrap: anywhere; }
+    .pr { display: grid; grid-template-columns: 78px 52px 1fr auto; align-items: center; gap: 12px; padding: 10px; border-radius: 10px; transition: background .1s ease; }
+    .pr-num { font-weight: 620; font-variant-numeric: tabular-nums; color: var(--muted); }
+    .pr-branch { color: var(--text); overflow-wrap: anywhere; }
+    .pr .link { justify-self: end; }
+    @media (max-width: 680px) { .pr { grid-template-columns: auto 1fr; } .pr .link { grid-column: 1 / -1; justify-self: start; } }
+    .card-foot { margin-top: 18px; padding-top: 13px; border-top: 1px solid var(--line); display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
+    .meta-label { font-size: 10px; font-weight: 680; text-transform: uppercase; letter-spacing: .08em; color: var(--faint); }
+    .link { cursor: pointer; color: color-mix(in srgb, var(--accent) 70%, #fff); text-decoration: none; font-size: 12px; font-weight: 580; }
+    .link:hover { text-decoration: underline; }
+    /* Activity rail */
+    .rail { position: sticky; top: 26px; border: 1px solid var(--line); border-radius: 18px; background: var(--panel); padding: 16px 16px 18px; }
+    .rail-head { font-size: 13px; font-weight: 660; margin: 2px 4px 12px; }
+    .activity { display: flex; flex-direction: column; gap: 9px; }
+    .act { padding: 11px 12px; border-radius: 13px; background: var(--panel-2); border: 1px solid var(--line); }
+    .act-top { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }
+    .act-repo { font-size: 11px; color: var(--faint); }
+    .act-msg { font-size: 12.5px; line-height: 1.45; overflow-wrap: anywhere; }
+    .act-ts { margin-top: 6px; font-family: var(--mono); font-size: 10.5px; color: var(--faint); }
+    @media (max-width: 940px) {
+      .layout { grid-template-columns: 1fr; }
+      .rail { position: static; }
+      .summary { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 760px) {
+      .sidebar { display: none; }
+    }
+    .empty { text-align: center; color: var(--muted); padding: 60px 0; }
+    .empty-sm { color: var(--faint); font-size: 12.5px; padding: 8px 4px; }
+    .pill { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; font-weight: 620; line-height: 1.5; padding: 2px 9px; border-radius: 999px; border: 1px solid transparent; white-space: nowrap; }
+    .pill.default { background: rgba(255,255,255,.08); color: var(--muted); }
+    .pill.branch { font-family: var(--mono); font-weight: 500; letter-spacing: -0.01em; background: rgba(255,255,255,.05); color: var(--muted); border-color: var(--line-2); }
+    .pill.audit { background: rgba(139,92,255,.18); color: #b69bff; }
+    .pill.merged { background: rgba(163,113,247,.18); color: #c4a4ff; }
+    .pill.open { background: rgba(63,185,80,.16); color: #6ed98a; }
+    .pill.closed { background: rgba(248,81,73,.16); color: #ff8079; }
+    .pill.info { background: rgba(91,134,255,.16); color: #8fb0ff; }
+    .pill.warn { background: rgba(227,179,65,.16); color: #f0cf76; }
   </style>
 </head>
 <body>
-  <header>
-    <h1>Fieldwork Dashboard</h1>
-    <div>
-      <button id="refresh" type="button">Refresh</button>
-      <span id="generated" class="meta"></span>
-    </div>
-  </header>
-  <main>
-    <div id="root" class="grid"></div>
-  </main>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="brand"><span class="brand-mark">F</span><span class="brand-name">Fieldwork</span></div>
+      <nav id="nav" class="nav"></nav>
+      <div class="side-card">
+        <div class="side-card-title">Read-only view</div>
+        <div class="side-card-text">Served over an SSH tunnel from your VPS. No write access from here.</div>
+      </div>
+      <div class="side-foot"><span class="dot"></span><span id="generated">Connecting\\u2026</span></div>
+    </aside>
+    <main class="content">
+      <div class="topbar">
+        <div class="greeting">
+          <h1>Repository status</h1>
+          <p class="sub">Live view of your Fieldwork sessions.</p>
+        </div>
+        <div class="top-actions"><button id="refresh" type="button">Refresh</button></div>
+      </div>
+      <div id="summary" class="summary"></div>
+      <div class="layout">
+        <div id="repos" class="main-col"></div>
+        <aside class="rail">
+          <div class="rail-head">Recent activity</div>
+          <div id="activity" class="activity"></div>
+        </aside>
+      </div>
+    </main>
+  </div>
   <script>
-    const root = document.getElementById("root");
-    const generated = document.getElementById("generated");
-    const refresh = document.getElementById("refresh");
+    const elRefresh = document.getElementById("refresh");
+    const elGenerated = document.getElementById("generated");
+    const elNav = document.getElementById("nav");
+    const elSummary = document.getElementById("summary");
+    const elRepos = document.getElementById("repos");
+    const elActivity = document.getElementById("activity");
 
     function node(tag, className, text) {
       const el = document.createElement(tag);
       if (className) el.className = className;
-      if (text !== undefined) el.textContent = text;
+      if (text !== undefined && text !== null) el.textContent = text;
       return el;
     }
 
-    function row(label, value) {
-      const r = node("div", "row");
-      r.append(node("span", "label", label), node("span", "value", value || "-"));
-      return r;
+    function pill(text, kind) {
+      return node("span", "pill " + (kind || "default"), text);
+    }
+
+    function safeLink(text, url) {
+      if (typeof url === "string" && /^https?:\\/\\//i.test(url)) {
+        const a = node("a", "link", text);
+        a.href = url;
+        a.target = "_blank";
+        a.rel = "noopener noreferrer";
+        return a;
+      }
+      return node("span", "mono", url || "");
+    }
+
+    function section(title, count) {
+      const s = node("section", "sec");
+      const h = node("div", "sec-head");
+      h.append(node("h3", "sec-title", title));
+      if (count !== undefined) h.append(node("span", "sec-count", String(count)));
+      s.append(h);
+      return s;
+    }
+
+    function prKind(state) {
+      const s = String(state || "").toUpperCase();
+      if (s === "MERGED") return "merged";
+      if (s === "CLOSED") return "closed";
+      if (s === "OPEN" || s === "") return "open";
+      return "default";
+    }
+
+    function statCard(label, value, sub, kind) {
+      const c = node("div", "stat " + kind);
+      const top = node("div", "stat-top");
+      top.append(node("div", "stat-label", label));
+      top.append(node("div", "stat-btn", "\\u2197"));
+      c.append(top);
+      c.append(node("div", "stat-value", String(value)));
+      c.append(node("div", "stat-sub", sub));
+      return c;
+    }
+
+    function navItem(label, icon, onClick, active) {
+      const b = node("button", "nav-item" + (active ? " active" : ""));
+      b.type = "button";
+      b.append(node("span", "nav-ico", icon));
+      b.append(node("span", "nav-label", label));
+      b.addEventListener("click", onClick);
+      return b;
     }
 
     function renderRepo(repo) {
-      const card = node("section", "repo");
-      card.append(node("h2", "", repo.slug));
-      const worktrees = repo.worktrees || {};
-      const prs = repo.prs || {};
+      const card = node("section", "panel");
+      card.id = "repo-" + repo.slug;
+      const head = node("div", "panel-head");
+      head.append(node("span", "panel-name", repo.slug));
       const audit = repo.latest_audit_event || {};
-      card.append(row("Worktrees", String(Object.keys(worktrees).length)));
-      card.append(row("Latest audit", audit.event ? `${audit.event} ${audit.branch || ""}` : "none"));
-      card.append(row("Resume context", repo.resume_context_present ? repo.resume_context_path : "missing"));
-      for (const [path, wt] of Object.entries(worktrees)) {
-        card.append(row(wt.branch || "worktree", `${path} - ${String(wt.rev || "").slice(0, 12)} - dirty ${wt.dirty_count || 0}`));
-      }
-      if (Object.keys(prs).length) {
-        const list = node("ul", "");
-        for (const [branch, pr] of Object.entries(prs)) {
-          list.append(node("li", "", `${branch} - #${pr.number || "?"} - ${pr.state || "open"} ${pr.url || ""}`));
+      if (audit.event) head.append(pill(audit.event + (audit.branch ? (" \\u00b7 " + audit.branch) : ""), "audit"));
+      card.append(head);
+
+      const wEntries = Object.entries(repo.worktrees || {});
+      const wsec = section("Worktrees", wEntries.length);
+      if (wEntries.length) {
+        for (const [path, wt] of wEntries) {
+          const r = node("div", "wt");
+          const top = node("div", "wt-top");
+          top.append(pill(wt.branch || "(detached)", "branch"));
+          top.append(node("span", "mono", String(wt.rev || "").slice(0, 12)));
+          const ahead = Number(wt.ahead_of_base || 0);
+          const pending = Number(wt.dirty_count || 0) + Number(wt.staged_count || 0) + Number(wt.untracked_count || 0);
+          if (ahead) top.append(pill("\\u2191" + ahead, "info"));
+          if (pending) top.append(pill("\\u25cf " + pending, "warn"));
+          r.append(top);
+          r.append(node("div", "wt-path mono", path));
+          wsec.append(r);
         }
-        card.append(list);
+      } else {
+        wsec.append(node("div", "empty-sm", "No active worktrees."));
       }
-      if (repo.journal_tail && repo.journal_tail.length) {
-        const list = node("ul", "");
-        for (const line of repo.journal_tail.slice(-5)) list.append(node("li", "", line));
-        card.append(list);
+      card.append(wsec);
+
+      const prEntries = Object.entries(repo.prs || {});
+      if (prEntries.length) {
+        const psec = section("Pull requests", prEntries.length);
+        for (const [branch, pr] of prEntries) {
+          const r = node("div", "pr");
+          r.append(pill(String(pr.state || "OPEN").toUpperCase(), prKind(pr.state)));
+          r.append(node("span", "pr-num", "#" + (pr.number || "?")));
+          r.append(node("span", "pr-branch", branch));
+          if (pr.url) r.append(safeLink("open \\u2197", pr.url));
+          psec.append(r);
+        }
+        card.append(psec);
       }
+
+      const foot = node("div", "card-foot");
+      foot.append(node("span", "meta-label", "Resume context"));
+      foot.append(node("span", "mono", repo.resume_context_present ? repo.resume_context_path : "missing"));
+      card.append(foot);
       return card;
     }
 
-    async function load() {
-      const res = await fetch("/api/status", { cache: "no-store" });
-      const data = await res.json();
-      generated.textContent = data.generated_at ? `Updated ${data.generated_at}` : "";
-      const repos = data.repos || [];
-      if (!repos.length) {
-        root.replaceChildren(node("div", "empty", "No Fieldwork repo state found yet."));
-        return;
-      }
-      root.replaceChildren(...repos.map(renderRepo));
+    function activityItem(entry) {
+      const it = node("div", "act");
+      const top = node("div", "act-top");
+      if (entry.branch) top.append(pill(entry.branch, "branch"));
+      top.append(node("span", "act-repo", entry.slug));
+      it.append(top);
+      it.append(node("div", "act-msg", entry.msg));
+      if (entry.ts) it.append(node("div", "act-ts", entry.ts));
+      return it;
     }
 
-    refresh.addEventListener("click", load);
-    load().catch((err) => root.replaceChildren(node("div", "empty", String(err))));
+    function collectActivity(repos) {
+      const acts = [];
+      for (const r of repos) {
+        for (const line of (r.journal_tail || [])) {
+          const parts = String(line).replace(/^-\\s*/, "").split(" | ");
+          if (parts.length >= 3) {
+            acts.push({ slug: r.slug, ts: parts[0], branch: parts[1], msg: parts.slice(2).join(" | ") });
+          } else {
+            acts.push({ slug: r.slug, ts: "", branch: "", msg: String(line) });
+          }
+        }
+      }
+      acts.sort((a, b) => String(b.ts || "").localeCompare(String(a.ts || "")));
+      return acts.slice(0, 14);
+    }
+
+    async function load() {
+      elRefresh.disabled = true;
+      const label = elRefresh.textContent;
+      elRefresh.textContent = "Refreshing\\u2026";
+      try {
+        const res = await fetch("/api/status", { cache: "no-store" });
+        const data = await res.json();
+        elGenerated.textContent = data.generated_at ? ("Updated " + data.generated_at) : "Connected";
+        const repos = data.repos || [];
+
+        let worktrees = 0, openPrs = 0, mergedPrs = 0;
+        for (const r of repos) {
+          worktrees += Object.keys(r.worktrees || {}).length;
+          for (const pr of Object.values(r.prs || {})) {
+            const st = String(pr.state || "").toUpperCase();
+            if (st === "MERGED" || pr.merged_at) mergedPrs++;
+            else if (st !== "CLOSED") openPrs++;
+          }
+        }
+        elSummary.replaceChildren(
+          statCard("Worktrees", worktrees, "active checkouts", "amber"),
+          statCard("Open PRs", openPrs, "awaiting review", "violet"),
+          statCard("Merged", mergedPrs, "shipped", "green"),
+        );
+
+        const nav = [navItem("Overview", "\\u25c9", () => window.scrollTo({ top: 0, behavior: "smooth" }), true)];
+        for (const r of repos) {
+          nav.push(navItem(r.slug, r.slug.slice(0, 1).toUpperCase(), () => {
+            const t = document.getElementById("repo-" + r.slug);
+            if (t) t.scrollIntoView({ behavior: "smooth", block: "start" });
+          }, false));
+        }
+        elNav.replaceChildren(...nav);
+
+        if (!repos.length) {
+          elRepos.replaceChildren(node("div", "empty", "No Fieldwork repo state found yet."));
+        } else {
+          elRepos.replaceChildren(...repos.map(renderRepo));
+        }
+
+        const recent = collectActivity(repos);
+        if (recent.length) {
+          elActivity.replaceChildren(...recent.map(activityItem));
+        } else {
+          elActivity.replaceChildren(node("div", "empty-sm", "No recent activity."));
+        }
+      } catch (err) {
+        elRepos.replaceChildren(node("div", "empty", String(err)));
+      } finally {
+        elRefresh.disabled = false;
+        elRefresh.textContent = label;
+      }
+    }
+
+    elRefresh.addEventListener("click", load);
+    load();
   </script>
 </body>
 </html>

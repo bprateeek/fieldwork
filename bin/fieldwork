@@ -3736,6 +3736,31 @@ REMOTE
   fi
   set -e
 
+  # The SSH -L local listener can take a moment to start accepting after the ssh
+  # process launches; opening the browser before then shows a connection-refused
+  # page that needs a manual reload. Wait until the local port answers first.
+  dashboard_local_ready() {
+    if command -v curl >/dev/null 2>&1; then
+      curl -fsS -o /dev/null --max-time 2 "http://127.0.0.1:${local_port}/healthz" 2>/dev/null
+      return
+    fi
+    (exec 3<>"/dev/tcp/127.0.0.1/${local_port}") 2>/dev/null && exec 3>&- 3<&-
+  }
+  fieldwork_status_start "waiting for dashboard to respond"
+  local dashboard_ready=0 dashboard_attempt=0
+  while [ "$dashboard_attempt" -lt 40 ]; do
+    if dashboard_local_ready; then dashboard_ready=1; break; fi
+    kill -0 "$FIELDWORK_ACTIVE_PID" 2>/dev/null || break
+    sleep 0.25
+    dashboard_attempt=$((dashboard_attempt + 1))
+  done
+  if [ "$dashboard_ready" = "1" ]; then
+    fieldwork_status_succeed "dashboard responding"
+  else
+    fieldwork_status_fail ""
+    info_note "dashboard did not answer yet; if the page shows an error, reload it"
+  fi
+
   echo
   label_line "Open"
   echo "  $url"
