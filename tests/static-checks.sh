@@ -180,6 +180,9 @@ bash "$ROOT/tests/provision-tests.sh"
 echo "[checks] rotate-pat validation"
 bash "$ROOT/tests/rotate-pat-tests.sh"
 
+echo "[checks] verify-security credential-mode awareness"
+bash "$ROOT/tests/verify-security-tests.sh"
+
 echo "[checks] broker python syntax"
 python3 -c 'import ast, pathlib, sys; ast.parse(pathlib.Path(sys.argv[1]).read_text())' "$ROOT/lib/broker/server.py"
 
