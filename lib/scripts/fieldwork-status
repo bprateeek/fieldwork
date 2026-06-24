@@ -251,12 +251,20 @@ fieldwork_status_start() {
 
   local mode="plain"
   [ -t 1 ] && mode="tty"
-  fieldwork_status_renderer \
-    "$FIELDWORK_STATUS_MESSAGE_FILE" \
-    "$FIELDWORK_STATUS_RENDERED_FILE" \
-    "$FIELDWORK_STATUS_DELAY_SECONDS" \
-    "$FIELDWORK_STATUS_LONG_SECONDS" \
-    "$mode" &
+  # Run the renderer in a subshell that drops the parent's INT/TERM/EXIT traps.
+  # Otherwise killing it in fieldwork_status_stop_renderer fires the inherited
+  # TERM trap (bin/fieldwork: `kill -TERM "$$"`), which re-sends SIGTERM to the
+  # parent shell and prints bash "run_pending_traps" warnings (seen under
+  # doctor/quickstart).
+  (
+    trap - INT TERM EXIT
+    fieldwork_status_renderer \
+      "$FIELDWORK_STATUS_MESSAGE_FILE" \
+      "$FIELDWORK_STATUS_RENDERED_FILE" \
+      "$FIELDWORK_STATUS_DELAY_SECONDS" \
+      "$FIELDWORK_STATUS_LONG_SECONDS" \
+      "$mode"
+  ) &
   FIELDWORK_STATUS_PID=$!
 }
 
