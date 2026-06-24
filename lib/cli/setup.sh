@@ -529,12 +529,21 @@ EOF
     ssh "$FIELDWORK_SSH_HOST" 'export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"; command -v fieldwork-verify >/dev/null 2>&1 && command -v fieldwork-pr-prepare >/dev/null 2>&1 && command -v fieldwork-pr-submit >/dev/null 2>&1' >/dev/null 2>&1
   }
   ensure_remote_runner_sockets() {
-    ssh "$FIELDWORK_SSH_HOST" 'set -eu
+    ssh "$FIELDWORK_SSH_HOST" "force_install=$(shell_quote "$force_install") bash -s" <<'REMOTE_RUNNER_SOCKETS' >/dev/null 2>&1
+set -eu
 mkdir -p "$HOME/.config/systemd/user"
 cp "$HOME/.fieldwork/infra/fieldwork-verify-runner.socket" "$HOME/.fieldwork/infra/fieldwork-verify-runner@.service" "$HOME/.fieldwork/infra/fieldwork-pr-prepare-runner.socket" "$HOME/.fieldwork/infra/fieldwork-pr-prepare-runner@.service" "$HOME/.fieldwork/infra/fieldwork-event-poll.service" "$HOME/.fieldwork/infra/fieldwork-event-poll.timer" "$HOME/.fieldwork/infra/fieldwork-dashboard.service" "$HOME/.config/systemd/user/"
 systemctl --user daemon-reload
 systemctl --user enable --now fieldwork-verify-runner.socket fieldwork-pr-prepare-runner.socket fieldwork-event-poll.timer
-' >/dev/null 2>&1
+# On --force-install, restart so changed socket-unit settings (e.g. MaxConnections)
+# take effect; enable --now alone does not re-read an already-active socket.
+# Already-accepted runner @ instances run as separate units and are not stopped;
+# a connection attempted during the sub-second restart window may need to retry,
+# which is acceptable for an explicit reprovision.
+if [ "${force_install:-0}" = "1" ]; then
+  systemctl --user restart fieldwork-verify-runner.socket fieldwork-pr-prepare-runner.socket fieldwork-event-poll.timer
+fi
+REMOTE_RUNNER_SOCKETS
   }
   write_remote_codex_socket_allowlist() {
     local profile
@@ -2140,7 +2149,7 @@ EOF
     info_row "Purpose" "Verify the delivery runner sockets used from Codex SSH sessions."
     setup_row ok "Claude session systemd unit skipped for Codex-only setup"
   fi
-  if ! remote_verify_runner_ready >/dev/null 2>&1 || ! remote_prepare_runner_ready >/dev/null 2>&1; then
+  if [ "$force_install" = "1" ] || ! remote_verify_runner_ready >/dev/null 2>&1 || ! remote_prepare_runner_ready >/dev/null 2>&1; then
     progress_wait "enabling runner sockets" ensure_remote_runner_sockets || true
   fi
   if progress_wait "checking verify runner sandbox" remote_verify_runner_ready; then

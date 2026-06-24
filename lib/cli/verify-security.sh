@@ -203,6 +203,16 @@ EOF
     security_fail "broker request ledger owner/mode is $ledger_meta" "Run: $(remote_sudo_ssh_command "install -o fieldwork-pr-broker -g fieldwork-pr-broker -m 700 -d /var/lib/fieldwork-pr-broker/requests")"
   fi
 
+  local audit_meta=""
+  audit_meta="$(ssh "$FIELDWORK_SSH_HOST" "sudo -n stat -c '%U:%G %a' /var/lib/fieldwork-pr-broker/audit.jsonl 2>/dev/null" || true)"
+  if [ -z "$audit_meta" ]; then
+    security_manual "broker audit log metadata needs sudo inspection" "Run: $(remote_sudo_ssh_command "stat -c '%U:%G %a' /var/lib/fieldwork-pr-broker/audit.jsonl")"
+  elif [ "$audit_meta" = "fieldwork-pr-broker:fieldwork-pr-broker 640" ]; then
+    security_ok "broker audit log owner/mode is fieldwork-pr-broker:fieldwork-pr-broker 640"
+  else
+    security_fail "broker audit log owner/mode is $audit_meta" "Run: $(remote_sudo_ssh_command "chown fieldwork-pr-broker:fieldwork-pr-broker /var/lib/fieldwork-pr-broker/audit.jsonl && chmod 0640 /var/lib/fieldwork-pr-broker/audit.jsonl")"
+  fi
+
   phase_section "Broker Service Hardening"
   local directive
   for directive in \
