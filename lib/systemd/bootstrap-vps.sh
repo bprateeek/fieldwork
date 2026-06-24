@@ -645,25 +645,23 @@ done
 if [ "$units_installed" -gt 0 ]; then
   run_optional "user systemd daemon reloaded" systemctl --user daemon-reload || note "user systemd daemon-reload failed; retry after reconnecting"
 fi
-# Enable + start the verify runner socket. The socket itself is cheap
-# (no daemon process until first connect) and the agent's verify-before-pr
-# skill expects the socket to exist; failing here is fail-fast onboarding,
-# not runtime breakage.
-if [ -f "$HOME/.config/systemd/user/fieldwork-verify-runner.socket" ]; then
-  run_optional "fieldwork-verify-runner.socket enabled" \
-    systemctl --user enable --now fieldwork-verify-runner.socket \
-    || note "could not enable fieldwork-verify-runner.socket; rerun: systemctl --user enable --now fieldwork-verify-runner.socket"
-fi
-if [ -f "$HOME/.config/systemd/user/fieldwork-pr-prepare-runner.socket" ]; then
-  run_optional "fieldwork-pr-prepare-runner.socket enabled" \
-    systemctl --user enable --now fieldwork-pr-prepare-runner.socket \
-    || note "could not enable fieldwork-pr-prepare-runner.socket; rerun: systemctl --user enable --now fieldwork-pr-prepare-runner.socket"
-fi
-if [ -f "$HOME/.config/systemd/user/fieldwork-event-poll.timer" ]; then
-  run_optional "fieldwork-event-poll.timer enabled" \
-    systemctl --user enable --now fieldwork-event-poll.timer \
-    || note "could not enable fieldwork-event-poll.timer; rerun: systemctl --user enable --now fieldwork-event-poll.timer"
-fi
+# Enable + restart the runner sockets and poll timer. The sockets are cheap
+# (no daemon process until first connect) and the agent's verify-before-pr skill
+# expects them to exist; failing here is fail-fast onboarding, not runtime
+# breakage. The restart after enable is what makes a re-bootstrap apply changed
+# unit settings (e.g. socket MaxConnections); enable --now alone does not re-read
+# an already-active unit. Already-accepted runner @ instances run as separate
+# units and are not stopped by restarting the listening socket.
+for unit in fieldwork-verify-runner.socket fieldwork-pr-prepare-runner.socket fieldwork-event-poll.timer; do
+  if [ -f "$HOME/.config/systemd/user/$unit" ]; then
+    run_optional "$unit enabled" \
+      systemctl --user enable --now "$unit" \
+      || note "could not enable $unit; rerun: systemctl --user enable --now $unit"
+    run_optional "$unit restarted to apply current settings" \
+      systemctl --user restart "$unit" \
+      || note "could not restart $unit; rerun: systemctl --user restart $unit"
+  fi
+done
 ok "Fieldwork systemd units installed"
 
 # ----- post -----

@@ -2854,6 +2854,77 @@ EOF
       else
         doctor_row skipped "fieldwork-agent@ unit" "not configured for Codex-only setup"
       fi
+      # Event poller + dashboard are agent-agnostic infra, checked for both
+      # claude and codex. The poll timer must be installed, enabled (survives
+      # reboot), and active now; a VPS upgraded via onboard/refresh without a
+      # fresh setup keeps the timer unenabled, which used to pass silently.
+      # The dashboard service is started on demand by `fieldwork dashboard`, so
+      # only its unit-file presence is asserted, never is-active.
+      poll_meta="$(ssh "$FIELDWORK_SSH_HOST" '
+  unit=fieldwork-event-poll.timer
+  if test -f "$HOME/.config/systemd/user/$unit"; then
+    enabled=$(systemctl --user is-enabled "$unit" 2>/dev/null || true)
+    active=$(systemctl --user is-active "$unit" 2>/dev/null || true)
+    printf "timer=yes enabled=%s active=%s " "$enabled" "$active"
+  else
+    printf "timer=no enabled= active= "
+  fi
+  test -f "$HOME/.config/systemd/user/fieldwork-dashboard.service" \
+    && printf "dashboard=yes\n" || printf "dashboard=no\n"' 2>/dev/null || true)"
+      timer_present=""; timer_enabled=""; timer_active=""; dashboard_present=""
+      for poll_tok in $poll_meta; do
+        case "$poll_tok" in
+          timer=*) timer_present="${poll_tok#timer=}" ;;
+          enabled=*) timer_enabled="${poll_tok#enabled=}" ;;
+          active=*) timer_active="${poll_tok#active=}" ;;
+          dashboard=*) dashboard_present="${poll_tok#dashboard=}" ;;
+        esac
+      done
+      if [ -z "$poll_meta" ] || [ -z "$timer_present" ]; then
+        doctor_manual \
+          "event poll timer state could not be determined" \
+          "fieldwork doctor --remote --explain" \
+          "the SSH probe for fieldwork-event-poll.timer returned nothing" \
+          "without the poller, dashboard events and PR status updates stop refreshing" \
+          "rerun doctor; if it persists, check SSH access and systemctl --user on the VPS" \
+          "yes"
+      elif [ "$timer_present" != "yes" ]; then
+        doctor_manual \
+          "event poll timer unit file missing" \
+          "fieldwork setup --force-install" \
+          "fieldwork-event-poll.timer is not in ~/.config/systemd/user" \
+          "the poller never runs, so dashboard events and PR status updates stall" \
+          "fieldwork setup --force-install re-copies the unit, daemon-reloads, and enables it" \
+          "yes"
+      elif [ "$timer_enabled" = "enabled" ] && [ "$timer_active" = "active" ]; then
+        doctor_ok "event poll timer enabled and active"
+      else
+        if [ "$timer_enabled" != "enabled" ] && [ "$timer_active" != "active" ]; then
+          poll_fault="disabled and inactive"
+        elif [ "$timer_enabled" != "enabled" ]; then
+          poll_fault="active but not enabled across reboot"
+        else
+          poll_fault="enabled but not active"
+        fi
+        doctor_manual \
+          "event poll timer is $poll_fault" \
+          "fieldwork setup --force-install" \
+          "fieldwork-event-poll.timer is enabled=$timer_enabled active=$timer_active" \
+          "the poller drives dashboard events and PR status refresh; if disabled it will not survive a reboot, if inactive it is not refreshing now" \
+          "fieldwork setup --force-install re-applies and enables the timer. Advanced: if the unit file is already current, ssh -t $FIELDWORK_SSH_HOST 'systemctl --user enable --now fieldwork-event-poll.timer'" \
+          "yes"
+      fi
+      if [ "$dashboard_present" = "yes" ]; then
+        doctor_ok "dashboard unit installed"
+      else
+        doctor_manual \
+          "dashboard unit file missing" \
+          "fieldwork setup --force-install" \
+          "fieldwork-dashboard.service is not in ~/.config/systemd/user" \
+          "fieldwork dashboard cannot start the read-only dashboard until the unit is installed" \
+          "fieldwork setup --force-install re-copies the dashboard unit (started on demand by fieldwork dashboard)" \
+          "yes"
+      fi
 
 	      doctor_section "Verify runner"
 	      [ "$explain" = "1" ] && doctor_info "purpose" "verify /verify-before-pr can confine repo-controlled lint/test steps"

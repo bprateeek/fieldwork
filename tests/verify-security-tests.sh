@@ -51,6 +51,8 @@ ssh() {
       printf 'fieldwork-pr-broker:fieldwork-pr-broker 600' ;;
     *stat*requests*)
       printf 'fieldwork-pr-broker:fieldwork-pr-broker 700' ;;
+    *stat*audit.jsonl*)
+      printf '%s' "${FAKE_AUDIT_META-fieldwork-pr-broker:fieldwork-pr-broker 640}" ;;
     *stat*fieldwork-pr.sock*)
       printf 'fieldwork-pr-broker:fieldwork 660' ;;
     *test\ !\ -r*github-app-private-key.pem*)
@@ -106,6 +108,7 @@ assert_contains "app key owner/mode"      "$app_out" "GitHub App private key own
 assert_contains "agent cannot read key"   "$app_out" "agent user cannot read GitHub App private key"
 assert_contains "stale PAT tolerated"     "$app_out" "stale broker PAT is absent or unreadable by the agent"
 assert_absent   "no PAT-mode check"       "$app_out" "broker PAT file owner/mode"
+assert_contains "audit log owner/mode"    "$app_out" "broker audit log owner/mode is fieldwork-pr-broker:fieldwork-pr-broker 640"
 
 echo "[verify-security] PAT mode inspects the gh-token file"
 pat_rc=0
@@ -124,6 +127,24 @@ if [ "$bad_rc" -eq 0 ]; then
 else
   printf '  ok   readable key fails the check (rc %s)\n' "$bad_rc"
 fi
+
+echo "[verify-security] world-readable audit log (0644) is a hard fail"
+audit_bad_rc=0
+audit_bad_out="$(MODE=pat FAKE_AUDIT_META='fieldwork-pr-broker:fieldwork-pr-broker 644' verify_security)" || audit_bad_rc=$?
+assert_contains "reports audit drift"     "$audit_bad_out" "broker audit log owner/mode is fieldwork-pr-broker:fieldwork-pr-broker 644"
+assert_contains "audit remediation chown" "$audit_bad_out" "chown fieldwork-pr-broker:fieldwork-pr-broker /var/lib/fieldwork-pr-broker/audit.jsonl"
+assert_contains "audit remediation chmod" "$audit_bad_out" "chmod 0640 /var/lib/fieldwork-pr-broker/audit.jsonl"
+if [ "$audit_bad_rc" -eq 0 ]; then
+  printf '  FAIL audit 0644 must be non-zero exit: rc [%s]\n' "$audit_bad_rc" >&2; fail=1
+else
+  printf '  ok   audit 0644 fails the check (rc %s)\n' "$audit_bad_rc"
+fi
+
+echo "[verify-security] unreadable audit metadata degrades to manual, not fail"
+audit_manual_rc=0
+audit_manual_out="$(MODE=pat FAKE_AUDIT_META= verify_security)" || audit_manual_rc=$?
+assert_rc       "audit manual stays passing" "$audit_manual_rc" "0"
+assert_contains "audit manual inspection"    "$audit_manual_out" "broker audit log metadata needs sudo inspection"
 
 if [ "$fail" -ne 0 ]; then
   echo "verify-security-tests FAILED" >&2

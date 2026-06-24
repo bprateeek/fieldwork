@@ -236,6 +236,28 @@ grep -q "fieldwork-event-poll.timer" "$ROOT/lib/systemd/bootstrap-vps.sh"
 grep -q "fieldwork-event-poll" "$ROOT/install.sh"
 grep -q "fieldwork-event-poll.timer" "$ROOT/lib/cli/uninstall.sh"
 
+echo "[checks] setup restarts runner sockets on --force-install"
+# (1) The guard must force entry on --force-install even when sockets look ready,
+#     so a stale-MaxConnections-but-active socket is still re-applied.
+grep -Eq 'if \[ "\$force_install" = "1" \] \|\| ! remote_verify_runner_ready' "$ROOT/lib/cli/setup.sh" \
+  || { echo "setup guard missing force_install short-circuit before runner-ready check" >&2; exit 1; }
+# (2)-(5) Scoped to the remote provisioning block: force_install is passed in, and a
+#     restart of all three units is gated behind force_install (not unconditional).
+runner_block="$(awk '/ensure_remote_runner_sockets\(\) \{/,/^REMOTE_RUNNER_SOCKETS$/' "$ROOT/lib/cli/setup.sh")"
+printf '%s\n' "$runner_block" | grep -qF 'force_install=$(shell_quote "$force_install") bash -s' \
+  || { echo "ensure_remote_runner_sockets does not pass force_install into the remote shell" >&2; exit 1; }
+printf '%s\n' "$runner_block" | grep -A2 'force_install:-0' \
+  | grep -qF 'systemctl --user restart fieldwork-verify-runner.socket fieldwork-pr-prepare-runner.socket fieldwork-event-poll.timer' \
+  || { echo "force-install restart of all three runner units missing or not gated by force_install" >&2; exit 1; }
+[ "$(printf '%s\n' "$runner_block" | grep -c 'systemctl --user restart')" = "1" ] \
+  || { echo "runner-socket restart should appear exactly once (gated), not unconditionally" >&2; exit 1; }
+# bootstrap-vps shares the provisioning path and must also restart (not just
+# enable --now) so a re-bootstrap applies changed unit settings.
+grep -Eq 'for unit in fieldwork-verify-runner\.socket fieldwork-pr-prepare-runner\.socket fieldwork-event-poll\.timer' "$ROOT/lib/systemd/bootstrap-vps.sh" \
+  || { echo "bootstrap-vps does not loop-enable the three runner/timer units" >&2; exit 1; }
+grep -qF 'systemctl --user restart "$unit"' "$ROOT/lib/systemd/bootstrap-vps.sh" \
+  || { echo "bootstrap-vps does not restart runner/timer units after enable" >&2; exit 1; }
+
 echo "[checks] dashboard tests"
 python3 -m py_compile "$ROOT/lib/scripts/fieldwork-status-snapshot" "$ROOT/lib/scripts/fieldwork-dashboard-server" "$ROOT/tests/dashboard-tests.py"
 python3 "$ROOT/tests/dashboard-tests.py"
@@ -1175,6 +1197,12 @@ case "$args" in
   *"state/broker-pat-confirmed"*) exit 1 ;;
   *"git config --get user.email"*) exit 1 ;;
   *"git config --get user.name"*) exit 1 ;;
+  *"fieldwork-event-poll.timer"*)
+    case "${FAKE_POLL_TIMER:-healthy}" in
+      disabled) echo "timer=yes enabled=disabled active=inactive dashboard=yes" ;;
+      *) echo "timer=yes enabled=enabled active=active dashboard=yes" ;;
+    esac
+    exit 0 ;;
   *)
     echo "unexpected fake doctor ssh command: $args" >&2
     exit 1
@@ -1213,6 +1241,8 @@ if grep -q "^Notifications pending:$\\|Notifications details:\\|local ntfy topic
   exit 1
 fi
 grep -q "purpose .*verify Fieldwork user services and runner sockets" ${TMPDIR:-/tmp}/fieldwork-doctor-remote.out
+grep -q "event poll timer enabled and active" ${TMPDIR:-/tmp}/fieldwork-doctor-remote.out
+grep -q "dashboard unit installed" ${TMPDIR:-/tmp}/fieldwork-doctor-remote.out
 grep -q "purpose .*verify the separate broker that owns the GitHub write token" ${TMPDIR:-/tmp}/fieldwork-doctor-remote.out
 grep -q "!  PR broker install needed" ${TMPDIR:-/tmp}/fieldwork-doctor-remote.out
 grep -q "!  PR broker socket missing or not writable" ${TMPDIR:-/tmp}/fieldwork-doctor-remote.out
@@ -1236,6 +1266,17 @@ fi
 FIELDWORK_SSH_MULTIPLEX=0 HOME="$tmp_doctor_home" PATH="$fake_doctor_bin:$PATH" \
   "$ROOT/bin/fieldwork" doctor --remote --explain >${TMPDIR:-/tmp}/fieldwork-doctor-remote-mux-off.out || true
 grep -q "SSH multiplexing .*disabled by FIELDWORK_SSH_MULTIPLEX=0; dir" ${TMPDIR:-/tmp}/fieldwork-doctor-remote-mux-off.out
+
+# A dead event-poll timer must flip doctor from "ready" to a needs-action row
+# with the setup --force-install remediation (the live-shakedown regression).
+FAKE_POLL_TIMER=disabled HOME="$tmp_doctor_home" PATH="$fake_doctor_bin:$PATH" \
+  "$ROOT/bin/fieldwork" doctor --remote --explain >${TMPDIR:-/tmp}/fieldwork-doctor-remote-poll-bad.out || true
+grep -q "event poll timer is disabled and inactive" ${TMPDIR:-/tmp}/fieldwork-doctor-remote-poll-bad.out
+grep -q "fieldwork setup --force-install" ${TMPDIR:-/tmp}/fieldwork-doctor-remote-poll-bad.out
+if grep -q "event poll timer enabled and active" ${TMPDIR:-/tmp}/fieldwork-doctor-remote-poll-bad.out; then
+  echo "doctor reported a dead poll timer as healthy" >&2
+  exit 1
+fi
 
 echo "[checks] doctor Codex Desktop and app-server diagnostics"
 fake_codex_doctor_bin="$(mktemp_dir)"
@@ -1302,6 +1343,7 @@ case "$args" in
   *"git config --get user.email"*) echo "fieldwork@example.com"; exit 0 ;;
   *"git config --get user.name"*) echo "Fieldwork"; exit 0 ;;
   *"echo repo=ok"*) printf 'repo=ok\nstack=none\n'; exit 0 ;;
+  *"fieldwork-event-poll.timer"*) echo "timer=yes enabled=enabled active=active dashboard=yes"; exit 0 ;;
   *)
     echo "unexpected fake codex doctor ssh command: $args" >&2
     exit 1
@@ -1467,6 +1509,7 @@ project_deps=missing
 EOF
     exit 0
     ;;
+  *"fieldwork-event-poll.timer"*) echo "timer=yes enabled=enabled active=active dashboard=yes"; exit 0 ;;
   *)
     echo "unexpected fake doctor repo ssh command: $args" >&2
     exit 1
@@ -1531,6 +1574,7 @@ case "$args" in
   *"stat -c '%U:%G %a' /etc/fieldwork-pr-broker/gh-token"*) exit 0 ;;
   *"git config --get user.email"*) echo "fieldwork@example.com"; exit 0 ;;
   *"git config --get user.name"*) echo "Fieldwork"; exit 0 ;;
+  *"fieldwork-event-poll.timer"*) echo "timer=yes enabled=enabled active=active dashboard=yes"; exit 0 ;;
   *)
     echo "unexpected fake doctor apparmor ssh command: $args" >&2
     exit 1
