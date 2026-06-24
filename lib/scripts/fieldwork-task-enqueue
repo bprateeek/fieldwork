@@ -1,0 +1,225 @@
+#!/usr/bin/env python3
+"""fieldwork-task-enqueue - validated writer for the one_shot_job task spool.
+
+Reads a single framed request on stdin and, if valid, atomically drops a
+per-task directory into the queue. Both enqueue surfaces use this one helper:
+
+  - `fieldwork task add` (run as the agent user over SSH), and
+  - the Telegram `/task` command (run as the bot user, which has rwx on
+    `<spool>/queue` only).
+
+So the temp dir + atomic rename happen *inside* `queue/` - the only place the
+bot is permitted to write. The dispatcher (which owns the whole spool) is the
+final trust gate and re-validates on claim; this helper does the cheap,
+fail-fast checks and keeps oversize input from ever being buffered.
+
+Wire framing (stdin):
+
+    <header-json>\n            # one compact JSON line, see HEADER_FIELDS
+    <prompt bytes>             # exactly header["prompt_bytes"] raw bytes, no more
+
+The header carries `prompt_bytes` so the byte count is validated against the cap
+*before* the prompt body is read.
+
+Header fields:
+    slug          required  ^[a-z0-9][a-z0-9-]{0,30}$ (matches the broker slug)
+    prompt_bytes  required  non-negative int, <= FIELDWORK_TASK_PROMPT_MAX_BYTES
+    source        optional  "cli" | "telegram" (default "cli")
+    actor         optional  advisory attribution string (<=128 chars), not auth
+    profile       optional  ^[a-z0-9][a-z0-9_-]{0,40}$ or empty
+
+On success prints the task id (hex) to stdout and exits 0.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import sys
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+
+SCHEMA_VERSION = 1
+
+SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,30}$")
+PROFILE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,40}$")
+SOURCES = ("cli", "telegram")
+
+ACTOR_MAX = 128
+
+
+def env_int(name: str, default: int, minimum: int = 1) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        val = int(raw)
+    except ValueError:
+        return default
+    return val if val >= minimum else default
+
+
+PROMPT_MAX_BYTES = env_int("FIELDWORK_TASK_PROMPT_MAX_BYTES", 64 * 1024)
+HEADER_MAX_BYTES = 8 * 1024
+QUEUE_MAX = env_int("FIELDWORK_TASK_QUEUE_MAX", 50)
+SLUG_QUEUE_MAX = env_int("FIELDWORK_TASK_SLUG_QUEUE_MAX", 10)
+TASKS_DIR = os.environ.get("FIELDWORK_TASKS_DIR", "/var/lib/fieldwork-tasks")
+
+
+def fail(message: str, code: int = 2) -> "NoReturn":  # type: ignore[name-defined]
+    sys.stderr.write(f"[fieldwork-task-enqueue] {message}\n")
+    raise SystemExit(code)
+
+
+def read_header() -> dict:
+    raw = sys.stdin.buffer.readline(HEADER_MAX_BYTES + 1)
+    if not raw:
+        fail("no request header on stdin")
+    if len(raw) > HEADER_MAX_BYTES:
+        fail("request header too large")
+    if not raw.endswith(b"\n"):
+        fail("request header not newline-terminated")
+    try:
+        header = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        fail(f"request header is not valid UTF-8 JSON: {exc}")
+    if not isinstance(header, dict):
+        fail("request header must be a JSON object")
+    return header
+
+
+def validate_header(header: dict) -> dict:
+    slug = header.get("slug")
+    if not isinstance(slug, str) or not SLUG_RE.match(slug):
+        fail("slug must match ^[a-z0-9][a-z0-9-]{0,30}$")
+
+    prompt_bytes = header.get("prompt_bytes")
+    if not isinstance(prompt_bytes, int) or isinstance(prompt_bytes, bool) or prompt_bytes < 0:
+        fail("prompt_bytes must be a non-negative integer")
+    if prompt_bytes == 0:
+        fail("prompt is empty")
+    if prompt_bytes > PROMPT_MAX_BYTES:
+        fail(f"prompt is {prompt_bytes} bytes; max is {PROMPT_MAX_BYTES}")
+
+    source = header.get("source", "cli")
+    if source not in SOURCES:
+        fail(f"source must be one of {SOURCES}")
+
+    actor = header.get("actor", "")
+    if not isinstance(actor, str) or len(actor) > ACTOR_MAX:
+        fail(f"actor must be a string <= {ACTOR_MAX} chars")
+
+    profile = header.get("profile", "") or ""
+    if profile and (not isinstance(profile, str) or not PROFILE_RE.match(profile)):
+        fail("profile must match ^[a-z0-9][a-z0-9_-]{0,40}$")
+
+    return {
+        "slug": slug,
+        "prompt_bytes": prompt_bytes,
+        "source": source,
+        "actor": actor,
+        "profile": profile,
+    }
+
+
+def read_prompt(n: int) -> bytes:
+    body = sys.stdin.buffer.read(n)
+    if len(body) != n:
+        fail(f"prompt truncated: expected {n} bytes, got {len(body)}")
+    # Anything past the declared length is a framing violation; reject it rather
+    # than silently dropping trailing bytes.
+    if sys.stdin.buffer.read(1):
+        fail("trailing bytes after declared prompt length")
+    return body
+
+
+def queue_depth_ok(queue: Path, slug: str) -> None:
+    total = 0
+    slug_count = 0
+    for entry in queue.iterdir():
+        name = entry.name
+        if name.startswith(".tmp.") or not entry.is_dir():
+            continue
+        total += 1
+        # Per-slug depth: task dirs are named "<slug>-<id>"; the dispatcher and
+        # this writer agree on that shape.
+        if name == slug or name.startswith(slug + "-"):
+            slug_count += 1
+    if total >= QUEUE_MAX:
+        fail(f"queue is full ({total}/{QUEUE_MAX}); retry later", code=3)
+    if slug_count >= SLUG_QUEUE_MAX:
+        fail(f"too many queued tasks for {slug} ({slug_count}/{SLUG_QUEUE_MAX})", code=3)
+
+
+def main() -> int:
+    queue = Path(TASKS_DIR, "queue")
+    if not queue.is_dir():
+        fail(f"task queue not provisioned at {queue}; run the broker install / setup", code=4)
+
+    header = validate_header(read_header())
+    queue_depth_ok(queue, header["slug"])
+    prompt = read_prompt(header["prompt_bytes"])
+
+    task_id = uuid.uuid4().hex
+    dir_name = f"{header['slug']}-{task_id[:12]}"
+    task = {
+        "schema_version": SCHEMA_VERSION,
+        "id": task_id,
+        "slug": header["slug"],
+        "profile": header["profile"] or None,
+        "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "actor": header["actor"],
+        "source": header["source"],
+    }
+
+    # Build inside queue/ (the only dir the bot may write), then atomic rename.
+    # Group-permissive modes (0770 dir / 0660 files) on purpose: the bot
+    # (fieldwork-bot) and the dispatcher/runner (fieldwork) are different users
+    # sharing the spool via a default ACL on queue/. Creating with 0700/0600
+    # would collapse the inherited ACL mask to ---, nullifying the other user's
+    # ACL entry - so the dispatcher could not even rename (claim) a bot-created
+    # task dir (a cross-parent dir rename needs write on the dir itself). The
+    # queue/ directory ACL still restricts access to fieldwork + fieldwork-bot;
+    # there is no world access.
+    tmp = queue / f".tmp.{dir_name}.{os.getpid()}"
+    try:
+        tmp.mkdir(mode=0o770)
+        os.chmod(tmp, 0o770)  # explicit: defeat umask, and set the ACL mask to rwx
+    except FileExistsError:
+        fail("temp task dir already exists; retry", code=3)
+    try:
+        _write_private(tmp / "task.json", json.dumps(task, sort_keys=True).encode("utf-8") + b"\n")
+        _write_private(tmp / "prompt.txt", prompt)
+        os.rename(tmp, queue / dir_name)
+    except OSError as exc:
+        _rmtree(tmp)
+        fail(f"could not enqueue task: {exc}", code=5)
+
+    print(dir_name)
+    return 0
+
+
+def _write_private(path: Path, data: bytes) -> None:
+    # 0660 (not 0600): keep the inherited ACL mask open so the fieldwork user's
+    # ACL entry stays effective on bot-created files. See enqueue() for why.
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o660)
+    try:
+        os.fchmod(fd, 0o660)  # explicit: defeat umask, keep the ACL mask at rw
+        os.write(fd, data)
+    finally:
+        os.close(fd)
+
+
+def _rmtree(path: Path) -> None:
+    try:
+        for child in path.iterdir():
+            child.unlink()
+        path.rmdir()
+    except OSError:
+        pass
+
+
+if __name__ == "__main__":
+    sys.exit(main())

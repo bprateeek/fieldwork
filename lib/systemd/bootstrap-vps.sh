@@ -625,6 +625,7 @@ units=(
   fieldwork-dashboard.service
   fieldwork-event-poll.service
   fieldwork-event-poll.timer
+  fieldwork-task-dispatcher.service
   fieldwork-verify-runner.socket
   fieldwork-verify-runner@.service
   fieldwork-pr-prepare-runner.socket
@@ -652,7 +653,7 @@ fi
 # unit settings (e.g. socket MaxConnections); enable --now alone does not re-read
 # an already-active unit. Already-accepted runner @ instances run as separate
 # units and are not stopped by restarting the listening socket.
-for unit in fieldwork-verify-runner.socket fieldwork-pr-prepare-runner.socket fieldwork-event-poll.timer; do
+for unit in fieldwork-verify-runner.socket fieldwork-pr-prepare-runner.socket fieldwork-event-poll.timer fieldwork-task-dispatcher.service; do
   if [ -f "$HOME/.config/systemd/user/$unit" ]; then
     run_optional "$unit enabled" \
       systemctl --user enable --now "$unit" \

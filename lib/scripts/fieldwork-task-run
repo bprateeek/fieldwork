@@ -1,0 +1,609 @@
+#!/usr/bin/env python3
+"""fieldwork-task-run - execute one one_shot_job task end to end.
+
+Invoked by fieldwork-task-dispatcher as:
+
+    fieldwork-task-run <processing-task-dir>
+
+The task dir (already moved into <spool>/processing/<id>/ by the dispatcher)
+holds task.json + prompt.txt; this script writes state.json, run.log, and on
+failure a diff.patch.
+
+It operates in the MAIN checkout $PROJECTS_ROOT/<slug> (the broker + prepare
+runner only accept that path - never a worktree). The flow:
+
+  1. lock the slug; ensure the checkout is clean and on the resolved base.
+  2. run the agent adapter (edit-only) INSIDE a bwrap sandbox: egress open,
+     $HOME excluded, .git read-only, broker socket + creds unreachable, model
+     key in this process env only.
+  3. detect the diff; refuse control-path edits (.fieldwork/**, .claude/**) and
+     .git tampering; track task-created ignored files.
+  4. commit via fieldwork-pr-prepare, verify via fieldwork-verify, submit via
+     fieldwork-pr-submit (generic title/message - never the raw prompt; the
+     broker scans the body only).
+  5. hold the checkout on-branch until the broker reaches a terminal state
+     (pr_opened / request_denied) or the submit expires_at + grace elapses;
+     then restore the checkout to base and scrub task-created ignored files.
+
+Security invariants live here, not in the per-agent adapter, so an adapter
+cannot weaken the sandbox.
+"""
+
+from __future__ import annotations
+
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+
+HOME = Path(os.environ.get("HOME", str(Path.home())))
+PROJECTS_ROOT = Path(os.environ.get("FIELDWORK_PROJECTS_ROOT", str(HOME / "projects")))
+TASKS_DIR = Path(os.environ.get("FIELDWORK_TASKS_DIR", "/var/lib/fieldwork-tasks"))
+LOCAL_BIN = HOME / ".local" / "bin"
+ADAPTERS_DIR = HOME / ".fieldwork" / "infra" / "agents"
+BRANCH_PREFIX = os.environ.get("FIELDWORK_BRANCH_PREFIX", "fieldwork")
+ADAPTER_NAME = os.environ.get("FIELDWORK_AGENT_ADAPTER", "aider")
+AIDER_CONF = HOME / ".fieldwork" / "aider.conf"
+BWRAP = os.environ.get("FIELDWORK_BWRAP", "bwrap")
+TIMEOUT = int(os.environ.get("FIELDWORK_TASK_TIMEOUT", "1800") or "1800")
+APPROVAL_GRACE = int(os.environ.get("FIELDWORK_TASK_APPROVAL_GRACE", "120") or "120")
+AUDIT_LOG = Path(os.environ.get("FIELDWORK_BROKER_AUDIT_LOG", "/var/lib/fieldwork-pr-broker/audit.jsonl"))
+NOTIFY_DIR = os.environ.get("FIELDWORK_NOTIFICATIONS_DIR", "/var/lib/fieldwork-pr-broker/notifications")
+
+DEFAULT_BRANCH_FILE = ".fieldwork/default-branch"
+APPROVAL_GATE_MARKER = ".fieldwork/approval-gate"
+CONTROL_PATH_RE = re.compile(r"^(\.git/|\.fieldwork/|\.claude/)")
+SECRETISH_RE = re.compile(r"(^|/)(\.env(\.|$)|.*\.pem$|.*secret.*|.*credential.*|.*\.key$)", re.IGNORECASE)
+GIT_CRITICAL = ("config", "hooks", "info")
+
+log = sys.stderr
+
+
+def now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def run(cmd, cwd=None, env=None, timeout=120, check=False, text=True):
+    return subprocess.run(
+        cmd, cwd=cwd, env=env, timeout=timeout, check=check,
+        capture_output=True, text=text,
+    )
+
+
+def git(repo: Path, *args, timeout=120):
+    # core.hooksPath=/dev/null: defence in depth so a repo-controlled hook can
+    # never piggyback on git the runner invokes.
+    return run(["git", "-c", "core.hooksPath=/dev/null", "-C", str(repo), *args], timeout=timeout)
+
+
+class TaskError(Exception):
+    def __init__(self, outcome: str, message: str):
+        super().__init__(message)
+        self.outcome = outcome  # failed | failed_needs_manual_cleanup | no_changes
+        self.message = message
+
+
+# ---- config (parse, never source) -------------------------------------------
+
+def parse_aider_conf(profile: str | None) -> dict:
+    """Minimal TOML-ish reader: flat keys + [profile.NAME] overrides."""
+    flat: dict[str, str] = {}
+    sections: dict[str, dict[str, str]] = {}
+    cur: dict[str, str] | None = flat
+    if AIDER_CONF.is_file():
+        for raw in AIDER_CONF.read_text().splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("[") and "]" in line:
+                name = line[1:line.index("]")].strip().strip('"')
+                cur = sections.setdefault(name, {})
+                continue
+            if "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            cur[k.strip()] = v.strip().strip('"')
+    effective = dict(flat)
+    if profile:
+        effective.update(sections.get(f"profile.{profile}", {}))
+    return effective
+
+
+def model_env(conf: dict) -> tuple[dict, str]:
+    model = conf.get("model")
+    if not model:
+        raise TaskError("failed", "aider.conf has no model")
+    base_url = conf.get("base_url", "")
+    api_key = conf.get("api_key", "")
+    provider = (conf.get("provider", "openai-compatible") or "openai-compatible").lower()
+    env: dict[str, str] = {}
+    if provider == "ollama":
+        if base_url:
+            env["OLLAMA_API_BASE"] = base_url
+    else:
+        if base_url:
+            env["OPENAI_API_BASE"] = base_url
+        if api_key:
+            env["OPENAI_API_KEY"] = api_key
+    return env, model
+
+
+# ---- state + notifications --------------------------------------------------
+
+class Task:
+    def __init__(self, task_dir: Path):
+        self.dir = task_dir
+        data = json.loads((task_dir / "task.json").read_text())
+        self.id = data["id"]
+        self.slug = data["slug"]
+        self.profile = data.get("profile")
+        self.actor = data.get("actor", "")
+        self.source = data.get("source", "")
+        self.repo = PROJECTS_ROOT / self.slug
+        self.branch = f"{BRANCH_PREFIX}/{self.slug}-{self.id[:12]}"
+        self.state: dict[str, object] = {"id": self.id, "slug": self.slug, "branch": self.branch}
+
+    def set_phase(self, phase: str, **extra):
+        self.state["phase"] = phase
+        self.state["updated_at"] = now()
+        self.state.update(extra)
+        tmp = self.dir / "state.json.tmp"
+        tmp.write_text(json.dumps(self.state, sort_keys=True) + "\n")
+        os.replace(tmp, self.dir / "state.json")
+
+
+def notify(task: Task, event: str, text: str) -> None:
+    drop = Path(NOTIFY_DIR)
+    if not (drop.is_dir() and os.access(drop, os.W_OK)):
+        return
+    uid = uuid.uuid4().hex
+    payload = {
+        "schema": 1,
+        "kind": "task_lifecycle",
+        "source": "dispatcher",
+        "event": event,
+        "repo_slug": task.slug,
+        "request_id": task.state.get("request_id"),
+        "branch": task.branch,
+        "profile": task.profile,
+        "dedupe_key": f"task:{task.id}:{event}",
+        "text": text,
+    }
+    tmp = drop / f".tmp-{uid}"
+    out = drop / f"{uid}.json"
+    try:
+        tmp.write_text(json.dumps(payload, sort_keys=True) + "\n")
+        os.chmod(tmp, 0o660)
+        os.replace(tmp, out)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
+def redact(text: str, secrets: list[str]) -> str:
+    for s in secrets:
+        if s:
+            text = text.replace(s, "[redacted]")
+    return text
+
+
+# ---- git checkout prep ------------------------------------------------------
+
+def resolve_base(repo: Path) -> str:
+    f = repo / DEFAULT_BRANCH_FILE
+    if f.is_file():
+        b = f.read_text().strip()
+        if b:
+            return b
+    r = git(repo, "symbolic-ref", "--short", "refs/remotes/origin/HEAD")
+    if r.returncode == 0 and r.stdout.strip():
+        return r.stdout.strip().split("/", 1)[-1]
+    raise TaskError("failed", "cannot resolve base branch")
+
+
+def ensure_clean_on_base(repo: Path, base: str) -> str:
+    porcelain = git(repo, "status", "--porcelain").stdout
+    if porcelain.strip():
+        raise TaskError("failed_needs_manual_cleanup",
+                        "checkout is dirty before the task ran; refusing to reset foreign state")
+    cur = git(repo, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+    if cur != base:
+        r = git(repo, "checkout", base)
+        if r.returncode != 0:
+            raise TaskError("failed_needs_manual_cleanup", f"cannot checkout base {base}: {r.stderr.strip()}")
+    return git(repo, "rev-parse", "HEAD").stdout.strip()
+
+
+def snapshot_git_critical(repo: Path) -> dict:
+    snap = {}
+    gitdir = repo / ".git"
+    for name in GIT_CRITICAL:
+        p = gitdir / name
+        if p.is_file():
+            snap[name] = hashlib.sha256(p.read_bytes()).hexdigest()
+        elif p.is_dir():
+            for child in sorted(p.rglob("*")):
+                if child.is_file():
+                    snap[str(child.relative_to(gitdir))] = hashlib.sha256(child.read_bytes()).hexdigest()
+    return snap
+
+
+def ignored_set(repo: Path) -> set:
+    r = git(repo, "status", "--ignored", "--porcelain")
+    out = set()
+    for line in r.stdout.splitlines():
+        if line.startswith("!! "):
+            out.add(line[3:])
+    return out
+
+
+# ---- sandbox ----------------------------------------------------------------
+
+def build_sandbox_argv(repo: Path, env: dict, adapter_real: Path, prompt_in_repo: str) -> list[str]:
+    argv = [BWRAP, "--clearenv"]
+    for k, v in env.items():
+        argv += ["--setenv", k, v]
+    argv += [
+        "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--unshare-user",
+        "--new-session", "--die-with-parent",
+        "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
+        "--ro-bind", "/usr", "/usr",
+        "--ro-bind", "/etc", "/etc",
+        # Mask broker creds even though POSIX perms already deny them.
+        "--tmpfs", "/etc/fieldwork-pr-broker",
+    ]
+    # Merged-usr vs split: replicate the host's top-level layout read-only.
+    for top in ("bin", "sbin", "lib", "lib64", "lib32", "libx32"):
+        host = Path("/", top)
+        if host.is_symlink():
+            argv += ["--symlink", os.readlink(host), f"/{top}"]
+        elif host.is_dir():
+            argv += ["--ro-bind", str(host), f"/{top}"]
+    # DNS: if resolv.conf points into /run (systemd-resolved), bind the target so
+    # name resolution + TLS to the model endpoint work without mounting /run.
+    real_resolv = os.path.realpath("/etc/resolv.conf")
+    if os.path.exists(real_resolv) and not real_resolv.startswith("/etc/"):
+        argv += ["--ro-bind", real_resolv, real_resolv]
+    # Aider venv (real runs); harmless if absent.
+    venv = "/opt/fieldwork/aider-venv"
+    if os.path.isdir(venv):
+        argv += ["--ro-bind", venv, venv]
+    # The one checkout, RW; then .git RO (so aider cannot rewrite config/hooks).
+    argv += ["--dir", str(PROJECTS_ROOT)]
+    argv += ["--bind", str(repo), str(repo)]
+    argv += ["--ro-bind", str(repo / ".git"), str(repo / ".git")]
+    # The adapter (lives under the excluded $HOME) bound in read-only.
+    argv += ["--ro-bind", str(adapter_real), "/tmp/fieldwork-adapter"]
+    # Run the adapter with bash explicitly: adapters are bash scripts (set -o
+    # pipefail etc.) and /bin/sh is dash on Debian/Ubuntu. Using bash avoids
+    # depending on the bound file's exec bit too.
+    argv += ["--chdir", str(repo), "--", "/bin/bash", "/tmp/fieldwork-adapter"]
+    return argv
+
+
+def run_adapter(task: Task, conf_env: dict, model: str, secrets: list[str]) -> None:
+    adapter = ADAPTERS_DIR / ADAPTER_NAME
+    adapter_real = Path(os.path.realpath(adapter))
+    if not adapter_real.is_file():
+        raise TaskError("failed", f"adapter not found: {adapter}")
+
+    local_dir = task.repo / ".fieldwork" / "local"
+    local_dir.mkdir(parents=True, exist_ok=True)
+    prompt_in_repo = local_dir / f"task-prompt-{task.id[:12]}.txt"
+    shutil.copyfile(task.dir / "prompt.txt", prompt_in_repo)
+    os.chmod(prompt_in_repo, 0o600)
+
+    senv = dict(conf_env)
+    senv["PATH"] = "/usr/bin:/bin"
+    senv["HOME"] = "/tmp"
+    senv["TERM"] = "dumb"
+    senv["GIT_OPTIONAL_LOCKS"] = "0"
+    senv["FIELDWORK_TASK_PROMPT_FILE"] = str(prompt_in_repo)
+    senv["FIELDWORK_AIDER_MODEL"] = model
+    if os.environ.get("FIELDWORK_AIDER_BIN"):
+        senv["FIELDWORK_AIDER_BIN"] = os.environ["FIELDWORK_AIDER_BIN"]
+
+    argv = build_sandbox_argv(task.repo, senv, adapter_real, str(prompt_in_repo))
+    try:
+        proc = run(argv, timeout=TIMEOUT)
+    except subprocess.TimeoutExpired:
+        (task.dir / "run.log").write_text("[fieldwork] aider timed out\n")
+        raise TaskError("failed", f"aider timed out after {TIMEOUT}s")
+    finally:
+        try:
+            prompt_in_repo.unlink()
+        except OSError:
+            pass
+    logtext = redact((proc.stdout or "") + (proc.stderr or ""), secrets)
+    (task.dir / "run.log").write_text(logtext)
+    if proc.returncode != 0:
+        raise TaskError("failed", f"aider exited {proc.returncode}; see run.log")
+
+
+# ---- diff / commit / verify / submit ----------------------------------------
+
+def changed_paths(repo: Path) -> list[str]:
+    out = []
+    r = git(repo, "status", "--porcelain", "-uall", "-z")
+    parts = r.stdout.split("\0")
+    i = 0
+    while i < len(parts):
+        entry = parts[i]
+        i += 1
+        if not entry:
+            continue
+        status, path = entry[:2], entry[3:]
+        if status[0] in ("R", "C"):
+            i += 1  # skip the rename source record
+        out.append(path)
+    return out
+
+
+def write_prepare_request(task: Task, paths: list[str]) -> Path:
+    local = task.repo / ".fieldwork" / "local"
+    msg = (
+        f"Fieldwork task {task.id[:12]}\n\n"
+        f"Automated one_shot_job change for {task.slug}. "
+        f"See task spool for the prompt; it is intentionally omitted here.\n"
+    )
+    req = {
+        "request_id": str(uuid.uuid4()),
+        "created_at": now(),
+        "repo_path": str(task.repo),
+        "branch": task.branch,
+        "paths": paths,
+        "message": msg,
+    }
+    path = local / "pr-prepare-request.json"
+    path.write_text(json.dumps(req))
+    return path
+
+
+def write_pr_request(task: Task) -> Path:
+    local = task.repo / ".fieldwork" / "local"
+    body = (
+        f"Automated change from a Fieldwork one_shot_job ({ADAPTER_NAME}).\n\n"
+        f"- repo: {task.slug}\n- task: {task.id[:12]}\n"
+    )
+    req = {
+        "request_id": str(uuid.uuid4()),
+        "created_at": now(),
+        "repo_path": str(task.repo),
+        "branch": task.branch,
+        "title": f"Fieldwork task: {task.slug} ({task.id[:8]})",
+        "body": body,
+    }
+    path = local / "pr-request.json"
+    path.write_text(json.dumps(req))
+    return path
+
+
+def call_client(name: str, arg: str, repo: Path):
+    return run([str(LOCAL_BIN / name), arg], cwd=repo, timeout=600)
+
+
+# ---- terminal-state wait (gated) --------------------------------------------
+
+def wait_for_terminal(request_id: str, expires_at: str) -> str:
+    """Return 'pr_opened' | 'request_denied' | 'expired'."""
+    deadline = time.time() + APPROVAL_GRACE
+    try:
+        exp = datetime.strptime(expires_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        deadline = exp.timestamp() + APPROVAL_GRACE
+    except (TypeError, ValueError):
+        pass
+    while time.time() < deadline:
+        ev = scan_audit(request_id)
+        if ev:
+            return ev
+        time.sleep(5)
+    # One last scan, then treat as expired: a late approval is rejected by the
+    # broker because the pending entry has expired.
+    return scan_audit(request_id) or "expired"
+
+
+def scan_audit(request_id: str) -> str | None:
+    try:
+        with open(AUDIT_LOG) as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if rec.get("request_id") == request_id and rec.get("event") in ("pr_opened", "request_denied"):
+                    return rec["event"]
+    except OSError:
+        return None
+    return None
+
+
+# ---- restore + finish -------------------------------------------------------
+
+def restore(repo: Path, base: str, base_head: str, branch: str, scrub: set) -> None:
+    git(repo, "reset", "--hard", base_head)
+    git(repo, "checkout", base)
+    git(repo, "branch", "-D", branch)
+    # Remove untracked files the agent created but that were never committed
+    # (e.g. a refused control-path edit, or a pre-prepare failure). The checkout
+    # was clean before the task (ensure_clean_on_base), so every untracked file
+    # now is task-created. `-fd` removes untracked files+dirs; no `-x`, so
+    # ignored paths (.fieldwork/local) are preserved - task-created ignored files
+    # are handled separately via `scrub`. Without this the checkout stays dirty
+    # and the dispatcher defers all future tasks for the slug.
+    git(repo, "clean", "-fd")
+    for rel in scrub:
+        target = repo / rel
+        try:
+            if target.is_dir() and not target.is_symlink():
+                shutil.rmtree(target)
+            elif target.exists() or target.is_symlink():
+                target.unlink()
+        except OSError:
+            pass
+
+
+def finish(task: Task, outcome: str, message: str) -> int:
+    task.set_phase("terminal", outcome=outcome, message=message)
+    dest_parent = TASKS_DIR / ("done" if outcome in ("success", "no_changes") else "failed")
+    dest_parent.mkdir(parents=True, exist_ok=True)
+    dest = dest_parent / task.dir.name
+    if dest.exists():
+        dest = dest_parent / f"{task.dir.name}-{int(time.time())}"
+    try:
+        os.replace(task.dir, dest)
+    except OSError:
+        pass
+    event = "pr_opened" if outcome == "success" else ("task_no_changes" if outcome == "no_changes" else "task_failed")
+    notify(task, event, f"{task.slug}: {message}")
+    print(f"{outcome}: {message}")
+    return 0 if outcome in ("success", "no_changes") else 1
+
+
+# ---- main -------------------------------------------------------------------
+
+def execute(task: Task) -> int:
+    repo = task.repo
+    if not (repo / ".git").exists():
+        return finish(task, "failed", f"no git checkout at {repo}")
+
+    conf = parse_aider_conf(task.profile)
+    conf_env, model = model_env(conf)
+    secrets = [v for v in conf_env.values()]
+
+    task.set_phase("editing")
+    base = resolve_base(repo)
+    base_head = ensure_clean_on_base(repo, base)
+    task.state["base_head"] = base_head
+    git_snap = snapshot_git_critical(repo)
+    ignored_before = ignored_set(repo)
+
+    notify(task, "task_started", f"{task.slug}: started")
+    run_adapter(task, conf_env, model, secrets)
+
+    if snapshot_git_critical(repo) != git_snap:
+        restore(repo, base, base_head, task.branch, set())
+        return finish(task, "failed", ".git config/hooks/info changed during the task")
+
+    paths = changed_paths(repo)
+    ignored_after = ignored_set(repo)
+    new_ignored = ignored_after - ignored_before
+
+    if not paths:
+        # Scrub any stray ignored files the run created, then report no changes.
+        restore(repo, base, base_head, task.branch, new_ignored)
+        return finish(task, "no_changes", "agent produced no changes")
+
+    bad = [p for p in paths if CONTROL_PATH_RE.match(p)]
+    if bad:
+        save_patch(task, repo)
+        restore(repo, base, base_head, task.branch, new_ignored)
+        return finish(task, "failed", f"refused: control-path edits {bad[:5]}")
+
+    secretish = [p for p in new_ignored if SECRETISH_RE.search(p)]
+    if secretish:
+        save_patch(task, repo)
+        restore(repo, base, base_head, task.branch, new_ignored)
+        return finish(task, "failed", f"refused: secret-shaped ignored files {secretish[:5]}")
+
+    task.set_phase("committed")
+    prep = write_prepare_request(task, paths)
+    r = call_client("fieldwork-pr-prepare", str(prep), repo)
+    if r.returncode != 0:
+        save_patch(task, repo)
+        restore(repo, base, base_head, task.branch, new_ignored)
+        return finish(task, "failed", f"prepare failed: {r.stderr.strip()[:200]}")
+
+    task.set_phase("verifying")
+    r = call_client("fieldwork-verify", str(repo), repo)
+    if r.returncode != 0:
+        save_patch(task, repo)
+        restore(repo, base, base_head, task.branch, new_ignored)
+        return finish(task, "failed", f"verify failed: {r.stderr.strip()[:200]}")
+
+    task.set_phase("submitted")
+    prr = write_pr_request(task)
+    r = call_client("fieldwork-pr-submit", str(prr), repo)
+    if r.returncode != 0:
+        save_patch(task, repo)
+        restore(repo, base, base_head, task.branch, new_ignored)
+        return finish(task, "failed", f"broker rejected: {r.stderr.strip()[:200]}")
+
+    resp = {}
+    first = (r.stdout or "").splitlines()
+    if first:
+        try:
+            resp = json.loads(first[0])
+        except json.JSONDecodeError:
+            resp = {}
+    request_id = resp.get("request_id", "")
+
+    if resp.get("queued") is True:
+        task.set_phase("awaiting_approval", request_id=request_id, expires_at=resp.get("expires_at"))
+        notify(task, "task_queued", f"{task.slug}: queued for approval")
+        outcome = wait_for_terminal(request_id, resp.get("expires_at", ""))
+        restore(repo, base, base_head, task.branch, new_ignored)
+        if outcome == "pr_opened":
+            return finish(task, "success", "PR opened after approval")
+        if outcome == "request_denied":
+            return finish(task, "failed", "approval denied")
+        return finish(task, "failed", "approval expired")
+
+    # Non-gated: broker pushed synchronously.
+    url = resp.get("url", "")
+    restore(repo, base, base_head, task.branch, new_ignored)
+    return finish(task, "success", f"PR opened: {url}" if url else "PR opened")
+
+
+def save_patch(task: Task, repo: Path) -> None:
+    r = git(repo, "add", "-A")
+    diff = git(repo, "diff", "--cached")
+    try:
+        (task.dir / "diff.patch").write_text(diff.stdout)
+    except OSError:
+        pass
+    git(repo, "reset")
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) != 2:
+        log.write("usage: fieldwork-task-run <processing-task-dir>\n")
+        return 2
+    task_dir = Path(argv[1]).resolve()
+    if not (task_dir / "task.json").is_file():
+        log.write(f"no task.json in {task_dir}\n")
+        return 2
+    task = Task(task_dir)
+
+    locks = TASKS_DIR / "locks"
+    locks.mkdir(parents=True, exist_ok=True)
+    lock_fd = os.open(str(locks / f"{task.slug}.lock"), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        log.write(f"slug {task.slug} is busy; another runner holds the lock\n")
+        return 75  # EX_TEMPFAIL: dispatcher should leave it queued/retry
+    try:
+        return execute(task)
+    except TaskError as e:
+        try:
+            return finish(task, e.outcome, e.message)
+        except Exception:  # noqa: BLE001 - finishing must never crash the runner
+            log.write(f"task {task.id} failed: {e.message}\n")
+            return 1
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

@@ -1,10 +1,17 @@
 #!/usr/bin/env bash
 # Fieldwork agent adapter: Claude Code Remote Control.
 #
+# fieldwork-process-model: remote_control_daemon
+#
 # An agent adapter is an executable that fieldwork-agent-session invokes as:
 #   <adapter> <repo-slug> <repo-dir>
 # It must exec a single long-running foreground process — the agent session for
 # that repo. systemd keeps it alive (Restart=on-failure).
+#
+# Process models (see docs/agent-adapters.md): an adapter declares one via the
+# `fieldwork-process-model:` header above. fieldwork-agent-session routes on it.
+# remote_control_daemon (this adapter) runs as the per-repo session unit;
+# one_shot_job agents are driven by fieldwork-task-dispatcher, not this unit.
 #
 # Adapter contract (see docs/agent-adapters.md):
 #   - exec a long-running foreground process; do not background or fork-and-exit

@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# Fieldwork agent adapter: Aider.
+#
+# fieldwork-process-model: one_shot_job
+#
+# Unlike a remote_control_daemon adapter, this is NOT a long-running session and
+# is NOT exec'd by fieldwork-agent-session. It runs once per task, INSIDE the
+# bwrap sandbox that fieldwork-task-run builds. By the time this runs the runner
+# has already:
+#   - bound the repo checkout read-write and .git read-only,
+#   - made the broker socket + credentials unreachable,
+#   - excluded $HOME (so notify.env / other model keys are invisible),
+#   - exported the model endpoint + key into THIS process env ONLY,
+#   - set FIELDWORK_TASK_PROMPT_FILE to the prompt path inside the sandbox.
+#
+# The runner (not this adapter) owns diff detection, commit, verify, and the
+# broker submission. This adapter only edits files: aider in edit-only,
+# non-interactive mode, with repo-supplied config (.aider.conf.yml / .env)
+# neutralized so a hostile repo cannot re-enable shell/analytics/URL fetch.
+
+set -euo pipefail
+
+prompt_file="${FIELDWORK_TASK_PROMPT_FILE:?adapter requires FIELDWORK_TASK_PROMPT_FILE}"
+model="${FIELDWORK_AIDER_MODEL:?adapter requires FIELDWORK_AIDER_MODEL}"
+aider_bin="${FIELDWORK_AIDER_BIN:-/opt/fieldwork/aider-venv/bin/aider}"
+
+# /dev/null is an always-empty, readable file (and /dev is mounted in the
+# sandbox), so the repo's own .aider.conf.yml / .env are ignored without writing
+# a temp file. History/log paths go under /tmp (a writable tmpfs in the sandbox)
+# so no .aider.* side files land in the repo.
+exec "$aider_bin" \
+  --model "$model" \
+  --message-file "$prompt_file" \
+  --yes-always \
+  --no-auto-commits --no-auto-lint --no-auto-test \
+  --no-check-update --no-analytics \
+  --no-suggest-shell-commands --no-detect-urls --disable-playwright \
+  --config /dev/null --env-file /dev/null \
+  --input-history-file /tmp/.aider.input.history \
+  --chat-history-file /tmp/.aider.chat.history.md \
+  --llm-history-file /tmp/.aider.llm.history

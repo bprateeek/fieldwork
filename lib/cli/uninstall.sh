@@ -397,6 +397,7 @@ print_uninstall_plan() {
       echo "  - fieldwork-pr-prepare-runner.socket/service"
       echo "  - fieldwork-event-poll.timer/service"
       echo "  - fieldwork-dashboard.service"
+      echo "  - fieldwork-task-dispatcher.service"
       echo "  - remote Fieldwork scripts and synced checkout"
       [ "$purge" = "1" ] && echo "  - remote Fieldwork cache/log state"
     else
@@ -1168,6 +1169,9 @@ uninstall_local_files() {
     "$HOME/.local/bin/fieldwork-setup-probe" \
     "$HOME/.local/bin/fieldwork-codex-sandbox" \
     "$HOME/.local/bin/fieldwork-pr-submit" \
+    "$HOME/.local/bin/fieldwork-task-enqueue" \
+    "$HOME/.local/bin/fieldwork-task-run" \
+    "$HOME/.local/bin/fieldwork-task-dispatcher" \
     "$HOME/.fieldwork/scripts/fieldwork-status-snapshot" \
     "$HOME/.fieldwork/scripts/fieldwork-dashboard-server" \
     "$HOME/.fieldwork/scripts/fieldwork-clone" \
@@ -1175,6 +1179,9 @@ uninstall_local_files() {
     "$HOME/.fieldwork/scripts/fieldwork-launch" \
     "$HOME/.fieldwork/scripts/fieldwork-pr-submit" \
     "$HOME/.fieldwork/scripts/fieldwork-agent-session" \
+    "$HOME/.fieldwork/scripts/fieldwork-task-enqueue" \
+    "$HOME/.fieldwork/scripts/fieldwork-task-run" \
+    "$HOME/.fieldwork/scripts/fieldwork-task-dispatcher" \
     "$HOME/.fieldwork/scripts/fieldwork-event-poll" \
     "$HOME/.fieldwork/scripts/fieldwork-setup-probe" \
     "$HOME/.fieldwork/scripts/fieldwork-codex-sandbox" \
@@ -1194,6 +1201,7 @@ uninstall_local_files() {
     "$HOME/.fieldwork/infra/fieldwork-verify-runner@.service" \
     "$HOME/.fieldwork/infra/fieldwork-event-poll.service" \
     "$HOME/.fieldwork/infra/fieldwork-event-poll.timer" \
+    "$HOME/.fieldwork/infra/fieldwork-task-dispatcher.service" \
     "$HOME/.fieldwork/infra/fieldwork-pr-prepare-runner.socket" \
     "$HOME/.fieldwork/infra/fieldwork-pr-prepare-runner@.service" \
     "$HOME/.fieldwork/infra/agents" \
@@ -1403,7 +1411,7 @@ EOF
   fi
 }
 
-if systemctl --user disable --now fieldwork-verify-runner.socket fieldwork-pr-prepare-runner.socket fieldwork-event-poll.timer fieldwork-dashboard.service >/dev/null 2>&1; then
+if systemctl --user disable --now fieldwork-verify-runner.socket fieldwork-pr-prepare-runner.socket fieldwork-event-poll.timer fieldwork-dashboard.service fieldwork-task-dispatcher.service >/dev/null 2>&1; then
   ok "remote user runner sockets, event timer, and dashboard"
 elif [ -f "$HOME/.config/systemd/user/fieldwork-verify-runner.socket" ] || [ -f "$HOME/.config/systemd/user/fieldwork-pr-prepare-runner.socket" ] || [ -f "$HOME/.config/systemd/user/fieldwork-event-poll.timer" ] || [ -f "$HOME/.config/systemd/user/fieldwork-dashboard.service" ]; then
   failed "remote user runner sockets, event timer, and dashboard" "systemctl failed"
@@ -1451,6 +1459,9 @@ for path in \
   "$HOME/.local/bin/fieldwork-setup-probe" \
   "$HOME/.local/bin/fieldwork-codex-sandbox" \
   "$HOME/.local/bin/fieldwork-pr-submit" \
+  "$HOME/.local/bin/fieldwork-task-enqueue" \
+  "$HOME/.local/bin/fieldwork-task-run" \
+  "$HOME/.local/bin/fieldwork-task-dispatcher" \
   "$HOME/.fieldwork/scripts/fieldwork-status-snapshot" \
   "$HOME/.fieldwork/scripts/fieldwork-dashboard-server" \
   "$HOME/.fieldwork/scripts/fieldwork-clone" \
@@ -1458,6 +1469,9 @@ for path in \
   "$HOME/.fieldwork/scripts/fieldwork-launch" \
   "$HOME/.fieldwork/scripts/fieldwork-pr-submit" \
   "$HOME/.fieldwork/scripts/fieldwork-agent-session" \
+  "$HOME/.fieldwork/scripts/fieldwork-task-enqueue" \
+  "$HOME/.fieldwork/scripts/fieldwork-task-run" \
+  "$HOME/.fieldwork/scripts/fieldwork-task-dispatcher" \
   "$HOME/.fieldwork/scripts/fieldwork-event-poll" \
   "$HOME/.fieldwork/scripts/fieldwork-setup-probe" \
   "$HOME/.fieldwork/scripts/fieldwork-codex-sandbox" \
@@ -1477,6 +1491,7 @@ for path in \
   "$HOME/.fieldwork/infra/fieldwork-verify-runner@.service" \
   "$HOME/.fieldwork/infra/fieldwork-event-poll.service" \
   "$HOME/.fieldwork/infra/fieldwork-event-poll.timer" \
+  "$HOME/.fieldwork/infra/fieldwork-task-dispatcher.service" \
   "$HOME/.fieldwork/infra/fieldwork-pr-prepare-runner.socket" \
   "$HOME/.fieldwork/infra/fieldwork-pr-prepare-runner@.service" \
   "$HOME/.fieldwork/infra/agents" \
@@ -1491,6 +1506,7 @@ remove_file "remote verify socket unit" "$HOME/.config/systemd/user/fieldwork-ve
 remove_file "remote verify service unit" "$HOME/.config/systemd/user/fieldwork-verify-runner@.service"
 remove_file "remote event poll service unit" "$HOME/.config/systemd/user/fieldwork-event-poll.service"
 remove_file "remote event poll timer unit" "$HOME/.config/systemd/user/fieldwork-event-poll.timer"
+remove_file "remote task dispatcher unit" "$HOME/.config/systemd/user/fieldwork-task-dispatcher.service"
 remove_file "remote PR prepare socket unit" "$HOME/.config/systemd/user/fieldwork-pr-prepare-runner.socket"
 remove_file "remote PR prepare service unit" "$HOME/.config/systemd/user/fieldwork-pr-prepare-runner@.service"
 remove_file "remote Claude login confirmation" "$HOME/.fieldwork/state/claude-login-confirmed"

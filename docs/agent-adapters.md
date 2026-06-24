@@ -98,6 +98,79 @@ The value is parsed as plain `key=value`, never sourced as shell, defaults to
 `2`, and is clamped to `1..4`. The validated value is exported to adapters as
 `FIELDWORK_AGENT_CAPACITY`.
 
+## Process models
+
+Not every agent is a long-running session. An adapter declares how Fieldwork
+drives it with a header line near the top of `lib/agents/<name>`:
+
+```text
+# fieldwork-process-model: remote_control_daemon
+```
+
+`fieldwork-agent-session` reads it and routes accordingly. An unset or unknown
+header defaults to `remote_control_daemon`, so existing adapters are unaffected.
+
+| Process model           | Agent (today) | How Fieldwork drives it                                   |
+|-------------------------|---------------|-----------------------------------------------------------|
+| `remote_control_daemon` | Claude        | long-running per-repo `fieldwork-agent@<slug>.service`     |
+| `desktop_relay`         | Codex         | provisioned env only; no Fieldwork-owned process or unit  |
+| `one_shot_job`          | Aider         | queued tasks run to completion by `fieldwork-task-dispatcher` |
+| `interactive_shell`     | (manual)      | attach over SSH/tmux; escape hatch, no unit               |
+
+The numbered contract below is the `remote_control_daemon` contract (requirement
+1, "exec a single long-running foreground process," applies to that model).
+`one_shot_job` agents instead let Fieldwork own the queue, worktree/checkout,
+environment injection, diff detection, commit, verify, broker submission, and
+cleanup; the agent only edits files. They are launched by the task dispatcher,
+not by the per-repo session unit, which exits cleanly if pointed at one.
+
+## Aider (`one_shot_job`)
+
+Aider has no remote-control transport, so it runs as a `one_shot_job`: you queue
+a task and Fieldwork runs it to completion. **Fieldwork** owns the queue,
+checkout, sandbox, diff detection, commit, verify, and broker submission; the
+adapter (`lib/agents/aider`) only edits files.
+
+Operator setup on the VPS:
+
+1. Install aider into a system-path venv (kept out of `$HOME`, which the sandbox
+   excludes): `python3 -m venv /opt/fieldwork/aider-venv && /opt/fieldwork/aider-venv/bin/pip install aider-chat`.
+2. Configure the BYO model in `~/.fieldwork/aider.conf` (mode 600), parsed
+   as `key=value`, never sourced:
+
+   ```
+   model = gpt-4o
+   base_url = https://api.openai.com/v1
+   api_key = sk-...
+   # provider = ollama        # for a local Ollama endpoint (base_url only)
+   ```
+
+   Per-profile overrides go in a `[profile.NAME]` section.
+3. Select the adapter: `FIELDWORK_AGENT_ADAPTER=aider`.
+
+Submit work:
+
+```sh
+fieldwork task add <slug> "refactor the auth module"     # CLI, prompt over SSH stdin
+fieldwork task list
+fieldwork task discard <task-id>
+```
+
+How a task runs (`fieldwork-task-run`): the checkout is taken to a clean base;
+aider runs **inside a bwrap sandbox** (egress open for the model API, but `$HOME`
+excluded, `.git` read-only, and the broker socket + credentials unreachable),
+edit-only (`--no-auto-commits`, repo `.aider.conf.yml`/`.env` neutralized); the
+model key lives only in that one process's env and is redacted from logs. The
+runner then refuses `.fieldwork/**`/`.claude/**`/`.git` edits, commits via the
+prepare runner, verifies, and submits through the broker. On any failure the
+checkout is restored and a `diff.patch` is kept for inspection; nothing is
+submitted unverified.
+
+**Residual risk:** the aider process can read its own environment (unlike the
+broker-token isolation), and egress is open, so a hostile model endpoint or
+prompt-injected content could exfiltrate the checkout. For maximum isolation run
+a localhost Ollama endpoint.
+
 ## Adding a new adapter: checklist
 
 A PR adding an adapter should include:
@@ -154,8 +227,8 @@ binary, not the adapter shim.
   Fieldwork agent user for now. If you need to run two managed services on the
   same host, give each its own agent user with its own agent config layout and
   adapter setting.
-- **Headless adapter.** A non-remote-control adapter is planned but not
-  implemented. The adapter seam is already in place.
+- **Headless adapter.** Implemented as the `one_shot_job` process model (Aider);
+  see the Aider section above.
 - **Forge adapters beyond GitHub.** The broker speaks `gh` today; a GitLab or
   Gitea broker would be a fork of `lib/broker/server.py` with the same trust
   model, not an agent adapter.
