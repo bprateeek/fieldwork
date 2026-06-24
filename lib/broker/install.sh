@@ -30,6 +30,9 @@ BROKER_SOCKET_GROUP="${FIELDWORK_BROKER_SOCKET_GROUP:-}"
 # reference it; the bot user is provisioned separately by
 # `fieldwork setup-notify --telegram-bot` when the operator opts in.
 BROKER_BOT_GROUP="${FIELDWORK_BROKER_BOT_GROUP:-fieldwork-bot}"
+# The bot user (provisioned later by setup-notify --telegram-bot). Used only to
+# grant a task-queue ACL when it already exists; absence is not an error here.
+BOT_USER="${FIELDWORK_BOT_USER:-fieldwork-bot}"
 # The unprivileged user that runs the coding agent and submits PR requests.
 AGENT_USER="${FIELDWORK_REMOTE_USER:-fieldwork}"
 # Root of per-repo checkouts the broker is allowed to read and push from.
@@ -40,6 +43,9 @@ CONFIG_DIR="/etc/fieldwork-pr-broker"
 STATE_DIR="/var/lib/fieldwork-pr-broker"
 LIB_DIR="/usr/local/lib/fieldwork-pr-broker"
 BROKER_LOG="/var/log/fieldwork-pr-broker.log"
+# Shared one_shot_job task spool: agent-owned, traversable+queue-writable by the
+# bot (which cannot reach the agent's $HOME). See docs/agent-adapters.md.
+TASKS_DIR="${FIELDWORK_TASKS_DIR:-/var/lib/fieldwork-tasks}"
 # ---------------------------------------------------------------------------
 
 usage() {
@@ -303,8 +309,34 @@ setup_directories() {
     done
     setfacl -m "u:$BROKER_USER:rwx" "$STATE_DIR/notifications"
     setfacl -d -m "u:$BROKER_USER:rwx" "$STATE_DIR/notifications"
+    # Bot traverse on STATE_DIR. The bot reaches pending/ + notifications/ only
+    # by traversing STATE_DIR; it otherwise relies on the systemd StateDirectory
+    # 0755 (other=r-x), which install's 0700 transiently removes until the broker
+    # service next starts - crash-looping the bot. An explicit traverse ACL makes
+    # the bot independent of that race. Guarded: the bot user is created later by
+    # setup-notify, which (re)applies this; harmless when absent.
+    if getent passwd "$BOT_USER" >/dev/null 2>&1; then
+      setfacl -m "u:$BOT_USER:--x" "$STATE_DIR"
+    fi
   else
     echo "setfacl unavailable; audit/dashboard read access and broker lifecycle drops need manual ACL setup" >&2
+  fi
+  # One_shot_job task spool. Agent-owned; the bot can only enqueue (traverse the
+  # base + rwx on queue/), never touch processing/done/failed. The bot user is
+  # created later by setup-notify --telegram-bot, which (re)applies the bot ACL;
+  # apply it here too when the user already exists so re-runs converge.
+  install -o "$AGENT_USER" -g "$AGENT_USER" -m 700 -d "$TASKS_DIR"
+  install -o "$AGENT_USER" -g "$AGENT_USER" -m 700 -d \
+    "$TASKS_DIR/queue" "$TASKS_DIR/processing" "$TASKS_DIR/done" "$TASKS_DIR/failed"
+  if command -v setfacl >/dev/null 2>&1; then
+    setfacl -d -m "u:$AGENT_USER:rwx" "$TASKS_DIR/queue"
+    if getent passwd "$BOT_USER" >/dev/null 2>&1; then
+      setfacl -m "u:$BOT_USER:--x" "$TASKS_DIR"
+      setfacl -m "u:$BOT_USER:rwx" "$TASKS_DIR/queue"
+      setfacl -d -m "u:$BOT_USER:rwx" "$TASKS_DIR/queue"
+    fi
+  else
+    echo "setfacl unavailable; Telegram /task enqueue needs manual ACL setup for $TASKS_DIR/queue" >&2
   fi
   install -o root -g root -m 755 -d "$LIB_DIR"
   # The broker reads each repo checkout under the agent user's home; that home

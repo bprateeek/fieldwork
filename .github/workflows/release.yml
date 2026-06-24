@@ -25,6 +25,7 @@ jobs:
           python3 tests/broker-validation-tests.py
           python3 tests/bot-tests.py
           python3 tests/pr-prepare-validation-tests.py
+          bash tests/task-dispatcher-tests.sh
 
       - name: Build source archive and checksums
         run: |

@@ -20,7 +20,10 @@ so you can decide whether it fits before investing setup time.
 
 ## Agents
 
-- Claude and Codex are supported; other agents are not yet.
+- Claude (remote_control_daemon), Codex (desktop_relay), and Aider
+  (one_shot_job, queued via `fieldwork task` / Telegram `/task`) are supported;
+  other agents are not yet. Aider requires an operator-installed venv at
+  `/opt/fieldwork/aider-venv` and a BYO model in `~/.fieldwork/aider.conf`.
 - Codex parity is partial. Claude session hooks do not run under Codex, so Codex
   sessions still have no hook-derived "needs input" or "turn done" activity
   notifications. Git-derived journaling and resume-context artifacts are

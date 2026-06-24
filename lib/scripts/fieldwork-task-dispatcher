@@ -1,0 +1,182 @@
+#!/usr/bin/env python3
+"""fieldwork-task-dispatcher - schedule one_shot_job tasks.
+
+Always-on user service (fieldwork-task-dispatcher.service). It does NOT run
+agents itself; it claims queued tasks and spawns fieldwork-task-run per task,
+bounded by FIELDWORK_AGENT_CAPACITY across distinct slugs. The runner owns the
+sandbox, commit, verify, broker submission, and checkout restore.
+
+Scheduling rules:
+  - at most FIELDWORK_AGENT_CAPACITY runners at once;
+  - at most one runner per slug (the broker/prepare path use the single main
+    checkout $PROJECTS_ROOT/<slug>);
+  - defer a slug whose main checkout is dirty (uncommitted work in flight);
+    a clean checkout is safe even if a Claude daemon is up, since the runner
+    switches it to base. (Keying off fieldwork-agent@<slug> being active would
+    defer forever - that unit is a persistent daemon, not a per-edit signal.)
+
+Claiming is an atomic whole-dir rename queue/<id>/ -> processing/<id>/.
+
+Crash recovery (conservative, never clobbers): on startup any leftover
+processing/<id>/ is from a runner that died mid-run; it is moved to failed/ as
+failed_needs_manual_cleanup WITHOUT touching git. If that left the checkout on a
+branch, the next task for the slug refuses (ensure_clean_on_base) until an
+operator cleans up - safe by construction.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+HOME = Path(os.environ.get("HOME", str(Path.home())))
+TASKS_DIR = Path(os.environ.get("FIELDWORK_TASKS_DIR", "/var/lib/fieldwork-tasks"))
+QUEUE = TASKS_DIR / "queue"
+PROCESSING = TASKS_DIR / "processing"
+FAILED = TASKS_DIR / "failed"
+RUN_BIN = os.environ.get("FIELDWORK_TASK_RUN_BIN", str(HOME / ".local" / "bin" / "fieldwork-task-run"))
+PROJECTS_ROOT = Path(os.environ.get("FIELDWORK_PROJECTS_ROOT", str(HOME / "projects")))
+POLL_SECONDS = int(os.environ.get("FIELDWORK_TASK_POLL_SECONDS", "5") or "5")
+DISPATCH_ONCE = os.environ.get("FIELDWORK_TASK_DISPATCH_ONCE") == "1"
+
+CAP_DEFAULT = 2
+CAP_MAX = 4
+
+log = sys.stderr
+
+
+def now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def capacity() -> int:
+    raw = os.environ.get("FIELDWORK_AGENT_CAPACITY", "")
+    if not raw:
+        conf = HOME / ".fieldwork" / "agent.conf"
+        if conf.is_file():
+            for line in conf.read_text().splitlines():
+                s = line.strip()
+                if s.startswith("capacity"):
+                    _, _, v = s.partition("=")
+                    raw = v.strip()
+                    break
+    try:
+        n = int(raw)
+    except ValueError:
+        return CAP_DEFAULT
+    return max(1, min(CAP_MAX, n))
+
+
+def slug_of(task_dir: Path) -> str:
+    try:
+        return json.loads((task_dir / "task.json").read_text())["slug"]
+    except (OSError, ValueError, KeyError):
+        # Fall back to the "<slug>-<id12>" dir name shape.
+        name = task_dir.name
+        return name.rsplit("-", 1)[0] if "-" in name else name
+
+
+def checkout_busy(slug: str) -> bool:
+    """Defer a slug whose main checkout has uncommitted work in flight.
+
+    The broker/prepare path operate on the single checkout $PROJECTS_ROOT/<slug>.
+    We must not run a task while something is mid-edit there - but a Claude repo
+    is onboarded as a *persistent* `claude remote-control` daemon, so keying off
+    `fieldwork-agent@<slug>` being active would defer forever. Instead defer only
+    when the checkout is actually dirty (uncommitted changes); when it is clean
+    the runner safely checks out the base and proceeds. A clean checkout on a
+    feature branch is fine - the runner switches it to base.
+    """
+    repo = PROJECTS_ROOT / slug
+    if not (repo / ".git").exists():
+        return False  # let the runner report the missing/invalid checkout
+    try:
+        r = subprocess.run(
+            ["git", "-C", str(repo), "status", "--porcelain"],
+            capture_output=True, text=True, timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return True  # can't tell -> be conservative, defer
+    return bool(r.stdout.strip())
+
+
+def queued_tasks() -> list[Path]:
+    if not QUEUE.is_dir():
+        return []
+    items = [p for p in QUEUE.iterdir() if p.is_dir() and not p.name.startswith(".tmp.")]
+    items.sort(key=lambda p: p.stat().st_mtime)
+    return items
+
+
+def recover() -> None:
+    if not PROCESSING.is_dir():
+        return
+    FAILED.mkdir(parents=True, exist_ok=True)
+    for p in list(PROCESSING.iterdir()):
+        if not p.is_dir():
+            continue
+        marker = {"phase": "terminal", "outcome": "failed_needs_manual_cleanup",
+                  "message": "dispatcher restarted mid-run; checkout not auto-reset", "updated_at": now()}
+        try:
+            (p / "recovery.json").write_text(json.dumps(marker, sort_keys=True) + "\n")
+        except OSError:
+            pass
+        dest = FAILED / p.name
+        if dest.exists():
+            dest = FAILED / f"{p.name}-{int(time.time())}"
+        try:
+            os.replace(p, dest)
+            log.write(f"[dispatcher] recovered stale task {p.name} -> failed (manual cleanup)\n")
+        except OSError:
+            pass
+
+
+def schedule(running: dict) -> None:
+    cap = capacity()
+    PROCESSING.mkdir(parents=True, exist_ok=True)
+    for task_dir in queued_tasks():
+        if len(running) >= cap:
+            return
+        slug = slug_of(task_dir)
+        if slug in running:
+            continue
+        if checkout_busy(slug):
+            continue
+        dest = PROCESSING / task_dir.name
+        try:
+            os.replace(task_dir, dest)  # atomic claim
+        except OSError:
+            continue
+        try:
+            proc = subprocess.Popen([RUN_BIN, str(dest)])
+        except OSError as exc:
+            log.write(f"[dispatcher] cannot spawn runner for {dest.name}: {exc}\n")
+            continue
+        running[slug] = proc
+        log.write(f"[dispatcher] started {dest.name} (slug={slug}, running={len(running)}/{cap})\n")
+
+
+def reap(running: dict) -> None:
+    for slug in list(running):
+        if running[slug].poll() is not None:
+            del running[slug]
+
+
+def main() -> int:
+    recover()
+    running: dict[str, subprocess.Popen] = {}
+    while True:
+        reap(running)
+        schedule(running)
+        if DISPATCH_ONCE:
+            return 0
+        time.sleep(POLL_SECONDS)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

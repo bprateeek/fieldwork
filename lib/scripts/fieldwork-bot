@@ -26,8 +26,10 @@ import http.client
 import json
 import logging
 import os
+import re
 import secrets
 import socket as socket_mod
+import subprocess
 import sys
 import threading
 import time
@@ -69,6 +71,16 @@ TELEGRAM_API = os.environ.get("FIELDWORK_BOT_TELEGRAM_API", "https://api.telegra
 HEALTH_PENDING_LIMIT = int(os.environ.get("FIELDWORK_BOT_HEALTH_PENDING_LIMIT", "20"))
 DEDUPE_TTL_SECONDS = int(os.environ.get("FIELDWORK_BOT_DEDUPE_TTL_SECONDS", str(24 * 60 * 60)))
 
+# /task command (one_shot_job submission). Off unless task_chat_ids is set in
+# config: a privilege/spend surface distinct from approval recipients. The bot
+# cannot reach the agent's $HOME, so it shells out to the system-installed
+# enqueue helper, which validates and atomically drops into the shared spool.
+TASK_ENQUEUE_BIN = os.environ.get("FIELDWORK_BOT_TASK_ENQUEUE_BIN", "/usr/local/bin/fieldwork-task-enqueue")
+TASK_SPOOL_DIR = os.environ.get("FIELDWORK_BOT_TASKS_DIR", "/var/lib/fieldwork-tasks")
+TASK_RATE_PER_HOUR = int(os.environ.get("FIELDWORK_BOT_TASK_RATE_PER_HOUR", "6"))
+_task_rate_lock = threading.Lock()
+_task_rate: dict = {}  # chat_id -> list[timestamps]
+
 logging.basicConfig(
     filename=LOG_PATH,
     format="%(asctime)s %(levelname)s %(message)s",
@@ -106,7 +118,11 @@ def load_config(path: str = CONFIG_PATH) -> dict:
         raise RuntimeError(f"{path}: allowed_chat_ids must be a list of ints")
     if not chats:
         raise RuntimeError(f"{path}: allowed_chat_ids must contain at least one chat ID")
-    return {"bot_token": token, "allowed_chat_ids": chats}
+    # Optional, opt-in: chats allowed to submit /task. Empty/absent => /task off.
+    task_chats = cfg.get("task_chat_ids", [])
+    if not isinstance(task_chats, list) or not all(isinstance(c, int) for c in task_chats):
+        raise RuntimeError(f"{path}: task_chat_ids must be a list of ints")
+    return {"bot_token": token, "allowed_chat_ids": chats, "task_chat_ids": task_chats}
 
 
 def load_secret(path: str = SECRET_PATH) -> bytes:
@@ -603,6 +619,89 @@ def handle_callback(cfg: dict, secret: bytes, update: dict) -> None:
     edit_message(token, chat_id, message_id, new_text)
 
 
+SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,30}$")
+
+
+def _task_rate_ok(chat_id: int) -> bool:
+    if TASK_RATE_PER_HOUR <= 0:
+        return True
+    cutoff = time.time() - 3600
+    with _task_rate_lock:
+        hits = [t for t in _task_rate.get(chat_id, []) if t > cutoff]
+        if len(hits) >= TASK_RATE_PER_HOUR:
+            _task_rate[chat_id] = hits
+            return False
+        hits.append(time.time())
+        _task_rate[chat_id] = hits
+        return True
+
+
+def _reply(token: str, chat_id: int, text: str) -> None:
+    try:
+        telegram_call(token, "sendMessage", {"chat_id": chat_id, "text": text})
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError) as e:
+        log.warning("sendMessage failed chat=%s: %s", chat_id, e)
+
+
+def handle_message(cfg: dict, update: dict) -> None:
+    msg = update.get("message")
+    if not isinstance(msg, dict):
+        return
+    text = msg.get("text")
+    if not isinstance(text, str) or not text.startswith("/task"):
+        return
+    chat = msg.get("chat") or {}
+    chat_id = chat.get("id")
+    token = cfg["bot_token"]
+    user = msg.get("from") or {}
+    user_name = user.get("username") or user.get("first_name") or str(user.get("id") or "?")
+
+    # Separate opt-in allowlist (not the approval recipients): /task runs code
+    # and spends model budget, so a non-allowlisted chat is silently dropped.
+    if chat_id not in cfg.get("task_chat_ids", []):
+        log.warning("/task from non-allowlisted chat=%s user=%s — dropped", chat_id, user_name)
+        return
+
+    if not _task_rate_ok(chat_id):
+        _reply(token, chat_id, "⏳ task rate limit reached; try again later")
+        return
+
+    # "/task[@bot] <slug> <prompt...>"
+    body = text.split(None, 1)[1] if len(text.split(None, 1)) > 1 else ""
+    parts = body.split(None, 1)
+    if len(parts) < 2:
+        _reply(token, chat_id, "usage: /task <slug> <prompt>")
+        return
+    slug, prompt = parts[0], parts[1]
+    if not SLUG_RE.match(slug):
+        _reply(token, chat_id, f"invalid slug '{slug}' (^[a-z0-9][a-z0-9-]{{0,30}}$)")
+        return
+
+    prompt_bytes = prompt.encode("utf-8")
+    header = json.dumps({
+        "slug": slug, "profile": "", "prompt_bytes": len(prompt_bytes),
+        "source": "telegram", "actor": str(chat_id),
+    }).encode("utf-8")
+    env = dict(os.environ)
+    env["FIELDWORK_TASKS_DIR"] = TASK_SPOOL_DIR
+    try:
+        proc = subprocess.run(
+            [TASK_ENQUEUE_BIN], input=header + b"\n" + prompt_bytes,
+            env=env, capture_output=True, timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log.error("/task enqueue exec failed: %s", e)
+        _reply(token, chat_id, "⚠️ could not enqueue task (enqueue helper unavailable)")
+        return
+    if proc.returncode == 0:
+        task_id = proc.stdout.decode("utf-8", "replace").strip()
+        log.info("/task queued id=%s slug=%s chat=%s user=%s", task_id, slug, chat_id, user_name)
+        _reply(token, chat_id, f"✅ queued task {task_id}")
+    else:
+        err = proc.stderr.decode("utf-8", "replace").strip()[:200] or "rejected"
+        _reply(token, chat_id, f"⚠️ task rejected: {err}")
+
+
 def poll_telegram(cfg: dict, secret: bytes, stop: threading.Event) -> None:
     token = cfg["bot_token"]
     offset = 0
@@ -610,9 +709,12 @@ def poll_telegram(cfg: dict, secret: bytes, stop: threading.Event) -> None:
     consecutive_failures = 0
     while not stop.is_set():
         try:
+            allowed_updates = ["callback_query"]
+            if cfg.get("task_chat_ids"):
+                allowed_updates.append("message")
             result = telegram_call(
                 token, "getUpdates",
-                {"timeout": POLL_TIMEOUT_SECONDS, "offset": offset, "allowed_updates": ["callback_query"]},
+                {"timeout": POLL_TIMEOUT_SECONDS, "offset": offset, "allowed_updates": allowed_updates},
                 timeout=POLL_TIMEOUT_SECONDS + 5,
             )
             write_health(last_poll_ok_at=_utcnow_iso(), last_poll_error_at=None, last_poll_error=None)
@@ -637,6 +739,10 @@ def poll_telegram(cfg: dict, secret: bytes, stop: threading.Event) -> None:
                 handle_callback(cfg, secret, update)
             except Exception:
                 log.exception("handle_callback raised")
+            try:
+                handle_message(cfg, update)
+            except Exception:
+                log.exception("handle_message raised")
             update_id = update.get("update_id")
             if isinstance(update_id, int):
                 offset = max(offset, update_id + 1)

@@ -151,11 +151,13 @@ source "$FIELDWORK_ROOT/lib/cli/verify-security.sh"
 source "$FIELDWORK_ROOT/lib/cli/uninstall.sh"
 # shellcheck source=lib/cli/developer-preview.sh
 source "$FIELDWORK_ROOT/lib/cli/developer-preview.sh"
+# shellcheck source=lib/cli/task.sh
+source "$FIELDWORK_ROOT/lib/cli/task.sh"
 
 # Resolve the control-plane config object (host, user, projects root, default
 # branch, notify provider, forge, identity). Owns the defaults; see lib/cli/config.sh.
 fieldwork_load_config
-FIELDWORK_FINGERPRINT_FILES="bin/fieldwork install.sh AGENTS.md lib/cli/config.sh lib/cli/messaging.sh lib/cli/health.sh lib/cli/ssh-config.sh lib/cli/setup.sh lib/cli/onboard.sh lib/cli/quickstart.sh lib/cli/provision.sh lib/cli/verify-security.sh lib/cli/uninstall.sh lib/cli/developer-preview.sh lib/systemd/bootstrap-vps.sh lib/apparmor/fieldwork-bwrap lib/broker/install.sh lib/broker/standalone-install.sh lib/broker/fieldwork-pr-broker.service lib/broker/fieldwork-pr-broker.socket lib/broker/fieldwork-pr-approve.socket lib/broker/server.py schema/pr-request.schema.json schema/pr-prepare-request.schema.json lib/scripts/fieldwork-status lib/scripts/fieldwork-status-snapshot lib/scripts/fieldwork-dashboard-server lib/scripts/fieldwork-pr-submit lib/scripts/fieldwork-clone lib/scripts/fieldwork-init lib/scripts/fieldwork-launch lib/scripts/fieldwork-agent-session lib/scripts/fieldwork-event-poll lib/scripts/fieldwork-setup-probe lib/scripts/fieldwork-session-probe lib/scripts/fieldwork-codex-sandbox lib/scripts/fieldwork-bot lib/scripts/fieldwork-pr-prepare lib/scripts/fieldwork-pr-prepare-runner lib/scripts/fieldwork-pr-prepare-impl lib/agents/claude-remote-control lib/templates/repo/AGENTS.md lib/templates/repo/CLAUDE.md lib/templates/repo/.gitignore lib/templates/repo/.fieldwork/expected-origin lib/systemd/fieldwork-agent@.service lib/systemd/fieldwork-dashboard.service lib/systemd/fieldwork-event-poll.service lib/systemd/fieldwork-event-poll.timer lib/systemd/fieldwork-bot.service lib/systemd/fieldwork-pr-prepare-runner.socket lib/systemd/fieldwork-pr-prepare-runner@.service lib/systemd/fieldwork-verify-runner.socket lib/systemd/fieldwork-verify-runner@.service examples/eval/docker-compose.yml examples/eval/Dockerfile examples/eval/eval-smoke.sh examples/eval/fake-gh examples/eval/fake-gitleaks examples/eval/gh examples/eval/gitleaks examples/eval/README.md"
+FIELDWORK_FINGERPRINT_FILES="bin/fieldwork install.sh AGENTS.md lib/cli/config.sh lib/cli/messaging.sh lib/cli/health.sh lib/cli/ssh-config.sh lib/cli/setup.sh lib/cli/onboard.sh lib/cli/quickstart.sh lib/cli/provision.sh lib/cli/verify-security.sh lib/cli/uninstall.sh lib/cli/developer-preview.sh lib/cli/task.sh lib/systemd/bootstrap-vps.sh lib/apparmor/fieldwork-bwrap lib/broker/install.sh lib/broker/standalone-install.sh lib/broker/fieldwork-pr-broker.service lib/broker/fieldwork-pr-broker.socket lib/broker/fieldwork-pr-approve.socket lib/broker/server.py schema/pr-request.schema.json schema/pr-prepare-request.schema.json lib/scripts/fieldwork-status lib/scripts/fieldwork-status-snapshot lib/scripts/fieldwork-dashboard-server lib/scripts/fieldwork-pr-submit lib/scripts/fieldwork-clone lib/scripts/fieldwork-init lib/scripts/fieldwork-launch lib/scripts/fieldwork-agent-session lib/scripts/fieldwork-task-enqueue lib/scripts/fieldwork-task-run lib/scripts/fieldwork-task-dispatcher lib/scripts/fieldwork-event-poll lib/scripts/fieldwork-setup-probe lib/scripts/fieldwork-session-probe lib/scripts/fieldwork-codex-sandbox lib/scripts/fieldwork-bot lib/scripts/fieldwork-pr-prepare lib/scripts/fieldwork-pr-prepare-runner lib/scripts/fieldwork-pr-prepare-impl lib/agents/claude-remote-control lib/agents/aider lib/templates/repo/AGENTS.md lib/templates/repo/CLAUDE.md lib/templates/repo/.gitignore lib/templates/repo/.fieldwork/expected-origin lib/systemd/fieldwork-agent@.service lib/systemd/fieldwork-dashboard.service lib/systemd/fieldwork-event-poll.service lib/systemd/fieldwork-event-poll.timer lib/systemd/fieldwork-task-dispatcher.service lib/systemd/fieldwork-bot.service lib/systemd/fieldwork-pr-prepare-runner.socket lib/systemd/fieldwork-pr-prepare-runner@.service lib/systemd/fieldwork-verify-runner.socket lib/systemd/fieldwork-verify-runner@.service examples/eval/docker-compose.yml examples/eval/Dockerfile examples/eval/eval-smoke.sh examples/eval/fake-gh examples/eval/fake-gitleaks examples/eval/gh examples/eval/gitleaks examples/eval/README.md"
 FIELDWORK_UI_COLOR=0
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
   FIELDWORK_UI_COLOR=1
@@ -408,6 +410,7 @@ Getting started
 
 Day to day
   refresh <repo>      update the VPS checkout after merge
+  task add|list|discard   queue a one_shot_job task (e.g. aider) on the VPS
   dashboard           open read-only VPS dashboard
   status [repo]       show session and PR status
   log [repo]          tail the audit log
@@ -2870,14 +2873,26 @@ EOF
     printf "timer=no enabled= active= "
   fi
   test -f "$HOME/.config/systemd/user/fieldwork-dashboard.service" \
-    && printf "dashboard=yes\n" || printf "dashboard=no\n"' 2>/dev/null || true)"
+    && printf "dashboard=yes " || printf "dashboard=no "
+  disp=fieldwork-task-dispatcher.service
+  if test -f "$HOME/.config/systemd/user/$disp"; then
+    den=$(systemctl --user is-enabled "$disp" 2>/dev/null || true)
+    dac=$(systemctl --user is-active "$disp" 2>/dev/null || true)
+    printf "dispatcher=yes dispatcher_enabled=%s dispatcher_active=%s\n" "$den" "$dac"
+  else
+    printf "dispatcher=no dispatcher_enabled= dispatcher_active=\n"
+  fi' 2>/dev/null || true)"
       timer_present=""; timer_enabled=""; timer_active=""; dashboard_present=""
+      dispatcher_present=""; dispatcher_enabled=""; dispatcher_active=""
       for poll_tok in $poll_meta; do
         case "$poll_tok" in
           timer=*) timer_present="${poll_tok#timer=}" ;;
           enabled=*) timer_enabled="${poll_tok#enabled=}" ;;
           active=*) timer_active="${poll_tok#active=}" ;;
           dashboard=*) dashboard_present="${poll_tok#dashboard=}" ;;
+          dispatcher=*) dispatcher_present="${poll_tok#dispatcher=}" ;;
+          dispatcher_enabled=*) dispatcher_enabled="${poll_tok#dispatcher_enabled=}" ;;
+          dispatcher_active=*) dispatcher_active="${poll_tok#dispatcher_active=}" ;;
         esac
       done
       if [ -z "$poll_meta" ] || [ -z "$timer_present" ]; then
@@ -2923,6 +2938,30 @@ EOF
           "fieldwork-dashboard.service is not in ~/.config/systemd/user" \
           "fieldwork dashboard cannot start the read-only dashboard until the unit is installed" \
           "fieldwork setup --force-install re-copies the dashboard unit (started on demand by fieldwork dashboard)" \
+          "yes"
+      fi
+      # one_shot_job dispatcher: always-on; must be installed, enabled, active.
+      # Only relevant when a one_shot_job agent (e.g. aider) is configured, but
+      # the unit ships for all setups, so check presence and (if present) state.
+      if [ "$dispatcher_present" = "yes" ]; then
+        if [ "$dispatcher_enabled" = "enabled" ] && [ "$dispatcher_active" = "active" ]; then
+          doctor_ok "task dispatcher enabled and active"
+        else
+          doctor_manual \
+            "task dispatcher is enabled=$dispatcher_enabled active=$dispatcher_active" \
+            "fieldwork setup --force-install" \
+            "fieldwork-task-dispatcher.service is not both enabled and active" \
+            "queued one_shot_job tasks (fieldwork task add / Telegram /task) will not run until it is up" \
+            "fieldwork setup --force-install re-applies and enables it. Advanced: ssh -t $FIELDWORK_SSH_HOST 'systemctl --user enable --now fieldwork-task-dispatcher.service'" \
+            "yes"
+        fi
+      else
+        doctor_manual \
+          "task dispatcher unit file missing" \
+          "fieldwork setup --force-install" \
+          "fieldwork-task-dispatcher.service is not in ~/.config/systemd/user" \
+          "one_shot_job tasks cannot run until the dispatcher unit is installed" \
+          "fieldwork setup --force-install re-copies, daemon-reloads, and enables it" \
           "yes"
       fi
 
@@ -4980,6 +5019,7 @@ case "$cmd" in
   smoke) shift; smoke_repo "$@" ;;
   refresh) shift; refresh_repo "$@" ;;
   dashboard) shift; dashboard_fieldwork "$@" ;;
+  task) shift; task_fieldwork "$@" ;;
   eval) shift; fieldwork_eval "$@" ;;
   log) shift; fieldwork_log "$@" ;;
   adapter) shift; fieldwork_adapter "$@" ;;

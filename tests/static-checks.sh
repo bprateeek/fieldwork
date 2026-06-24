@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-FIELDWORK_TEST_FINGERPRINT_FILES="bin/fieldwork install.sh AGENTS.md lib/cli/config.sh lib/cli/messaging.sh lib/cli/health.sh lib/cli/ssh-config.sh lib/cli/setup.sh lib/cli/onboard.sh lib/cli/quickstart.sh lib/cli/provision.sh lib/cli/verify-security.sh lib/cli/uninstall.sh lib/cli/developer-preview.sh lib/systemd/bootstrap-vps.sh lib/apparmor/fieldwork-bwrap lib/broker/install.sh lib/broker/standalone-install.sh lib/broker/fieldwork-pr-broker.service lib/broker/fieldwork-pr-broker.socket lib/broker/fieldwork-pr-approve.socket lib/broker/server.py schema/pr-request.schema.json schema/pr-prepare-request.schema.json lib/scripts/fieldwork-status lib/scripts/fieldwork-status-snapshot lib/scripts/fieldwork-dashboard-server lib/scripts/fieldwork-pr-submit lib/scripts/fieldwork-clone lib/scripts/fieldwork-init lib/scripts/fieldwork-launch lib/scripts/fieldwork-agent-session lib/scripts/fieldwork-event-poll lib/scripts/fieldwork-setup-probe lib/scripts/fieldwork-session-probe lib/scripts/fieldwork-codex-sandbox lib/scripts/fieldwork-bot lib/scripts/fieldwork-pr-prepare lib/scripts/fieldwork-pr-prepare-runner lib/scripts/fieldwork-pr-prepare-impl lib/agents/claude-remote-control lib/templates/repo/AGENTS.md lib/templates/repo/CLAUDE.md lib/templates/repo/.gitignore lib/templates/repo/.fieldwork/expected-origin lib/systemd/fieldwork-agent@.service lib/systemd/fieldwork-dashboard.service lib/systemd/fieldwork-event-poll.service lib/systemd/fieldwork-event-poll.timer lib/systemd/fieldwork-bot.service lib/systemd/fieldwork-pr-prepare-runner.socket lib/systemd/fieldwork-pr-prepare-runner@.service lib/systemd/fieldwork-verify-runner.socket lib/systemd/fieldwork-verify-runner@.service examples/eval/docker-compose.yml examples/eval/Dockerfile examples/eval/eval-smoke.sh examples/eval/fake-gh examples/eval/fake-gitleaks examples/eval/gh examples/eval/gitleaks examples/eval/README.md"
+FIELDWORK_TEST_FINGERPRINT_FILES="bin/fieldwork install.sh AGENTS.md lib/cli/config.sh lib/cli/messaging.sh lib/cli/health.sh lib/cli/ssh-config.sh lib/cli/setup.sh lib/cli/onboard.sh lib/cli/quickstart.sh lib/cli/provision.sh lib/cli/verify-security.sh lib/cli/uninstall.sh lib/cli/developer-preview.sh lib/cli/task.sh lib/systemd/bootstrap-vps.sh lib/apparmor/fieldwork-bwrap lib/broker/install.sh lib/broker/standalone-install.sh lib/broker/fieldwork-pr-broker.service lib/broker/fieldwork-pr-broker.socket lib/broker/fieldwork-pr-approve.socket lib/broker/server.py schema/pr-request.schema.json schema/pr-prepare-request.schema.json lib/scripts/fieldwork-status lib/scripts/fieldwork-status-snapshot lib/scripts/fieldwork-dashboard-server lib/scripts/fieldwork-pr-submit lib/scripts/fieldwork-clone lib/scripts/fieldwork-init lib/scripts/fieldwork-launch lib/scripts/fieldwork-agent-session lib/scripts/fieldwork-task-enqueue lib/scripts/fieldwork-task-run lib/scripts/fieldwork-task-dispatcher lib/scripts/fieldwork-event-poll lib/scripts/fieldwork-setup-probe lib/scripts/fieldwork-session-probe lib/scripts/fieldwork-codex-sandbox lib/scripts/fieldwork-bot lib/scripts/fieldwork-pr-prepare lib/scripts/fieldwork-pr-prepare-runner lib/scripts/fieldwork-pr-prepare-impl lib/agents/claude-remote-control lib/agents/aider lib/templates/repo/AGENTS.md lib/templates/repo/CLAUDE.md lib/templates/repo/.gitignore lib/templates/repo/.fieldwork/expected-origin lib/systemd/fieldwork-agent@.service lib/systemd/fieldwork-dashboard.service lib/systemd/fieldwork-event-poll.service lib/systemd/fieldwork-event-poll.timer lib/systemd/fieldwork-task-dispatcher.service lib/systemd/fieldwork-bot.service lib/systemd/fieldwork-pr-prepare-runner.socket lib/systemd/fieldwork-pr-prepare-runner@.service lib/systemd/fieldwork-verify-runner.socket lib/systemd/fieldwork-verify-runner@.service examples/eval/docker-compose.yml examples/eval/Dockerfile examples/eval/eval-smoke.sh examples/eval/fake-gh examples/eval/fake-gitleaks examples/eval/gh examples/eval/gitleaks examples/eval/README.md"
 TMP_DIRS=""
 cleanup() {
   local dir
@@ -1200,7 +1200,7 @@ case "$args" in
   *"fieldwork-event-poll.timer"*)
     case "${FAKE_POLL_TIMER:-healthy}" in
       disabled) echo "timer=yes enabled=disabled active=inactive dashboard=yes" ;;
-      *) echo "timer=yes enabled=enabled active=active dashboard=yes" ;;
+      *) echo "timer=yes enabled=enabled active=active dashboard=yes dispatcher=yes dispatcher_enabled=enabled dispatcher_active=active" ;;
     esac
     exit 0 ;;
   *)
@@ -1343,7 +1343,7 @@ case "$args" in
   *"git config --get user.email"*) echo "fieldwork@example.com"; exit 0 ;;
   *"git config --get user.name"*) echo "Fieldwork"; exit 0 ;;
   *"echo repo=ok"*) printf 'repo=ok\nstack=none\n'; exit 0 ;;
-  *"fieldwork-event-poll.timer"*) echo "timer=yes enabled=enabled active=active dashboard=yes"; exit 0 ;;
+  *"fieldwork-event-poll.timer"*) echo "timer=yes enabled=enabled active=active dashboard=yes dispatcher=yes dispatcher_enabled=enabled dispatcher_active=active"; exit 0 ;;
   *)
     echo "unexpected fake codex doctor ssh command: $args" >&2
     exit 1
@@ -1509,7 +1509,7 @@ project_deps=missing
 EOF
     exit 0
     ;;
-  *"fieldwork-event-poll.timer"*) echo "timer=yes enabled=enabled active=active dashboard=yes"; exit 0 ;;
+  *"fieldwork-event-poll.timer"*) echo "timer=yes enabled=enabled active=active dashboard=yes dispatcher=yes dispatcher_enabled=enabled dispatcher_active=active"; exit 0 ;;
   *)
     echo "unexpected fake doctor repo ssh command: $args" >&2
     exit 1
@@ -1574,7 +1574,7 @@ case "$args" in
   *"stat -c '%U:%G %a' /etc/fieldwork-pr-broker/gh-token"*) exit 0 ;;
   *"git config --get user.email"*) echo "fieldwork@example.com"; exit 0 ;;
   *"git config --get user.name"*) echo "Fieldwork"; exit 0 ;;
-  *"fieldwork-event-poll.timer"*) echo "timer=yes enabled=enabled active=active dashboard=yes"; exit 0 ;;
+  *"fieldwork-event-poll.timer"*) echo "timer=yes enabled=enabled active=active dashboard=yes dispatcher=yes dispatcher_enabled=enabled dispatcher_active=active"; exit 0 ;;
   *)
     echo "unexpected fake doctor apparmor ssh command: $args" >&2
     exit 1

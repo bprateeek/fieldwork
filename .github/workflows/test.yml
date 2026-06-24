@@ -28,6 +28,9 @@ jobs:
       - name: pr-prepare-validation-tests
         run: python3 tests/pr-prepare-validation-tests.py
 
+      - name: task-dispatcher-tests
+        run: bash tests/task-dispatcher-tests.sh
+
   shellcheck:
     runs-on: ubuntu-latest
     timeout-minutes: 5

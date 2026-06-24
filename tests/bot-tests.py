@@ -308,5 +308,67 @@ class BotCallbackTests(unittest.TestCase):
         self.assertIn("answerCallbackQuery", methods)
 
 
+class BotTaskCommandTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.tmp = Path(tempfile.mkdtemp(prefix="fieldwork-bot-task."))
+        (cls.tmp / "spool" / "queue").mkdir(parents=True)
+        os.environ["FIELDWORK_BOT_TASK_ENQUEUE_BIN"] = str(ROOT / "lib/scripts/fieldwork-task-enqueue")
+        os.environ["FIELDWORK_BOT_TASKS_DIR"] = str(cls.tmp / "spool")
+        cls.bot = _load_bot_module(cls.tmp)
+        cls.cfg = {"bot_token": "t", "allowed_chat_ids": [1], "task_chat_ids": [1]}
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def setUp(self) -> None:
+        self.bot._task_rate.clear()
+        for d in (self.tmp / "spool" / "queue").iterdir():
+            shutil.rmtree(d, ignore_errors=True)
+
+    def _msg(self, chat_id, text):
+        return {"message": {"chat": {"id": chat_id}, "from": {"id": chat_id, "username": "u"}, "text": text}}
+
+    def _queue_dirs(self):
+        return [p for p in (self.tmp / "spool" / "queue").iterdir() if p.is_dir() and not p.name.startswith(".tmp.")]
+
+    def test_task_enqueues_for_allowlisted_chat(self) -> None:
+        sent = []
+        with patch.object(self.bot, "telegram_call", side_effect=lambda t, m, p, timeout=15: sent.append(p) or {"ok": True}):
+            self.bot.handle_message(self.cfg, self._msg(1, "/task web fix the login bug"))
+        dirs = self._queue_dirs()
+        self.assertEqual(len(dirs), 1, "exactly one task enqueued")
+        self.assertTrue((dirs[0] / "task.json").is_file())
+        self.assertEqual((dirs[0] / "prompt.txt").read_text(), "fix the login bug")
+        self.assertTrue(any("queued" in (p.get("text") or "") for p in sent))
+
+    def test_non_allowlisted_chat_silently_dropped(self) -> None:
+        with patch.object(self.bot, "telegram_call") as fake_tg:
+            self.bot.handle_message(self.cfg, self._msg(999, "/task web do stuff"))
+        fake_tg.assert_not_called()
+        self.assertEqual(self._queue_dirs(), [])
+
+    def test_bad_command_replies_usage(self) -> None:
+        sent = []
+        with patch.object(self.bot, "telegram_call", side_effect=lambda t, m, p, timeout=15: sent.append(p) or {"ok": True}):
+            self.bot.handle_message(self.cfg, self._msg(1, "/task web"))
+        self.assertEqual(self._queue_dirs(), [])
+        self.assertTrue(any("usage" in (p.get("text") or "") for p in sent))
+
+    def test_rate_limit(self) -> None:
+        orig = self.bot.TASK_RATE_PER_HOUR
+        self.bot.TASK_RATE_PER_HOUR = 1
+        try:
+            sent = []
+            with patch.object(self.bot, "telegram_call", side_effect=lambda t, m, p, timeout=15: sent.append(p) or {"ok": True}):
+                self.bot.handle_message(self.cfg, self._msg(1, "/task web first"))
+                self.bot.handle_message(self.cfg, self._msg(1, "/task web second"))
+            self.assertEqual(len(self._queue_dirs()), 1, "second task blocked by rate limit")
+            self.assertTrue(any("rate limit" in (p.get("text") or "") for p in sent))
+        finally:
+            self.bot.TASK_RATE_PER_HOUR = orig
+
+
 if __name__ == "__main__":
     unittest.main()

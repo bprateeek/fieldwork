@@ -26,7 +26,10 @@ RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 # Reads its config from /etc/fieldwork-bot (root-installed); writes only the
 # broker state dirs it shares with the broker over the fieldwork-bot group.
 ReadOnlyPaths=/etc/fieldwork-bot
-ReadWritePaths=/var/lib/fieldwork-pr-broker/pending /var/lib/fieldwork-pr-broker/notifications /var/lib/fieldwork-bot /var/log/fieldwork-bot.log
+# /var/lib/fieldwork-tasks/queue: enqueue-only drop dir for the /task command
+# (leading - tolerates absence before the task spool is provisioned). The bot
+# has no access to processing/done/failed; the dispatcher owns those.
+ReadWritePaths=/var/lib/fieldwork-pr-broker/pending /var/lib/fieldwork-pr-broker/notifications /var/lib/fieldwork-bot /var/log/fieldwork-bot.log -/var/lib/fieldwork-tasks/queue
 
 [Install]
 WantedBy=multi-user.target

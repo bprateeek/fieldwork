@@ -109,4 +109,39 @@ adapter="$HOME/.fieldwork/infra/agents/$adapter_name"
   exit 1
 }
 
-exec "$adapter" "$slug" "$repo_dir"
+# Adapters declare a process model via a `# fieldwork-process-model: <model>`
+# header. This per-repo session unit only runs remote_control_daemon adapters
+# (a long-running session). one_shot_job agents (e.g. aider) are driven by
+# fieldwork-task-dispatcher, not here; desktop_relay agents have no unit.
+# Unset/unknown defaults to remote_control_daemon so existing adapters are
+# unaffected.
+fieldwork_agent_process_model() {
+  local file="$1" model
+  model="$(awk '
+    /^[[:space:]]*#[[:space:]]*fieldwork-process-model[[:space:]]*:/ {
+      sub(/^[^:]*:/, ""); gsub(/[[:space:]]/, ""); print; exit
+    }
+  ' "$file" 2>/dev/null)"
+  printf '%s\n' "${model:-remote_control_daemon}"
+}
+
+process_model="$(fieldwork_agent_process_model "$adapter")"
+case "$process_model" in
+  remote_control_daemon)
+    exec "$adapter" "$slug" "$repo_dir"
+    ;;
+  one_shot_job)
+    echo "[fieldwork-agent-session] adapter '$adapter_name' is a one_shot_job agent" >&2
+    echo "[fieldwork-agent-session] it is driven by fieldwork-task-dispatcher, not a per-repo session" >&2
+    echo "[fieldwork-agent-session] submit work with: fieldwork task add $slug \"<prompt>\"" >&2
+    exit 0
+    ;;
+  desktop_relay)
+    echo "[fieldwork-agent-session] adapter '$adapter_name' is a desktop_relay agent (no session unit)" >&2
+    exit 0
+    ;;
+  *)
+    echo "[fieldwork-agent-session] adapter '$adapter_name' declares unknown process model: $process_model" >&2
+    exit 2
+    ;;
+esac

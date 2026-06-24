@@ -532,16 +532,16 @@ EOF
     ssh "$FIELDWORK_SSH_HOST" "force_install=$(shell_quote "$force_install") bash -s" <<'REMOTE_RUNNER_SOCKETS' >/dev/null 2>&1
 set -eu
 mkdir -p "$HOME/.config/systemd/user"
-cp "$HOME/.fieldwork/infra/fieldwork-verify-runner.socket" "$HOME/.fieldwork/infra/fieldwork-verify-runner@.service" "$HOME/.fieldwork/infra/fieldwork-pr-prepare-runner.socket" "$HOME/.fieldwork/infra/fieldwork-pr-prepare-runner@.service" "$HOME/.fieldwork/infra/fieldwork-event-poll.service" "$HOME/.fieldwork/infra/fieldwork-event-poll.timer" "$HOME/.fieldwork/infra/fieldwork-dashboard.service" "$HOME/.config/systemd/user/"
+cp "$HOME/.fieldwork/infra/fieldwork-verify-runner.socket" "$HOME/.fieldwork/infra/fieldwork-verify-runner@.service" "$HOME/.fieldwork/infra/fieldwork-pr-prepare-runner.socket" "$HOME/.fieldwork/infra/fieldwork-pr-prepare-runner@.service" "$HOME/.fieldwork/infra/fieldwork-event-poll.service" "$HOME/.fieldwork/infra/fieldwork-event-poll.timer" "$HOME/.fieldwork/infra/fieldwork-dashboard.service" "$HOME/.fieldwork/infra/fieldwork-task-dispatcher.service" "$HOME/.config/systemd/user/"
 systemctl --user daemon-reload
-systemctl --user enable --now fieldwork-verify-runner.socket fieldwork-pr-prepare-runner.socket fieldwork-event-poll.timer
+systemctl --user enable --now fieldwork-verify-runner.socket fieldwork-pr-prepare-runner.socket fieldwork-event-poll.timer fieldwork-task-dispatcher.service
 # On --force-install, restart so changed socket-unit settings (e.g. MaxConnections)
 # take effect; enable --now alone does not re-read an already-active socket.
 # Already-accepted runner @ instances run as separate units and are not stopped;
 # a connection attempted during the sub-second restart window may need to retry,
 # which is acceptable for an explicit reprovision.
 if [ "${force_install:-0}" = "1" ]; then
-  systemctl --user restart fieldwork-verify-runner.socket fieldwork-pr-prepare-runner.socket fieldwork-event-poll.timer
+  systemctl --user restart fieldwork-verify-runner.socket fieldwork-pr-prepare-runner.socket fieldwork-event-poll.timer fieldwork-task-dispatcher.service
 fi
 REMOTE_RUNNER_SOCKETS
   }
@@ -2451,6 +2451,11 @@ if [ -n "$submit_socket_group" ] && id -nG fieldwork-bot | tr ' ' '\n' | grep -F
 fi
 install -o root -g fieldwork-bot -m 750 -d /etc/fieldwork-bot
 install -o root -g root -m 755 "$bot_src" /usr/local/bin/fieldwork-bot
+# The bot cannot reach the agent's $HOME (ProtectHome=true), so the /task handler
+# shells out to a system-installed copy of the enqueue helper.
+if [ -f "$src_dir/lib/scripts/fieldwork-task-enqueue" ]; then
+  install -o root -g root -m 755 "$src_dir/lib/scripts/fieldwork-task-enqueue" /usr/local/bin/fieldwork-task-enqueue
+fi
 install -o root -g root -m 644 "$bot_unit" /etc/systemd/system/fieldwork-bot.service
 install -o fieldwork-bot -g fieldwork-bot -m 755 -d /var/lib/fieldwork-bot
 [ -f /var/log/fieldwork-bot.log ] || install -o fieldwork-bot -g fieldwork-bot -m 640 /dev/null /var/log/fieldwork-bot.log
@@ -2467,8 +2472,27 @@ if [ -d "$broker_state" ]; then
   if command -v setfacl >/dev/null 2>&1; then
     setfacl -m "u:$broker_user:rwx" "$broker_state/notifications"
     setfacl -d -m "u:$broker_user:rwx" "$broker_state/notifications"
+    # Explicit bot traverse on the broker state dir so the bot can reach
+    # pending/ + notifications/ without depending on the systemd StateDirectory
+    # 0755 window (broker install's 0700 transiently removes other-traverse and
+    # crash-loops the bot). Mirrors the broker installer's grant.
+    setfacl -m "u:fieldwork-bot:--x" "$broker_state"
   else
     echo "setfacl unavailable; broker lifecycle notifications need manual ACL setup for $broker_state/notifications" >&2
+  fi
+fi
+
+# Grant the bot user enqueue-only access to the one_shot_job task spool so the
+# Telegram /task command can drop tasks. Least privilege: traverse the base +
+# rwx on queue/ only; never processing/done/failed (the dispatcher owns those).
+tasks_dir="/var/lib/fieldwork-tasks"
+if [ -d "$tasks_dir/queue" ]; then
+  if command -v setfacl >/dev/null 2>&1; then
+    setfacl -m "u:fieldwork-bot:--x" "$tasks_dir"
+    setfacl -m "u:fieldwork-bot:rwx" "$tasks_dir/queue"
+    setfacl -d -m "u:fieldwork-bot:rwx" "$tasks_dir/queue"
+  else
+    echo "setfacl unavailable; Telegram /task enqueue needs manual ACL setup for $tasks_dir/queue" >&2
   fi
 fi
 

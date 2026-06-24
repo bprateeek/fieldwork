@@ -30,6 +30,7 @@ Use `fieldwork setup` directly when you want the step-by-step setup-only path.
 | `refresh`         | Fast-forward the VPS checkout after merge; restart Claude service only when configured.                         | [§ `fieldwork refresh`](#fieldwork-refresh-repo-slug) below                        |
 | `start`           | Start Claude service when configured; print Codex Desktop SSH instructions when configured.                     | [§ `fieldwork start`](#fieldwork-start-repo-slug) below                            |
 | `status`          | Show repo, broker, runner, delivery-client, Claude, and Codex readiness.                                        | [§ `fieldwork status`](#fieldwork-status-repo-slug) below                          |
+| `task`            | Queue, list, or discard a one_shot_job task (e.g. aider) that runs on the VPS.                                  | [§ `fieldwork task`](#fieldwork-task) below                                        |
 | `bot-status`      | Inspect the Telegram approval bot pipeline: polling, pending queue, sockets, and config.                        | [§ `fieldwork bot-status`](#fieldwork-bot-status) below                            |
 
 `fieldwork --help` prints the same surface with full argument syntax.
@@ -252,6 +253,23 @@ Flags:
 | `--no-open` | Print the URL without launching a browser. |
 
 ---
+
+## `fieldwork task`
+
+```
+fieldwork task add <slug> [<prompt>] [--profile <name>]
+fieldwork task list
+fieldwork task discard <task-id>
+```
+
+Submit a `one_shot_job` task (e.g. aider) to run on the VPS. `add` reads the
+prompt from the argument or stdin and streams it over SSH to the enqueue helper
+(the prompt never lands on local disk and never appears in an SSH argv). The
+`fieldwork-task-dispatcher` service then runs it: edit in a bwrap sandbox,
+detect the diff, commit via the prepare runner, verify, and open a PR through
+the broker. `list` shows queued/running/done/failed tasks; `discard` removes a
+queued or terminal task (a running or awaiting-approval task cannot be
+discarded). See [agent-adapters.md](agent-adapters.md) for the Aider setup.
 
 ## `fieldwork onboard <owner>/<repo>`
 

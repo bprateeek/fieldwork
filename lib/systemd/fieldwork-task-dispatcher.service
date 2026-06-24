@@ -1,0 +1,14 @@
+[Unit]
+Description=Fieldwork one_shot_job task dispatcher
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/.fieldwork/scripts/fieldwork-task-dispatcher
+Restart=on-failure
+RestartSec=10
+Environment=FIELDWORK_PROJECTS_ROOT=%h/projects
+Environment=FIELDWORK_TASKS_DIR=/var/lib/fieldwork-tasks
+
+[Install]
+WantedBy=default.target

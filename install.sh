@@ -282,10 +282,16 @@ link_one "$HOME/.fieldwork/scripts/fieldwork-pr-prepare" "$HOME/.local/bin/field
 link_one "$HOME/.fieldwork/scripts/fieldwork-pr-prepare-runner" "$HOME/.local/bin/fieldwork-pr-prepare-runner"
 link_one "$HOME/.fieldwork/scripts/fieldwork-setup-probe" "$HOME/.local/bin/fieldwork-setup-probe"
 link_one "$HOME/.fieldwork/scripts/fieldwork-codex-sandbox" "$HOME/.local/bin/fieldwork-codex-sandbox"
+# fieldwork-task-enqueue is invoked by `fieldwork task add` over SSH and by the
+# Telegram /task handler; both reach it via the stable ~/.local/bin path.
+link_one "$HOME/.fieldwork/scripts/fieldwork-task-enqueue" "$HOME/.local/bin/fieldwork-task-enqueue"
+# The dispatcher (one_shot_job scheduler) spawns the runner via ~/.local/bin.
+link_one "$HOME/.fieldwork/scripts/fieldwork-task-run" "$HOME/.local/bin/fieldwork-task-run"
+link_one "$HOME/.fieldwork/scripts/fieldwork-task-dispatcher" "$HOME/.local/bin/fieldwork-task-dispatcher"
 record_group_state command
 
 start_group "Claude helpers"
-for script in fieldwork-status fieldwork-status-snapshot fieldwork-dashboard-server fieldwork-clone fieldwork-init fieldwork-launch fieldwork-pr-submit fieldwork-agent-session fieldwork-event-poll fieldwork-setup-probe fieldwork-session-probe fieldwork-codex-sandbox fieldwork-verify fieldwork-verify-runner fieldwork-verify-pipeline fieldwork-pr-prepare fieldwork-pr-prepare-runner fieldwork-pr-prepare-impl notify.sh; do
+for script in fieldwork-status fieldwork-status-snapshot fieldwork-dashboard-server fieldwork-clone fieldwork-init fieldwork-launch fieldwork-pr-submit fieldwork-agent-session fieldwork-task-enqueue fieldwork-task-run fieldwork-task-dispatcher fieldwork-event-poll fieldwork-setup-probe fieldwork-session-probe fieldwork-codex-sandbox fieldwork-verify fieldwork-verify-runner fieldwork-verify-pipeline fieldwork-pr-prepare fieldwork-pr-prepare-runner fieldwork-pr-prepare-impl notify.sh; do
   link_one "$ROOT/lib/scripts/$script" "$HOME/.fieldwork/scripts/$script"
 done
 link_one "$ROOT/lib/claude/CLAUDE.md" "$HOME/.claude/CLAUDE.md"
@@ -303,6 +309,7 @@ link_one "$ROOT/lib/systemd/fieldwork-verify-runner.socket" "$HOME/.fieldwork/in
 link_one "$ROOT/lib/systemd/fieldwork-verify-runner@.service" "$HOME/.fieldwork/infra/fieldwork-verify-runner@.service"
 link_one "$ROOT/lib/systemd/fieldwork-event-poll.service" "$HOME/.fieldwork/infra/fieldwork-event-poll.service"
 link_one "$ROOT/lib/systemd/fieldwork-event-poll.timer" "$HOME/.fieldwork/infra/fieldwork-event-poll.timer"
+link_one "$ROOT/lib/systemd/fieldwork-task-dispatcher.service" "$HOME/.fieldwork/infra/fieldwork-task-dispatcher.service"
 link_one "$ROOT/lib/systemd/fieldwork-pr-prepare-runner.socket" "$HOME/.fieldwork/infra/fieldwork-pr-prepare-runner.socket"
 link_one "$ROOT/lib/systemd/fieldwork-pr-prepare-runner@.service" "$HOME/.fieldwork/infra/fieldwork-pr-prepare-runner@.service"
 link_one "$ROOT/lib/agents" "$HOME/.fieldwork/infra/agents"
