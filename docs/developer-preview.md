@@ -6,10 +6,10 @@ coding-agent infrastructure with broker-owned repository writes.
 Supported now:
 
 - Ubuntu 24.04 VPS
-- GitHub repositories
+- GitHub repositories and core GitLab projects
 - Claude Code remote-control adapter
 - Codex Desktop + SSH preview path
-- broker-owned GitHub PR creation
+- broker-owned GitHub PR creation and GitLab MR creation
 - optional Telegram approval transport
 - optional ntfy notifications
 
@@ -20,7 +20,7 @@ Evaluation only:
 Planned:
 
 - local shell evaluation mode
-- other forge brokers
+- Gitea broker support and deeper GitLab parity
 - additional approval transports
 - Codex in-session lifecycle notifications and stronger
   Fieldwork-managed sandbox parity
@@ -31,11 +31,11 @@ Costs and accounts:
 
 - a small Ubuntu VPS
 - Claude or OpenAI/Codex account usage, depending on agent choice
-- a GitHub fine-grained PAT for the broker
+- a GitHub fine-grained PAT or GitLab Project Access Token for the broker
 - optional notification or approval transport accounts
 
 Fieldwork has no Fieldwork-operated telemetry. Outbound calls are limited to
-GitHub, configured agent services, configured notification/approval transports,
+GitHub, GitLab, configured agent services, configured notification/approval transports,
 OS/package registries during install, and user-configured network endpoints.
 
 Developer-preview releases use signed Git tags and published SHA256 checksums.

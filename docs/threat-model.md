@@ -1,15 +1,16 @@
 # Threat Model
 
-Fieldwork is designed around one rule: the coding agent should not hold the GitHub write token.
+Fieldwork is designed around one rule: the coding agent should not hold the forge write token.
 
 Fieldwork treats the coding agent as adversarial. The agent is allowed to do
-useful work in the checkout, but every path that can write to GitHub goes
+useful work in the checkout, but every path that can write to GitHub or GitLab goes
 through broker validation and optional human approval.
 
 ## Assets
 
-- GitHub write credential used to push branches and open PRs: either a
-  fine-grained PAT or a GitHub App private key that mints installation tokens.
+- Forge write credential used to push branches and open PRs/MRs: a GitHub
+  fine-grained PAT, a GitHub App private key that mints installation tokens, or
+  a GitLab token held by the broker.
 - SSH deploy keys used for read-only clones.
 - Telegram bot token and approval HMAC secret.
 - ntfy topic.
@@ -22,10 +23,10 @@ through broker validation and optional human approval.
 fieldwork user
   owns repo checkout
   runs Claude/Codex and tokenless clients
-  cannot read broker GitHub credential
+  cannot read broker forge credential
 
 fieldwork-pr-broker user
-  owns GitHub write credential
+  owns forge write credential
   validates PR requests
   pushes and opens PRs
   does not run the coding agent
@@ -35,7 +36,7 @@ fieldwork-bot user
   watches pending approvals
   can call approve socket
   cannot submit PR requests
-  cannot read broker GitHub credential
+  cannot read broker forge credential
 ```
 
 Root on the VPS can read everything. Fieldwork does not defend against compromised root.
@@ -56,11 +57,26 @@ The agent cannot, by Fieldwork design:
 - read `/etc/fieldwork-pr-broker/gh-token`
 - read `/etc/fieldwork-pr-broker/github-app-private-key.pem`
 - read the Telegram bot token or HMAC secret
-- push with the broker GitHub credential
+- push with the broker forge credential
 - call the approve socket
 - merge PRs
 - push directly to `main` through the broker
-- write to GitHub repos outside the PAT scope or GitHub App installation
+- write to repos outside the validated project and credential scope
+
+## GitLab Host Pin
+
+For GitLab, `.fieldwork/expected-origin` and `remote.origin.url` are treated as
+agent-writable hints, not authority for API host selection. The broker derives
+the GitLab API and HTTPS push host only from `FIELDWORK_GITLAB_API` (default
+`https://gitlab.com/api/v4`) and then requires the expected-origin host to
+match that pin exactly. Token-bearing GitLab API calls use stdlib `urllib` with
+TLS verification on, optional `FIELDWORK_GITLAB_CA_BUNDLE`, no ambient proxy,
+explicit timeouts, and redirects refused so a token is not replayed to another
+host. The deploy-key SSH remote is parsed only for the opaque project path.
+
+The GitLab token is broker/root-only. Agent-side onboarding does not call the
+GitLab API; token-requiring metadata routes through broker `/preflight`, while
+clone/default-branch checks use tokenless git over the read-only deploy key.
 
 ## Agent Runtime Boundaries
 
@@ -84,9 +100,9 @@ Codex sandbox allowlist for the Unix sockets required by delivery:
 ```
 
 This is a real security delta from the Claude path: Codex is not inside
-Fieldwork's `claude --sandbox` confinement. The GitHub write boundary does not
-move, because the broker GitHub credential remains readable only by
-`fieldwork-pr-broker`, PR requests still go through broker validation, and
+Fieldwork's `claude --sandbox` confinement. The forge write boundary does not
+move, because the broker forge credential remains readable only by
+`fieldwork-pr-broker`, PR/MR requests still go through broker validation, and
 approval-gated repos still require the Telegram approval path before push.
 
 Codex preview gaps:
@@ -106,7 +122,7 @@ The server accepts GET requests only and shells only to `fieldwork-status-snapsh
 
 ## Broker Defenses
 
-The broker is the GitHub write boundary. It rejects requests unless they pass runtime validation.
+The broker is the forge write boundary. It rejects requests unless they pass runtime validation.
 
 Defenses:
 
@@ -151,7 +167,7 @@ The approve socket is group-writable to `fieldwork-bot`, not to the agent. The b
 
 ## Runner Boundary
 
-The verify and pr-prepare runners exist to bridge from the agent's NNP/userns cage to normal user-manager execution. They are not a GitHub credential boundary.
+The verify and pr-prepare runners exist to bridge from the agent's NNP/userns cage to normal user-manager execution. They are not a forge credential boundary.
 
 Runner access checks:
 
@@ -179,7 +195,7 @@ PR-prepare runner:
 - commits with `git -c core.hooksPath=/dev/null`
 - rolls back failed branch/add/commit attempts where possible
 
-Neither runner reads the GitHub write credential, Telegram token, HMAC secret, deploy key, or ntfy topic.
+Neither runner reads the forge write credential, Telegram token, HMAC secret, deploy key, or ntfy topic.
 
 ## Approval Gate Role
 
@@ -200,7 +216,7 @@ See [approval-gate.md](approval-gate.md).
 
 ## Notification Secrets
 
-The agent service does not load notification secrets into its environment. Hooks call wrapper scripts that load notification config at execution time. The Telegram bot token is owned by `fieldwork-bot`; the broker GitHub credential is owned by `fieldwork-pr-broker`.
+The agent service does not load notification secrets into its environment. Hooks call wrapper scripts that load notification config at execution time. The Telegram bot token is owned by `fieldwork-bot`; the broker forge credential is owned by `fieldwork-pr-broker`.
 
 The agent/dashboard user gets direct read ACL access to the broker audit log only. It does not join `fieldwork-bot`, cannot enter `pending/` or `requests/`, and cannot call the approve socket. The notifications directory is a deliberate drop path: the agent may write outbound notification files, the bot may read/delete them, and the broker may write lifecycle drops via a direct ACL.
 
@@ -221,16 +237,16 @@ fieldwork verify-security [repo-slug]
 It checks:
 
 - temporary passwordless sudo cleanup
-- broker PAT or GitHub App private key owner and mode
-- agent user cannot read broker GitHub credentials
+- broker token or GitHub App private key owner and mode
+- agent user cannot read broker forge credentials
 - Codex SSH identity is `fieldwork` when Codex is configured
-- Codex SSH identity can reach the submit socket but cannot read the broker GitHub credential
+- Codex SSH identity can reach the submit socket but cannot read the broker forge credential
 - broker socket owner and mode
 - broker ledger owner and mode
 - broker systemd hardening directives
 - bot user is not in the submit socket group
 - approve socket owner, group, mode, and live connectivity
-- bot cannot read broker GitHub credentials
+- bot cannot read broker forge credentials
 - bot HMAC secret owner and mode
 - notification secrets are not injected into the agent service
 - optional repo origin checks
@@ -241,22 +257,22 @@ Fieldwork does not defend against:
 
 - compromised root on the VPS
 - malicious kernel, systemd, git, GitHub CLI, Claude Code binary, or Codex binary
-- malicious GitHub account or organization administrator
+- malicious GitHub or GitLab account, project, or organization administrator
 - a user pasting secrets into chat, code, or PR text
 - all same-host side channels
 - production deployment triggered after a human merges a PR
-- GitHub branch protection being disabled outside Fieldwork
+- GitHub/GitLab branch protection being disabled outside Fieldwork
 
-Remote coding work is the point. The defense is credential separation, scoped request validation, brokered GitHub writes, approval gating where enabled, and human PR review.
+Remote coding work is the point. The defense is credential separation, scoped request validation, brokered forge writes, approval gating where enabled, and human review.
 
 ## High-Risk Changes
 
 Review these carefully in forks:
 
 - giving deploy keys write access
-- putting a GitHub token in the agent environment
+- putting a forge token in the agent environment
 - widening broker repo path validation
 - letting the broker push directly to `main`
 - letting the agent call the approve socket
 - removing `core.hooksPath=/dev/null` from pr-prepare
-- disabling PR review on repos that auto-deploy from `main`
+- disabling review on repos that auto-deploy from `main`

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-FIELDWORK_TEST_FINGERPRINT_FILES="bin/fieldwork install.sh AGENTS.md lib/cli/config.sh lib/cli/messaging.sh lib/cli/health.sh lib/cli/ssh-config.sh lib/cli/setup.sh lib/cli/onboard.sh lib/cli/quickstart.sh lib/cli/provision.sh lib/cli/verify-security.sh lib/cli/uninstall.sh lib/cli/developer-preview.sh lib/cli/task.sh lib/systemd/bootstrap-vps.sh lib/apparmor/fieldwork-bwrap lib/broker/install.sh lib/broker/standalone-install.sh lib/broker/fieldwork-pr-broker.service lib/broker/fieldwork-pr-broker.socket lib/broker/fieldwork-pr-approve.socket lib/broker/server.py schema/pr-request.schema.json schema/pr-prepare-request.schema.json lib/scripts/fieldwork-status lib/scripts/fieldwork-status-snapshot lib/scripts/fieldwork-dashboard-server lib/scripts/fieldwork-pr-submit lib/scripts/fieldwork-clone lib/scripts/fieldwork-init lib/scripts/fieldwork-launch lib/scripts/fieldwork-agent-session lib/scripts/fieldwork-task-enqueue lib/scripts/fieldwork-task-run lib/scripts/fieldwork-task-dispatcher lib/scripts/fieldwork-event-poll lib/scripts/fieldwork-setup-probe lib/scripts/fieldwork-session-probe lib/scripts/fieldwork-codex-sandbox lib/scripts/fieldwork-bot lib/scripts/fieldwork-pr-prepare lib/scripts/fieldwork-pr-prepare-runner lib/scripts/fieldwork-pr-prepare-impl lib/agents/claude-remote-control lib/agents/aider lib/templates/repo/AGENTS.md lib/templates/repo/CLAUDE.md lib/templates/repo/.gitignore lib/templates/repo/.fieldwork/expected-origin lib/systemd/fieldwork-agent@.service lib/systemd/fieldwork-dashboard.service lib/systemd/fieldwork-event-poll.service lib/systemd/fieldwork-event-poll.timer lib/systemd/fieldwork-task-dispatcher.service lib/systemd/fieldwork-bot.service lib/systemd/fieldwork-pr-prepare-runner.socket lib/systemd/fieldwork-pr-prepare-runner@.service lib/systemd/fieldwork-verify-runner.socket lib/systemd/fieldwork-verify-runner@.service examples/eval/docker-compose.yml examples/eval/Dockerfile examples/eval/eval-smoke.sh examples/eval/fake-gh examples/eval/fake-gitleaks examples/eval/gh examples/eval/gitleaks examples/eval/README.md"
+FIELDWORK_TEST_FINGERPRINT_FILES="bin/fieldwork install.sh AGENTS.md lib/cli/config.sh lib/cli/messaging.sh lib/cli/health.sh lib/cli/ssh-config.sh lib/cli/setup.sh lib/cli/onboard.sh lib/cli/quickstart.sh lib/cli/provision.sh lib/cli/verify-security.sh lib/cli/uninstall.sh lib/cli/developer-preview.sh lib/cli/task.sh lib/systemd/bootstrap-vps.sh lib/apparmor/fieldwork-bwrap lib/broker/install.sh lib/broker/standalone-install.sh lib/broker/fieldwork-pr-broker.service lib/broker/fieldwork-pr-broker.socket lib/broker/fieldwork-pr-approve.socket lib/broker/server.py schema/pr-request.schema.json schema/pr-prepare-request.schema.json lib/scripts/fieldwork-project.sh lib/scripts/fieldwork-status lib/scripts/fieldwork-status-snapshot lib/scripts/fieldwork-dashboard-server lib/scripts/fieldwork-pr-submit lib/scripts/fieldwork-clone lib/scripts/fieldwork-init lib/scripts/fieldwork-launch lib/scripts/fieldwork-agent-session lib/scripts/fieldwork-task-enqueue lib/scripts/fieldwork-task-run lib/scripts/fieldwork-task-dispatcher lib/scripts/fieldwork-event-poll lib/scripts/fieldwork-setup-probe lib/scripts/fieldwork-session-probe lib/scripts/fieldwork-codex-sandbox lib/scripts/fieldwork-bot lib/scripts/fieldwork-pr-prepare lib/scripts/fieldwork-pr-prepare-runner lib/scripts/fieldwork-pr-prepare-impl lib/agents/claude-remote-control lib/agents/aider lib/templates/repo/AGENTS.md lib/templates/repo/CLAUDE.md lib/templates/repo/.gitignore lib/templates/repo/.fieldwork/expected-origin lib/systemd/fieldwork-agent@.service lib/systemd/fieldwork-dashboard.service lib/systemd/fieldwork-event-poll.service lib/systemd/fieldwork-event-poll.timer lib/systemd/fieldwork-task-dispatcher.service lib/systemd/fieldwork-bot.service lib/systemd/fieldwork-pr-prepare-runner.socket lib/systemd/fieldwork-pr-prepare-runner@.service lib/systemd/fieldwork-verify-runner.socket lib/systemd/fieldwork-verify-runner@.service examples/eval/docker-compose.yml examples/eval/Dockerfile examples/eval/eval-smoke.sh examples/eval/fake-gh examples/eval/fake-gitleaks examples/eval/gh examples/eval/gitleaks examples/eval/README.md"
 TMP_DIRS=""
 cleanup() {
   local dir
@@ -229,6 +229,21 @@ done
 
 echo "[checks] pr-prepare impl uses core.hooksPath=/dev/null"
 grep -q "core.hooksPath=/dev/null" "$ROOT/lib/scripts/fieldwork-pr-prepare-impl"
+
+echo "[checks] install links every helper a VPS-side script sources from its dir"
+# VPS-side scripts (clone/init/...) source shared libs from ~/.fieldwork/scripts via
+# $SCRIPT_DIR. Any such lib MUST be in install.sh's link loop or it is missing on the
+# VPS (regression: fieldwork-project.sh was sourced but never linked).
+install_link_block="$(sed -n '/for script in/,/done/p' "$ROOT/install.sh")"
+for vps_script in fieldwork-clone fieldwork-init fieldwork-agent-session; do
+  for dep in $(grep -oE 'source "\$SCRIPT_DIR/[^"]+"' "$ROOT/lib/scripts/$vps_script" 2>/dev/null \
+                 | sed -E 's#.*/([^"]+)".*#\1#'); do
+    case "$install_link_block" in
+      *"$dep"*) : ;;
+      *) echo "install.sh does not link '$dep' sourced by $vps_script (would be missing on the VPS)" >&2; exit 1 ;;
+    esac
+  done
+done
 
 echo "[checks] event poller tests"
 python3 "$ROOT/tests/event-poll-tests.py"
@@ -3695,7 +3710,7 @@ echo "[checks] bootstrap output uses checklist rows"
 grep -q -- "--verbose" ${TMPDIR:-/tmp}/fieldwork-bootstrap-help.out
 grep -q -- "--log-file" ${TMPDIR:-/tmp}/fieldwork-bootstrap-help.out
 grep -q "sudo may prompt for the Linux password" "$ROOT/lib/systemd/bootstrap-vps.sh"
-grep -q "not your Claude/Codex account password or GitHub token" "$ROOT/lib/systemd/bootstrap-vps.sh"
+grep -q "not your Claude/Codex account password or broker token" "$ROOT/lib/systemd/bootstrap-vps.sh"
 grep -q "bootstrap disables root SSH and password SSH login" "$ROOT/lib/systemd/bootstrap-vps.sh"
 grep -q "keep a non-Fieldwork sudo account for recovery" "$ROOT/lib/systemd/bootstrap-vps.sh"
 grep -q "normalize_bootstrap_agents()" "$ROOT/lib/systemd/bootstrap-vps.sh"
@@ -4484,6 +4499,7 @@ case "$last" in
   *"test -f "*"fieldwork-workspace_trust_confirmed"*) exit 0 ;;
   *"test -f "*"fieldwork-remote_control_consent_confirmed"*) exit 0 ;;
   *"mkdir -p "*"touch "*"fieldwork-"*) exit 0 ;;
+  *"mkdir -p .fieldwork && printf "*".fieldwork/forge"*) exit 0 ;;
   *"mkdir -p "*"fieldwork-onboard-state.json"*) exit 0 ;;
   *"systemctl --user is-active --quiet 'fieldwork-agent@fieldwork-smoke'"*) exit 1 ;;
   *"gh repo view "*"--json defaultBranchRef,nameWithOwner,visibility"*)
@@ -4539,7 +4555,7 @@ chmod +x "$tmp_bin/sudo" "$tmp_bin/gh"
 git init -q "$tmp_repo"
 mkdir -p "$tmp_repo/.github/workflows"
 printf 'name: existing\n' > "$tmp_repo/.github/workflows/existing.yml"
-FIELDWORK_TEMPLATE_DIR="$ROOT/lib/templates/repo" PATH="$tmp_bin:$PATH" "$ROOT/lib/scripts/fieldwork-init" --no-workflows "$tmp_repo" >${TMPDIR:-/tmp}/fieldwork-no-workflows.out
+FIELDWORK_TEMPLATE_DIR="$ROOT/lib/templates/repo" PATH="$tmp_bin:$PATH" "$ROOT/lib/scripts/fieldwork-init" --branch fieldwork/init --no-workflows "$tmp_repo" >${TMPDIR:-/tmp}/fieldwork-no-workflows.out
 test -f "$tmp_repo/.fieldwork/expected-origin"
 test -f "$tmp_repo/CLAUDE.md"
 test -f "$tmp_repo/REVIEW.md"
@@ -4552,7 +4568,7 @@ test ! -f "$tmp_repo/.github/workflows/audit.yml"
 echo "[checks] fieldwork-init prunes workflow templates without prerequisites"
 tmp_unknown_repo="$(mktemp_dir)"
 git init -q "$tmp_unknown_repo"
-FIELDWORK_TEMPLATE_DIR="$ROOT/lib/templates/repo" PATH="$tmp_bin:$PATH" "$ROOT/lib/scripts/fieldwork-init" "$tmp_unknown_repo" >${TMPDIR:-/tmp}/fieldwork-unknown-workflows.out
+FIELDWORK_TEMPLATE_DIR="$ROOT/lib/templates/repo" PATH="$tmp_bin:$PATH" "$ROOT/lib/scripts/fieldwork-init" --branch fieldwork/init "$tmp_unknown_repo" >${TMPDIR:-/tmp}/fieldwork-unknown-workflows.out
 test ! -f "$tmp_unknown_repo/.github/workflows/ci.yml"
 test ! -f "$tmp_unknown_repo/.github/workflows/codeql.yml"
 test -f "$tmp_unknown_repo/.github/workflows/semgrep.yml"
@@ -4720,8 +4736,8 @@ grep -q "restore root SSH or root authorized keys" "$ROOT/docs/uninstall.md"
 grep -q "credentials were saved in plain text" "$ROOT/docs/setup.md"
 grep -q "credentials were saved in plain text" "$ROOT/docs/quickstart.md"
 grep -q "credentials were saved in plain text" "$ROOT/docs/first-time-infrastructure.md"
-grep -q "separate from the broker PAT" "$ROOT/docs/setup.md"
-grep -q "not the broker PAT" "$ROOT/docs/first-time-infrastructure.md"
+grep -q "separate from the broker token" "$ROOT/docs/setup.md"
+grep -q "not the broker token" "$ROOT/docs/first-time-infrastructure.md"
 if grep -q "Use \\[docs/first-time-infrastructure.md\\].* first" "$ROOT/README.md"; then
   echo "README sends new users to the manual before setup" >&2
   exit 1
@@ -5024,7 +5040,7 @@ grep -q 'FIELDWORK_BROKER_RATE_LIMIT_PER_HOUR' "$ROOT/lib/broker/server.py"
 grep -q 'bounded_env_int("FIELDWORK_BROKER_RATE_LIMIT_PER_HOUR", 12, minimum=1, maximum=120)' "$ROOT/lib/broker/server.py"
 grep -q '`~/.fieldwork/agent.conf`' "$ROOT/docs/agent-adapters.md"
 grep -q 'clamped to `1..4`' "$ROOT/docs/agent-adapters.md"
-grep -q '12 PRs per hour' "$ROOT/docs/broker-standalone.md"
+grep -q '12 PRs/MRs per hour' "$ROOT/docs/broker-standalone.md"
 grep -q 'MaxConnections=4' "$ROOT/docs/runner-architecture.md"
 
 echo "[checks] cage flow string pins"

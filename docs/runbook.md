@@ -4,24 +4,27 @@ This doc is task-oriented (flows you'll do). For a per-command index, see [cli-r
 
 ## Flow A: Onboard an Existing Repo
 
-1. Widen the existing broker PAT on GitHub to include `<owner>/<repo>`.
+1. Widen the existing broker credential to include the target project. For
+   GitHub, that means adding `<owner>/<repo>` to the fine-grained PAT or GitHub
+   App installation. For GitLab, use a Project Access Token on the target
+   project with Developer role and `api` plus `write_repository` scopes.
 2. Run:
 
    ```sh
-   fieldwork onboard <owner>/<repo> --with-approval-gate
+   fieldwork onboard <project> --with-approval-gate
    ```
 
    If the broker PAT does not have Workflows read/write, use:
 
    ```sh
-   fieldwork onboard <owner>/<repo> --no-workflows
+   fieldwork onboard <project> --no-workflows
    ```
 
 3. Paste the read-only deploy key when prompted.
 4. In Claude mode, run the printed `ssh -t fieldwork-vps ...` commands to
    prime workspace trust and remote-control consent. In Codex mode, Codex
    Desktop owns the live SSH session and remote-project folder state.
-5. Review the init PR in GitHub mobile.
+5. Review the init PR/MR in GitHub or GitLab mobile.
 6. Merge only after reading the diff and CI results; failed workflow checks
    need review even when the broker successfully opened the PR.
 7. Prove the broker path without Claude or Codex:
@@ -29,6 +32,10 @@ This doc is task-oriented (flows you'll do). For a per-command index, see [cli-r
    ```sh
    fieldwork smoke <owner>/<repo>
    ```
+
+   `fieldwork smoke` is GitHub-only. For GitLab, use a throwaway project and
+   prove onboarding, broker preflight, push/MR creation, approval-gated push,
+   no-diff, and verify-fail paths.
 
 8. Refresh the VPS checkout:
 
@@ -43,19 +50,19 @@ This doc is task-oriented (flows you'll do). For a per-command index, see [cli-r
 If you stop during deploy-key setup, workspace trust, remote-control consent, init PR creation, or systemd startup, rerun:
 
 ```sh
-fieldwork onboard <owner>/<repo>
+fieldwork onboard <project>
 ```
 
 To inspect progress without changing anything:
 
 ```sh
-fieldwork onboard <owner>/<repo> --status
+fieldwork onboard <project> --status
 ```
 
 If the checkpoint is stale or corrupt:
 
 ```sh
-fieldwork onboard <owner>/<repo> --reset-state
+fieldwork onboard <project> --reset-state
 ```
 
 ## Flow B: Bootstrap a New Project
@@ -95,8 +102,8 @@ fieldwork onboard <owner>/my-app
 3. Respond when the agent needs input or permission. Claude can send ntfy
    lifecycle notifications; Codex lifecycle notifications are not wired in this
    milestone.
-4. If the repo is approval-gated, approve or deny the PR request in Telegram.
-5. Review the PR in GitHub mobile.
+4. If the repo is approval-gated, approve or deny the PR/MR request in Telegram.
+5. Review the PR/MR in GitHub or GitLab mobile.
 6. Merge only when the diff and checks are acceptable.
 7. Refresh the VPS checkout after merge.
 
@@ -113,9 +120,9 @@ fieldwork onboard <owner>/my-app
 - Workspace trust is one-time per repo, but must be repeated if the clone is deleted.
 - Default onboarding adds workflow templates; `--no-workflows` skips them and leaves existing workflow files untouched. Do not merge an init PR with failed workflow checks until you understand whether the failure is template tuning, GitHub billing/permissions, or an intentional no-workflows choice.
 - Approval gating requires `fieldwork setup-notify --telegram-bot` and `.fieldwork/approval-gate`.
-- Private repos without paid GitHub features may not enforce branch protection or secret scanning.
+- Private repos without paid GitHub features may not enforce branch protection or secret scanning. GitLab onboarding currently skips branch protection, secret scanning, CodeQL, and `.github/` templates.
 - If GitHub Actions says billing is locked, Fieldwork opened the PR successfully but GitHub refused to start CI. Fix billing or rerun checks before treating the PR as green.
-- Fieldwork records the GitHub default branch during onboarding. Rename unusual
+- Fieldwork records the forge default branch during onboarding. Rename unusual
   default branches before onboarding if `fieldwork onboard` rejects the branch
   shape.
 - Anything merged to the default branch may deploy if the repo has Vercel,

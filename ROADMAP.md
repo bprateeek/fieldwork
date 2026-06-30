@@ -9,11 +9,14 @@
 - Backup, restore, and upgrade guidance.
 - Adapter diagnostics for the Claude reference adapter.
 - Codex App + SSH developer-preview support.
+- Core GitLab forge support: broker preflight, host-pinned push/MR creation,
+  nested project paths, onboarding, token rotation, and setup wiring.
 
 ## Next
 
 - Local shell evaluation mode.
-- GitLab and Gitea broker implementations.
+- Gitea broker implementation and deeper GitLab parity (branch protection,
+  secret scanning, CodeQL/status surfaces, and event-poller MR merge detection).
 - Additional approval transports such as Slack or a small web UI.
 - Codex journaling, resume-context, lifecycle notifications, and stronger Fieldwork-managed sandbox parity.
 - Additional Fieldwork-launched agent adapters.

@@ -2,6 +2,13 @@
 # Sourced by bin/fieldwork. Do not execute directly.
 # Public resumable quickstart command handler.
 
+if ! declare -F fieldwork_slug_from_project >/dev/null 2>&1; then
+  _fieldwork_quickstart_root="${FIELDWORK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
+  # shellcheck source=lib/scripts/fieldwork-project.sh
+  source "$_fieldwork_quickstart_root/lib/scripts/fieldwork-project.sh"
+  unset _fieldwork_quickstart_root
+fi
+
 quickstart_usage() {
   cat <<'EOF'
 usage: fieldwork quickstart [owner/repo] [options]
@@ -18,6 +25,7 @@ Options:
   --skip-sync                 pass through to setup
   --force-install             pass through to setup
   --branch fieldwork/init     pass through to onboard
+  --slug slug                 pass through to onboard
   --no-workflows              pass through to onboard
   --with-approval-gate        pass through to onboard
   --reseed-templates          pass through to onboard
@@ -83,12 +91,13 @@ quickstart_phase_label() {
 }
 
 quickstart_print_status() {
-  local owner_repo="$1" setup_ledger="$2" onboard_ledger="${3:-}"
+  local owner_repo="$1" setup_ledger="$2" onboard_ledger="${3:-}" slug_override="${4:-}"
   phase_section "Quickstart status"
   info_row "setup ledger" "$setup_ledger"
   info_row "setup" "$(quickstart_phase_label "$setup_ledger" setup)"
   if [ -n "$owner_repo" ]; then
     info_row "repo" "$owner_repo"
+    [ -z "$slug_override" ] || info_row "repo slug" "$slug_override"
     info_row "onboard ledger" "$onboard_ledger"
     info_row "onboard" "$(quickstart_phase_label "$onboard_ledger" onboard)"
   else
@@ -97,11 +106,15 @@ quickstart_print_status() {
 }
 
 quickstart_preflight() {
-  local owner_repo="$1" setup_ledger="$2" onboard_ledger="${3:-}"
+  local owner_repo="$1" setup_ledger="$2" onboard_ledger="${3:-}" slug_override="${4:-}"
   local repo_slug="" doctor_status=0
 
   if [ -n "$owner_repo" ]; then
-    repo_slug="${owner_repo#*/}"
+    if [ -n "$slug_override" ]; then
+      repo_slug="$slug_override"
+    else
+      repo_slug="$(fieldwork_slug_from_project "$owner_repo")" || { echo "invalid repo path: $owner_repo" >&2; return 2; }
+    fi
     valid_slug "$repo_slug" || { echo "invalid Fieldwork repo slug for doctor preflight: $repo_slug" >&2; return 2; }
   fi
 
@@ -147,6 +160,9 @@ quickstart_run_onboard() {
   fi
   FIELDWORK_PROFILE="$FIELDWORK_PROFILE" \
   FIELDWORK_FORGE="$FIELDWORK_FORGE" \
+  FIELDWORK_GITLAB_API="$FIELDWORK_GITLAB_API" \
+  FIELDWORK_COMMIT_NAME="$FIELDWORK_COMMIT_NAME" \
+  FIELDWORK_COMMIT_EMAIL="$FIELDWORK_COMMIT_EMAIL" \
   FIELDWORK_SSH_HOST="$FIELDWORK_SSH_HOST" \
   FIELDWORK_REMOTE_USER="$FIELDWORK_REMOTE_USER" \
   FIELDWORK_PROJECTS_DIR="$FIELDWORK_PROJECTS_DIR" \
@@ -161,6 +177,7 @@ quickstart_fieldwork() {
   local dry_run=0
   local show_status=0
   local reset_state=0
+  local slug_override=""
   local setup_ledger onboard_ledger
   local -a setup_args=()
   local -a onboard_args=()
@@ -205,6 +222,19 @@ quickstart_fieldwork() {
         onboard_args+=("$1")
         shift
         ;;
+      --slug)
+        [ -n "${2:-}" ] || { echo "--slug requires a repo slug" >&2; return 2; }
+        valid_slug "$2" || { echo "invalid repo slug: $2" >&2; return 2; }
+        slug_override="$2"
+        onboard_args+=("$1" "$2")
+        shift 2
+        ;;
+      --slug=*)
+        slug_override="${1#--slug=}"
+        valid_slug "$slug_override" || { echo "invalid repo slug: $slug_override" >&2; return 2; }
+        onboard_args+=("$1")
+        shift
+        ;;
       --no-workflows|--with-approval-gate|--reseed-templates)
         onboard_args+=("$1")
         shift
@@ -222,8 +252,8 @@ quickstart_fieldwork() {
   done
 
   if [ -n "$owner_repo" ]; then
-    valid_owner_repo "$owner_repo" || { echo "invalid GitHub owner/repo: $owner_repo" >&2; return 2; }
-    onboard_ledger="$(quickstart_ledger_path "$owner_repo")"
+    valid_owner_repo "$owner_repo" || { echo "invalid repo path for $FIELDWORK_FORGE: $owner_repo" >&2; return 2; }
+    onboard_ledger="$(quickstart_ledger_path "$owner_repo${slug_override:+#$slug_override}")"
   elif [ "${#onboard_args[@]}" -gt 0 ]; then
     echo "quickstart onboarding flags require <owner/repo>" >&2
     return 2
@@ -247,12 +277,12 @@ quickstart_fieldwork() {
   fi
 
   if [ "$show_status" = "1" ]; then
-    quickstart_print_status "$owner_repo" "$setup_ledger" "$onboard_ledger"
+    quickstart_print_status "$owner_repo" "$setup_ledger" "$onboard_ledger" "$slug_override"
     return 0
   fi
 
   if [ "$dry_run" = "1" ]; then
-    quickstart_preflight "$owner_repo" "$setup_ledger" "$onboard_ledger"
+    quickstart_preflight "$owner_repo" "$setup_ledger" "$onboard_ledger" "$slug_override"
     return $?
   fi
 

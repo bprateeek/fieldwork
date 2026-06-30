@@ -20,6 +20,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/scripts/fieldwork-status
 source "$SCRIPT_DIR/fieldwork-status"
+# shellcheck source=lib/scripts/fieldwork-project.sh
+source "$SCRIPT_DIR/fieldwork-project.sh"
 trap 'fieldwork_status_cleanup' EXIT
 
 # Ensure ~/.local/bin is on PATH — non-interactive ssh shells don't source claude.bashrc,
@@ -28,19 +30,23 @@ export PATH="$HOME/.local/bin:$PATH"
 
 TEMPLATE_DIR="${FIELDWORK_TEMPLATE_DIR:-$HOME/.fieldwork/templates/repo}"
 
-usage() { echo "usage: $0 [--verify] [--branch <name>] [--repo <owner/repo>] [--no-workflows] [--with-approval-gate] <repo-path>" >&2; exit 2; }
+usage() { echo "usage: $0 [--verify] [--branch <name>] [--repo <project>] [--slug <slug>] [--no-workflows] [--with-approval-gate] <repo-path>" >&2; exit 2; }
 
 MODE="init"
 BRANCH=""
 REPO_OVERRIDE=""
+SLUG_OVERRIDE=""
 NO_WORKFLOWS=0
 WITH_APPROVAL_GATE=0
+FORGE="${FIELDWORK_FORGE:-github}"
+case "$FORGE" in github|"") FORGE="github" ;; gitlab) ;; *) echo "unsupported FIELDWORK_FORGE: $FORGE" >&2; exit 2 ;; esac
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --verify) MODE="verify"; shift;;
     --branch) BRANCH="${2:?--branch requires a name}"; shift 2;;
     --repo)   REPO_OVERRIDE="${2:?--repo requires <owner>/<repo>}"; shift 2;;
+    --slug)   SLUG_OVERRIDE="${2:?--slug requires a repo slug}"; shift 2;;
     --no-workflows) NO_WORKFLOWS=1; shift;;
     --with-approval-gate) WITH_APPROVAL_GATE=1; shift;;
     --) shift; break;;
@@ -219,6 +225,7 @@ copy_templates_without_rsync() {
     while IFS= read -r tpl_dir; do
       local rel="${tpl_dir#./}"
       case "$rel" in
+        .github|.github/*) [ "$FORGE" = "gitlab" ] && continue ;;
         .) mkdir -p "$REPO" ;;
         .github/workflows|.github/workflows/*) [ "$NO_WORKFLOWS" = "1" ] && continue ;;
       esac
@@ -228,11 +235,27 @@ copy_templates_without_rsync() {
     while IFS= read -r tpl_file; do
       local rel="${tpl_file#./}"
       case "$rel" in
+        .github|.github/*) [ "$FORGE" = "gitlab" ] && continue ;;
         .github/workflows/*) [ "$NO_WORKFLOWS" = "1" ] && continue ;;
       esac
       [ -e "$REPO/$rel" ] || cp -p "$TEMPLATE_DIR/$rel" "$REPO/$rel"
     done < <(find . -type f | sort)
   )
+}
+
+detect_origin_default_branch() {
+  git ls-remote --symref origin HEAD 2>/dev/null | awk '/^ref:/ { sub("refs/heads/", "", $2); print $2; exit }'
+}
+
+expected_origin_for_repo() {
+  local project="$1"
+  if [ "$FORGE" = "gitlab" ]; then
+    local host
+    host="$(fieldwork_gitlab_api_host)" || return 1
+    printf 'https://%s/%s.git\n' "$host" "$project"
+  else
+    printf 'https://github.com/%s.git\n' "$project"
+  fi
 }
 
 # ============================================================================
@@ -245,24 +268,23 @@ init_repo() {
 
   # GH_REPO lets gh skip auto-detection from the origin URL, which fails when
   # fieldwork-clone uses a per-repo deploy-key Host alias (e.g. github-<slug>).
-  [ -n "${REPO_OVERRIDE:-}" ] && export GH_REPO="$REPO_OVERRIDE"
+  [ "$FORGE" != "github" ] || [ -z "${REPO_OVERRIDE:-}" ] || export GH_REPO="$REPO_OVERRIDE"
 
   # ---- Branch safety: refuse default branch unless --branch was passed. ----
-  if have gh && fieldwork_status_check "checking GitHub repository" gh repo view; then
-    local default_branch current_branch
-    fieldwork_status_start "detecting default branch"
-    default_branch="$(gh repo view --json defaultBranchRef --jq .defaultBranchRef.name 2>/dev/null || echo '')"
-    fieldwork_status_succeed ""
-    current_branch="$(git symbolic-ref --short HEAD 2>/dev/null || echo '')"
-    if [ -n "$default_branch" ] && [ "$current_branch" = "$default_branch" ]; then
-      if [ -n "$BRANCH" ] && [ "$BRANCH" != "$default_branch" ]; then
-        git checkout -b "$BRANCH"
-        info "checked out feature branch $BRANCH off $default_branch"
-      else
-        echo "[fieldwork-init] refusing to run on default branch $default_branch (production deploy hazard)" >&2
-        echo "[fieldwork-init] pass --branch <name> or 'git checkout -b <name>' first" >&2
-        exit 2
-      fi
+  local default_branch current_branch
+  fieldwork_status_start "detecting default branch"
+  default_branch="$(detect_origin_default_branch || true)"
+  [ -n "$default_branch" ] || default_branch="${FIELDWORK_DEFAULT_BRANCH:-main}"
+  fieldwork_status_succeed ""
+  current_branch="$(git symbolic-ref --short HEAD 2>/dev/null || echo '')"
+  if [ -n "$default_branch" ] && [ "$current_branch" = "$default_branch" ]; then
+    if [ -n "$BRANCH" ] && [ "$BRANCH" != "$default_branch" ]; then
+      git checkout -b "$BRANCH"
+      info "checked out feature branch $BRANCH off $default_branch"
+    else
+      echo "[fieldwork-init] refusing to run on default branch $default_branch (production deploy hazard)" >&2
+      echo "[fieldwork-init] pass --branch <name> or 'git checkout -b <name>' first" >&2
+      exit 2
     fi
   fi
 
@@ -280,6 +302,7 @@ init_repo() {
   local skipped_files=()
   while IFS= read -r tpl_rel; do
     case "$tpl_rel" in
+      .github/*) [ "$FORGE" = "gitlab" ] && continue ;;
       .github/workflows/*) [ "$NO_WORKFLOWS" = "1" ] && continue ;;
     esac
     [ -e "$REPO/$tpl_rel" ] && skipped_files+=("$tpl_rel")
@@ -291,7 +314,9 @@ init_repo() {
 
   fieldwork_status_start "copying template files"
   if have rsync; then
-    if [ "$NO_WORKFLOWS" = "1" ]; then
+    if [ "$FORGE" = "gitlab" ]; then
+      rsync -a --ignore-existing --exclude='.github/' "$TEMPLATE_DIR/" "$REPO/"
+    elif [ "$NO_WORKFLOWS" = "1" ]; then
       rsync -a --ignore-existing --exclude='.github/workflows/' "$TEMPLATE_DIR/" "$REPO/"
     else
       rsync -a --ignore-existing "$TEMPLATE_DIR/" "$REPO/"
@@ -317,7 +342,7 @@ init_repo() {
     fi
   fi
 
-  customize_workflow_templates "$stack" "$pkg_mgr"
+  [ "$FORGE" != "gitlab" ] && customize_workflow_templates "$stack" "$pkg_mgr"
 
   # Mark stack in agent guidance files if the template marker is still present.
   local guidance_file
@@ -328,33 +353,32 @@ init_repo() {
   done
 
   # CODEOWNERS — replace OWNER with the GitHub username we can detect.
-  if [ -f "$REPO/.github/CODEOWNERS" ] && grep -q '@OWNER' "$REPO/.github/CODEOWNERS"; then
+  if [ "$FORGE" = "github" ] && [ -f "$REPO/.github/CODEOWNERS" ] && grep -q '@OWNER' "$REPO/.github/CODEOWNERS"; then
     if have gh; then
       local owner; owner="$(gh api user --jq .login 2>/dev/null || echo OWNER)"
       sed -i.bak "s|@OWNER|@$owner|g" "$REPO/.github/CODEOWNERS" && rm -f "$REPO/.github/CODEOWNERS.bak"
     fi
   fi
 
-  # expected-origin — fill from `gh repo view` if still placeholder.
+  # expected-origin — fill from the explicit project argument.
   local origin_file="$REPO/.fieldwork/expected-origin"
-  if [ -f "$origin_file" ] && grep -q 'OWNER/REPO' "$origin_file" && have gh; then
-    local nameWithOwner
-    nameWithOwner="$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null || true)"
-    if [ -n "$nameWithOwner" ]; then
-      echo "https://github.com/$nameWithOwner.git" > "$origin_file"
-      info "expected-origin set to https://github.com/$nameWithOwner.git"
-    fi
+  if [ -f "$origin_file" ] && grep -q 'OWNER/REPO' "$origin_file" && [ -n "${REPO_OVERRIDE:-}" ]; then
+    local expected_origin
+    expected_origin="$(expected_origin_for_repo "$REPO_OVERRIDE")" || {
+      echo "[fieldwork-init] FIELDWORK_GITLAB_API must be https://host/api/v4" >&2
+      exit 2
+    }
+    echo "$expected_origin" > "$origin_file"
+    info "expected-origin set to $expected_origin"
   fi
 
   # default-branch — the broker reads this when creating the PR base.
   local default_branch_file="$REPO/.fieldwork/default-branch"
-  if have gh; then
-    local detected_default_branch
-    detected_default_branch="$(gh repo view --json defaultBranchRef --jq .defaultBranchRef.name 2>/dev/null || true)"
-    if [ -n "$detected_default_branch" ]; then
-      echo "$detected_default_branch" > "$default_branch_file"
-      info "default-branch set to $detected_default_branch"
-    fi
+  local detected_default_branch
+  detected_default_branch="$(detect_origin_default_branch || true)"
+  if [ -n "$detected_default_branch" ]; then
+    echo "$detected_default_branch" > "$default_branch_file"
+    info "default-branch set to $detected_default_branch"
   fi
 
   # Global git identity — set once on first onboard so the broker's commit step
@@ -363,6 +387,13 @@ init_repo() {
   # back to the GitHub noreply form when the user keeps their address private.
   section "Git identity"
   if have git; then
+    if [ "$FORGE" = "gitlab" ]; then
+      [ -n "${FIELDWORK_COMMIT_NAME:-}" ] || { echo "[fieldwork-init] GitLab requires FIELDWORK_COMMIT_NAME / commit_name" >&2; exit 2; }
+      [ -n "${FIELDWORK_COMMIT_EMAIL:-}" ] || { echo "[fieldwork-init] GitLab requires FIELDWORK_COMMIT_EMAIL / commit_email" >&2; exit 2; }
+      git config --local user.name "$FIELDWORK_COMMIT_NAME"
+      git config --local user.email "$FIELDWORK_COMMIT_EMAIL"
+      pass "git local user.name=$FIELDWORK_COMMIT_NAME, user.email=$FIELDWORK_COMMIT_EMAIL"
+    else
     local existing_name existing_email
     existing_name="$(git config --global --get user.name 2>/dev/null || true)"
     existing_email="$(git config --global --get user.email 2>/dev/null || true)"
@@ -404,6 +435,7 @@ init_repo() {
         fi
       fi
     fi
+    fi
   fi
 
   # --with-approval-gate: commit an empty marker so the broker queues every PR
@@ -415,6 +447,10 @@ init_repo() {
   fi
 
   # GitHub-side configuration. Each call is in `permissions.ask` — user confirms each.
+  if [ "$FORGE" = "gitlab" ]; then
+    section "GitLab repository settings"
+    info "GitLab repository hardening/templates are deferred; broker-owned push/MR path is configured"
+  else
   section "GitHub repository settings"
   if have gh && fieldwork_status_check "checking GitHub repository settings" gh repo view; then
     local owner_repo
@@ -457,6 +493,7 @@ JSON
     fieldwork_status_succeed ""
   else
     info "gh not present or no remote — skipping GH-side config"
+  fi
   fi
 
   echo
@@ -506,7 +543,15 @@ verify_repo() {
   local origin_file="$REPO/.fieldwork/expected-origin"
   if [ -f "$origin_file" ]; then
     local origin; origin="$(head -1 "$origin_file")"
-    if [[ "$origin" =~ ^https://github\.com/[^/]+/[^/]+(\.git)?$ ]]; then
+    if [ "$FORGE" = "gitlab" ]; then
+      local gitlab_host
+      gitlab_host="$(fieldwork_gitlab_api_host 2>/dev/null || true)"
+      if [ -n "$gitlab_host" ] && [[ "$origin" =~ ^https://$gitlab_host/[A-Za-z0-9][A-Za-z0-9._-]*(/[A-Za-z0-9][A-Za-z0-9._-]*)+(\.git)?$ ]]; then
+        pass "expected-origin is HTTPS GitLab URL on pinned host"
+      else
+        fail "expected-origin is not an HTTPS GitLab URL on the pinned host: $origin"
+      fi
+    elif [[ "$origin" =~ ^https://github\.com/[^/]+/[^/]+(\.git)?$ ]]; then
       pass "expected-origin is HTTPS GitHub URL"
     else
       fail "expected-origin is not an https://github.com URL: $origin"
@@ -537,7 +582,9 @@ verify_repo() {
   fi
 
   # GitHub-side state (only if gh available + repo has a GitHub remote).
-  if have gh && (cd "$REPO" && gh repo view >/dev/null 2>&1); then
+  if [ "$FORGE" = "gitlab" ]; then
+    info "GitLab forge configured — skipping GitHub repository hardening checks"
+  elif have gh && (cd "$REPO" && gh repo view >/dev/null 2>&1); then
     section "github.com state"
     local owner_repo; owner_repo="$(cd "$REPO" && gh repo view --json nameWithOwner --jq .nameWithOwner)"
 

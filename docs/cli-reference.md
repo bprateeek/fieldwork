@@ -9,7 +9,7 @@ Use `fieldwork setup` directly when you want the step-by-step setup-only path.
 
 | Command           | One line                                                                                                        | Authoritative doc                                                                  |
 | ----------------- | --------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------- |
-| `quickstart`      | Resumable public setup + repo onboarding path; skips completed phases from its local phase ledger.              | [quickstart.md](quickstart.md), [§ `fieldwork quickstart`](#fieldwork-quickstart-ownerrepo) below |
+| `quickstart`      | Resumable public setup + repo/project onboarding path; skips completed phases from its local phase ledger.      | [quickstart.md](quickstart.md), [§ `fieldwork quickstart`](#fieldwork-quickstart-project) below |
 | `setup`           | First-run command center; connects the VPS, prepares the server, and prints the next action when it needs help. | [setup.md](setup.md)                                                               |
 | `provision`       | Create a VPS (Hetzner) via the `hcloud` CLI + cloud-init, write the SSH alias, and hand off to `setup`.         | [first-time-infrastructure.md](first-time-infrastructure.md)                       |
 | `uninstall`       | Guided teardown for Fieldwork-managed local, remote, broker, and approval-bot assets.                           | [uninstall.md](uninstall.md)                                                       |
@@ -26,7 +26,7 @@ Use `fieldwork setup` directly when you want the step-by-step setup-only path.
 | `smoke`           | Create a tiny PR through the broker without a coding agent. Proves the socket + PAT + push + PR path.          | [runbook.md](runbook.md)                                                           |
 | `bootstrap-vps`   | Run the 10-phase VPS bootstrap (packages, systemd template, runners, …). Invoked on the VPS itself.             | [quickstart.md](quickstart.md)                                                     |
 | `install-broker`  | Install the PR broker on the VPS (called as root). Invoked by setup or advanced operator flows.                 | [setup.md](setup.md), [broker-standalone.md](broker-standalone.md)                 |
-| `onboard`         | Clone a repo to the VPS, apply templates, open the init PR, and start Claude service when configured.           | [setup.md](setup.md), [runbook.md](runbook.md)                                     |
+| `onboard`         | Clone a repo/project to the VPS, apply templates, open the init PR/MR, and start Claude service when configured.| [setup.md](setup.md), [runbook.md](runbook.md)                                     |
 | `refresh`         | Fast-forward the VPS checkout after merge; restart Claude service only when configured.                         | [§ `fieldwork refresh`](#fieldwork-refresh-repo-slug) below                        |
 | `start`           | Start Claude service when configured; print Codex Desktop SSH instructions when configured.                     | [§ `fieldwork start`](#fieldwork-start-repo-slug) below                            |
 | `status`          | Show repo, broker, runner, delivery-client, Claude, and Codex readiness.                                        | [§ `fieldwork status`](#fieldwork-status-repo-slug) below                          |
@@ -37,10 +37,10 @@ Use `fieldwork setup` directly when you want the step-by-step setup-only path.
 
 ---
 
-## `fieldwork quickstart [owner/repo]`
+## `fieldwork quickstart [project]`
 
 ```text
-usage: fieldwork quickstart [owner/repo] [options]
+usage: fieldwork quickstart [project] [options]
 ```
 
 Public, resumable first-run path. It is intentionally a thin orchestrator over
@@ -60,9 +60,14 @@ Common forms:
 ```sh
 fieldwork quickstart --agent codex
 fieldwork quickstart <owner>/<repo> --agent codex --with-approval-gate
-fieldwork quickstart <owner>/<repo> --dry-run
-fieldwork quickstart <owner>/<repo> --status
+FIELDWORK_FORGE=gitlab fieldwork quickstart <group>/<subgroup>/<project> --agent codex --with-approval-gate
+fieldwork quickstart <project> --dry-run
+fieldwork quickstart <project> --status
 ```
+
+`project` is `owner/repo` for GitHub and the full project path for GitLab.
+GitLab paths may contain nested groups. The repo slug is derived from the leaf
+name by default; pass `--slug <slug>` when two projects would collide locally.
 
 Flags:
 
@@ -72,10 +77,11 @@ Flags:
 | `--yes` | Passed to `fieldwork setup`. |
 | `--skip-sync` | Passed to `fieldwork setup`. |
 | `--force-install` | Passed to `fieldwork setup`. |
-| `--branch fieldwork/init` | Passed to `fieldwork onboard`. Requires `<owner/repo>`. |
-| `--no-workflows` | Passed to `fieldwork onboard`. Requires `<owner/repo>`. |
-| `--with-approval-gate` | Passed to `fieldwork onboard`. Requires `<owner/repo>`. |
-| `--reseed-templates` | Passed to `fieldwork onboard`. Requires `<owner/repo>`. |
+| `--branch fieldwork/init` | Passed to `fieldwork onboard`. Requires `<project>`. |
+| `--no-workflows` | Passed to `fieldwork onboard`. Requires `<project>`. |
+| `--with-approval-gate` | Passed to `fieldwork onboard`. Requires `<project>`. |
+| `--reseed-templates` | Passed to `fieldwork onboard`. Requires `<project>`. |
+| `--slug <slug>` | Passed to `fieldwork onboard`. Useful for GitLab nested paths or same-leaf project names. |
 | `--dry-run` | Run a read-only doctor preflight for quickstart without setup, onboarding, or ledger writes. |
 | `--status` | Print quickstart phase state without running setup or onboarding. |
 | `--reset-state` | Remove quickstart's local phase ledger before continuing. |
@@ -271,20 +277,28 @@ the broker. `list` shows queued/running/done/failed tasks; `discard` removes a
 queued or terminal task (a running or awaiting-approval task cannot be
 discarded). See [agent-adapters.md](agent-adapters.md) for the Aider setup.
 
-## `fieldwork onboard <owner>/<repo>`
+## `fieldwork onboard <project>`
 
 ```text
-usage: fieldwork onboard <owner>/<repo> [--branch fieldwork/init] [--no-workflows] [--with-approval-gate] [--status] [--reset-state] [--reseed-templates]
+usage: fieldwork onboard <project> [--slug <slug>] [--branch fieldwork/init] [--no-workflows] [--with-approval-gate] [--status] [--reset-state] [--reseed-templates]
 ```
 
-Onboards a GitHub repo onto the VPS. It validates the repo shape, asks the broker to prove PAT reachability, clones with a read-only deploy key, applies repo templates, and opens the init PR through the broker. In Claude mode it also primes Claude workspace trust and remote-control consent and starts `fieldwork-agent@<slug>.service`. In Codex mode, Codex Desktop owns the live SSH connection and remote-project folder state.
+Onboards a GitHub repo or GitLab project onto the VPS. It validates the project
+shape, asks the broker to prove token reachability, clones with a read-only
+deploy key, applies repo templates, and opens the init PR/MR through the broker.
+For GitHub, `project` is `owner/repo`. For GitLab, use the full project path
+such as `group/subgroup/project`. In Claude mode it also primes Claude
+workspace trust and remote-control consent and starts
+`fieldwork-agent@<slug>.service`. In Codex mode, Codex Desktop owns the live SSH
+connection and remote-project folder state.
 
 Flags:
 
 | Flag                   | Meaning                                                                                       |
 | ---------------------- | --------------------------------------------------------------------------------------------- |
+| `--slug <slug>`        | Override the local checkout/service slug. The default comes from the project leaf.             |
 | `--branch <name>`      | Init PR branch. Must match the broker `fieldwork/...` branch policy.                          |
-| `--no-workflows`       | Skip workflow templates so the broker PAT does not need Workflows read/write for the init PR and users can add CI manually later. |
+| `--no-workflows`       | Skip GitHub workflow templates so the broker PAT does not need Workflows read/write for the init PR and users can add CI manually later. GitLab skips `.github/` templates. |
 | `--with-approval-gate` | Commit `.fieldwork/approval-gate` so future PR requests queue for Telegram approval.          |
 | `--status`             | Inspect onboarding checkpoint without changing state.                                         |
 | `--reset-state`        | Remove only the onboarding checkpoint and recompute from repo state.                          |

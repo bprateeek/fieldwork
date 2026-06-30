@@ -1069,26 +1069,48 @@ uninstall_remove_marked_ssh_block() {
 
 uninstall_remove_marked_github_ssh_blocks() {
   local config="$1"
+  local skip_alias="${2:-}"
   local tmp
-  local description="Fieldwork GitHub SSH aliases"
+  local description="Fieldwork SSH aliases"
   [ -f "$config" ] || { uninstall_skipped "$description" "ssh config not present"; return 0; }
   [ ! -L "$config" ] || { uninstall_skipped "$description" "ssh config is a symlink"; return 0; }
-  grep -Fq "# BEGIN FIELDWORK GITHUB SSH CONFIG:" "$config" 2>/dev/null || { uninstall_skipped "$description" "not present"; return 0; }
-  grep -Fq "# END FIELDWORK GITHUB SSH CONFIG:" "$config" 2>/dev/null || { uninstall_skipped "$description" "incomplete marker"; return 0; }
+  grep -Eq "# BEGIN FIELDWORK (GITHUB )?SSH CONFIG:" "$config" 2>/dev/null || { uninstall_skipped "$description" "not present"; return 0; }
+  grep -Eq "# END FIELDWORK (GITHUB )?SSH CONFIG:" "$config" 2>/dev/null || { uninstall_skipped "$description" "incomplete marker"; return 0; }
+  if [ -n "$skip_alias" ]; then
+    if ! awk -v skip_alias="$skip_alias" '
+      /^# BEGIN FIELDWORK (GITHUB )?SSH CONFIG: / {
+        alias = $0
+        sub(/^# BEGIN FIELDWORK (GITHUB )?SSH CONFIG: /, "", alias)
+        if (alias != skip_alias) found = 1
+      }
+      END { exit found ? 0 : 1 }
+    ' "$config"; then
+      uninstall_skipped "$description" "not present"
+      return 0
+    fi
+  fi
   tmp="$(mktemp "${TMPDIR:-/tmp}/fieldwork-ssh-config.XXXXXX")" || { uninstall_failed "$description" "mktemp failed"; return 1; }
-  awk '
+  awk -v skip_alias="$skip_alias" '
     in_block {
       block = block $0 ORS
-      if ($0 ~ /^# END FIELDWORK GITHUB SSH CONFIG: /) {
+      if ($0 ~ /^# END FIELDWORK (GITHUB )?SSH CONFIG: /) {
         in_block = 0
+        if (keep_block) {
+          printf "%s", block
+        } else {
+          removed = 1
+        }
         block = ""
-        removed = 1
+        keep_block = 0
       }
       next
     }
-    /^# BEGIN FIELDWORK GITHUB SSH CONFIG: / {
+    /^# BEGIN FIELDWORK (GITHUB )?SSH CONFIG: / {
       in_block = 1
       block = $0 ORS
+      alias = $0
+      sub(/^# BEGIN FIELDWORK (GITHUB )?SSH CONFIG: /, "", alias)
+      keep_block = (skip_alias != "" && alias == skip_alias)
       next
     }
     { print }
@@ -1208,7 +1230,7 @@ uninstall_local_files() {
     "$HOME/.fieldwork/infra/fieldwork-pr-broker"; do
     uninstall_remove_fieldwork_symlink "$script"
   done
-  uninstall_remove_marked_github_ssh_blocks "$HOME/.ssh/config"
+  uninstall_remove_marked_github_ssh_blocks "$HOME/.ssh/config" "${FIELDWORK_SSH_HOST:-}"
 
   uninstall_remove_tree_path "local Fieldwork config" "$HOME/.config/fieldwork" "$HOME"
   if [ "$remove_notify" = "1" ]; then

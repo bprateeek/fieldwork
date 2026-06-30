@@ -12,7 +12,24 @@ so you can decide whether it fits before investing setup time.
 
 ## Scope
 
-- GitHub only. GitLab, Gitea, and other forges are planned, not present.
+- GitHub and core GitLab are supported. GitLab support covers broker preflight,
+  broker-owned push/MR creation, nested project paths, and managed onboarding.
+  GitLab branch protection, secret scanning, CodeQL, `.github/` templates, and
+  event-poller MR status/merge detection are deferred.
+- Self-managed GitLab is bounded to a host-root install with SSH on the API host
+  at port 22. Set `gitlab_api` / `FIELDWORK_GITLAB_API` to the exact
+  `https://host/api/v4` API root; path-prefixed installs such as
+  `https://host/gitlab/api/v4` are rejected. A private CA can be uploaded from
+  `gitlab_ca_bundle`; the VPS stores it at `/etc/fieldwork/gitlab-ca.pem`.
+- `fieldwork smoke` is GitHub-only. The GitLab live gate is a throwaway-project
+  E2E: deploy-key clone, `fieldwork-init`, `rotate-pat`, broker push, MR create,
+  approval-gated push, no-diff path, and verify-fail path.
+- GitLab tokens should be Project Access Tokens with Developer role and `api`
+  plus `write_repository` scopes. The `api` scope is broad, and GitLab project
+  tokens act as internal users that may see Internal-visibility projects, so
+  prefer private projects for live testing. On gitlab.com, project tokens may
+  require a paid or trial namespace; a personal/group token can be used for the
+  live gate.
 - Single operator. There is no multi-user, RBAC, or shared-team model yet.
 - No managed or hosted option. You bring your own VPS, SSH config, and GitHub
   write credential. PAT mode is the default; GitHub App mode is available for

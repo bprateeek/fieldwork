@@ -115,8 +115,9 @@ unmarked notification config.
 The final checklist always prints. It includes exact follow-up URLs or commands
 for the things uninstall cannot own directly:
 
-- GitHub broker PAT revocation:
-  `https://github.com/settings/personal-access-tokens`
+- Broker token revocation. For GitHub PATs, use:
+  `https://github.com/settings/personal-access-tokens`; for GitLab Project
+  Access Tokens, revoke the token from the project access token settings.
 - Telegram bot deletion:
   open `https://t.me/BotFather` and send `/deletebot`
 - Recorded VPS `authorized_keys` fingerprint and, when available, a command to
@@ -152,7 +153,7 @@ path is the ownership boundary.
 ## One Repo Only
 
 `fieldwork uninstall` is for removing Fieldwork itself. To detach one repository,
-stop its remote session and remove its GitHub deploy key manually:
+stop its remote session and remove its forge deploy key manually:
 
 ```sh
 ssh fieldwork-vps 'systemctl --user disable --now fieldwork-agent@<slug>'
@@ -161,5 +162,5 @@ ssh fieldwork-vps 'systemctl --user disable --now fieldwork-agent@<slug>'
 Keep or remove the VPS checkout under `~/projects/<slug>` yourself after copying
 any work you still need.
 
-If the broker PAT is scoped only to selected repositories, remove that repo from
-the token's repository access in GitHub.
+If the broker token is scoped only to selected repositories or projects, remove
+that project from the token's access in the forge UI.

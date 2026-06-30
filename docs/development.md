@@ -21,7 +21,7 @@ docs/                      Public docs.
 ## Important Runtime Boundaries
 
 - `fieldwork` is the agent user. It owns repo checkouts and calls tokenless clients.
-- `fieldwork-pr-broker` is the broker user. It owns the GitHub PAT and opens PRs.
+- `fieldwork-pr-broker` is the broker user. It owns the forge credential and opens PRs/MRs.
 - `fieldwork-bot` is the Telegram bot user. It owns the Telegram token and approval HMAC secret.
 - The verify and pr-prepare runners run as systemd user socket-activated services for the agent user.
 - The broker submit socket is installed with the agent user's primary group so it remains reachable inside Claude's sandbox user namespace.
@@ -87,10 +87,10 @@ fieldwork setup-notify --telegram-bot [--yes]
 fieldwork sync-vps [--dry-run] [--yes] [--force-install]
 fieldwork verify-security [repo-slug]
 fieldwork report [repo-slug]
-fieldwork smoke <owner/repo> [--yes]
+fieldwork smoke <owner/repo> [--yes]   # GitHub only
 fieldwork bootstrap-vps [--print-path] [--verbose] [--log-file <path>]
 fieldwork install-broker [--print-path] [--verbose] [--log-file <path>]
-fieldwork onboard <owner/repo> [--branch fieldwork/init] [--no-workflows] [--with-approval-gate] [--status] [--reset-state] [--reseed-templates]
+fieldwork onboard <project> [--slug <slug>] [--branch fieldwork/init] [--no-workflows] [--with-approval-gate] [--status] [--reset-state] [--reseed-templates]
 fieldwork start <repo-slug>
 fieldwork status [repo-slug] [--verbose]
 fieldwork bot-status
@@ -103,7 +103,7 @@ Update [cli-reference.md](cli-reference.md) when this changes.
 Repo templates live under `lib/templates/repo/`. Onboarded repos receive copies, not live links. If a template skill or hook changes, existing repos may need:
 
 ```sh
-fieldwork onboard <owner>/<repo> --reseed-templates
+fieldwork onboard <project> --reseed-templates
 ```
 
 Document migration-sensitive template changes in [troubleshooting.md](troubleshooting.md) or the release notes for the PR.

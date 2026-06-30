@@ -13,10 +13,16 @@ You need:
 - A normal Linux user on the VPS, usually `fieldwork`; setup can create it through one-time root SSH or another sudo-capable VPS account when you approve.
 - Claude Code authenticated on the VPS when using `--agent claude` or `--agent both`.
 - Codex CLI authenticated on the VPS when using `--agent codex` or `--agent both`.
-- GitHub CLI authenticated on the VPS for repo-resolution preflights.
-- A GitHub repo. Fieldwork records the repo's default branch during onboarding.
-- A fine-grained GitHub PAT for the broker by default, or a GitHub App id,
-  installation id, and private key for App credential mode.
+- For GitHub projects: GitHub CLI authenticated on the VPS for repo-resolution
+  preflights, a GitHub repo, and a fine-grained GitHub PAT for the broker by
+  default. GitHub App credential mode is available with an App id,
+  installation id, and private key.
+- For GitLab projects: `forge = "gitlab"` in config or
+  `FIELDWORK_FORGE=gitlab`, a GitLab project, explicit `commit_name` and
+  `commit_email`, and a GitLab Project Access Token for the broker with
+  Developer role plus `api` and `write_repository` scopes. For self-managed
+  GitLab, set `gitlab_api` / `FIELDWORK_GITLAB_API` to the exact
+  `https://host/api/v4` root before setup/onboard.
 
 Fieldwork assumes project checkouts live under `/home/fieldwork/projects/<slug>` unless you override config.
 
@@ -31,7 +37,7 @@ bash install.sh
 fieldwork setup --agent claude
 ```
 
-`bash install.sh` links the local `fieldwork` command into `~/.local/bin`, links Fieldwork-owned scripts/templates/infra into `~/.fieldwork`, and keeps Claude discovery assets under `~/.claude`. It does not install secrets or change GitHub repositories.
+`bash install.sh` links the local `fieldwork` command into `~/.local/bin`, links Fieldwork-owned scripts/templates/infra into `~/.fieldwork`, and keeps Claude discovery assets under `~/.claude`. It does not install secrets or change repositories.
 
 If `--agent` is omitted, setup prompts in an interactive terminal and defaults to `claude`. Use `--agent codex` for the Codex Desktop + SSH path or `--agent both` to prepare both surfaces on the same VPS.
 
@@ -99,13 +105,21 @@ ssh -t fieldwork-vps 'gh auth login --hostname github.com --git-protocol ssh --w
 
 For Codex, setup additionally verifies that `codex` resolves on the non-interactive SSH login PATH, is at least the reviewed minimum version, `loginctl enable-linger fieldwork` is active, `$XDG_RUNTIME_DIR` points at `/run/user/<fieldwork-uid>`, runner sockets are enabled, and Codex's sandbox can connect to the Fieldwork broker/runner Unix sockets. Setup uses the pinned npm package in `FIELDWORK_CODEX_NPM_PACKAGE` when it offers to install Codex, defaulting to `@openai/codex@0.137.0`. Setup writes the Fieldwork socket allowlist into Codex config before accepting Codex readiness.
 
-Fieldwork preselects GitHub.com, SSH git protocol, browser/device auth, and
-skip-SSH-key upload for `gh auth login`. Do not paste the broker PAT. Browser
+For GitHub profiles, Fieldwork preselects GitHub.com, SSH git protocol,
+browser/device auth, and skip-SSH-key upload for `gh auth login`. Do not paste
+the broker token. Browser
 login gives GitHub CLI its own token after you approve the device code. On a
 headless VPS, `gh` may warn that credentials were saved in plain text because
 no OS keychain is available; that token lives under the `fieldwork`
-user's GitHub CLI config and is separate from the broker PAT. The broker PAT is
+user's GitHub CLI config and is separate from the broker token. The broker token is
 installed later into the broker user's root-owned config path.
+
+For GitLab profiles, setup skips GitHub CLI login. Agent-side onboarding does
+not call the GitLab API; broker `/preflight` proves the broker token can see the
+project, while clone/default-branch checks use tokenless git over the read-only
+deploy key. If `gitlab_ca_bundle` is set to a local PEM path, setup uploads it
+to the VPS as `/etc/fieldwork/gitlab-ca.pem` and stores only that broker-side
+path in the broker environment.
 
 Once a private SSH path is working (Tailscale, WireGuard, or similar that you set up yourself), point `HostName` at the private name and consider restricting public SSH:
 
@@ -132,9 +146,10 @@ The broker installer creates:
 
 The installed submit socket defaults to the agent user's primary group, not a dedicated supplementary group. That matters because sandboxed agent sessions can strip supplementary groups.
 
-## 5. Store The Broker GitHub Credential
+## 5. Store The Broker Forge Credential
 
-PAT mode is the default. Create a fine-grained GitHub PAT for the broker. Required permissions:
+For GitHub, PAT mode is the default. Create a fine-grained GitHub PAT for the
+broker. Required permissions:
 
 - Contents: read/write.
 - Pull requests: read/write.
@@ -146,15 +161,20 @@ Optional permission:
 
 Default onboarding includes workflow templates. Use `fieldwork onboard <owner>/<repo> --no-workflows` if you want to avoid granting Workflows permission.
 
+For GitLab, create a Project Access Token on the target project with Developer
+role and `api` plus `write_repository` scopes. GitLab tokens do not have a
+required prefix; `rotate-pat` proves liveness with `/user` and stores the token
+without placing it in argv or environment.
+
 Store the token interactively:
 
 ```sh
 ssh -t fieldwork-vps "sudo -p '[sudo] VPS Linux password for fieldwork: ' env FIELDWORK_ROTATE_PAT_TTY=1 /usr/local/sbin/rotate-pat"
 ```
 
-Paste the GitHub PAT only after `rotate-pat` prompts for it. The token is written to `/etc/fieldwork-pr-broker/gh-token`, owned by `fieldwork-pr-broker`, mode `600`.
+Paste the token only after `rotate-pat` prompts for it. The token is written to `/etc/fieldwork-pr-broker/gh-token`, owned by `fieldwork-pr-broker`, mode `600`.
 
-Advanced option: instead of a PAT, set `FIELDWORK_GITHUB_CREDENTIAL_MODE=app`
+Advanced GitHub option: instead of a PAT, set `FIELDWORK_GITHUB_CREDENTIAL_MODE=app`
 when running `rotate-pat` and provide `FIELDWORK_GITHUB_APP_ID`,
 `FIELDWORK_GITHUB_APP_INSTALLATION_ID`, and the GitHub App private key PEM on
 stdin. The broker stores the private key and mints short-lived installation
@@ -186,38 +206,46 @@ To disable connection reuse for one command, run:
 FIELDWORK_SSH_MULTIPLEX=0 fieldwork setup
 ```
 
-## 7. Onboard A Repo
+## 7. Onboard A Repo Or Project
 
 For the recommended approval-gated flow:
 
 ```sh
-fieldwork onboard <owner>/<repo> --with-approval-gate
+fieldwork onboard <project> --with-approval-gate
 ```
 
 Without the approval marker:
 
 ```sh
-fieldwork onboard <owner>/<repo>
+fieldwork onboard <project>
 ```
 
 To avoid workflow templates:
 
 ```sh
-fieldwork onboard <owner>/<repo> --no-workflows
+fieldwork onboard <project> --no-workflows
 ```
 
-Onboarding is resumable. It clones with a read-only deploy key, applies repo templates, and asks the broker to open the init PR. In Claude mode it also primes Claude workspace trust and remote-control consent and starts `fieldwork-agent@<slug>.service`; those two Claude prompts are interactive confirmations that Fieldwork cannot safely automate. In Codex mode, Codex Desktop owns the live SSH connection and remote-project folder state.
+Use `owner/repo` for GitHub. Use the GitLab project path for GitLab, including
+nested groups such as `group/subgroup/project`. Onboarding is resumable. It
+clones with a read-only deploy key, applies repo templates, and asks the broker
+to open the init PR or MR. For GitLab, `.github/` templates, branch protection,
+secret scanning, and CodeQL setup are skipped. In Claude mode it also primes
+Claude workspace trust and remote-control consent and starts
+`fieldwork-agent@<slug>.service`; those two Claude prompts are interactive
+confirmations that Fieldwork cannot safely automate. In Codex mode, Codex
+Desktop owns the live SSH connection and remote-project folder state.
 
 Inspect progress without changing state:
 
 ```sh
-fieldwork onboard <owner>/<repo> --status
+fieldwork onboard <project> --status
 ```
 
 If Fieldwork-managed templates changed after an upgrade, refresh an existing onboarded repo:
 
 ```sh
-fieldwork onboard <owner>/<repo> --reseed-templates
+fieldwork onboard <project> --reseed-templates
 ```
 
 ## 8. Prove The Broker Path
@@ -228,7 +256,7 @@ Before relying on a mobile agent session, create a broker-only PR:
 fieldwork smoke <owner>/<repo>
 ```
 
-This does not use Claude or Codex. It proves the checkout, broker socket, broker PAT, push, and PR creation path. Close or merge the smoke PR afterward.
+This does not use Claude or Codex. It proves the checkout, broker socket, broker token, push, and PR creation path. Close or merge the smoke PR afterward. `fieldwork smoke` is GitHub-only; for GitLab, use a throwaway project and exercise onboarding, broker preflight, push/MR creation, approval-gated push, no-diff, and verify-fail paths.
 
 ## 9. Start A Work Session
 

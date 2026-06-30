@@ -1,6 +1,8 @@
 # Architecture
 
-Fieldwork turns a phone instruction into a reviewable GitHub pull request while keeping the GitHub write token out of the coding agent's environment.
+Fieldwork turns a phone instruction into a reviewable GitHub pull request or
+GitLab merge request while keeping the forge write token out of the coding
+agent's environment.
 
 ## System Flow
 
@@ -16,7 +18,7 @@ mobile agent entry, one of:
        boundary: Codex task sandbox + Fieldwork Unix-socket allowlist
 
 both have: repo checkout, read-only deploy key
-both do not have: GitHub write PAT
+both do not have: forge write token
   |
   | Claude: /verify-before-pr and /pr-delivery
   | Codex: AGENTS.md delivery instructions
@@ -46,7 +48,7 @@ fieldwork-pr-submit
   v
 fieldwork-pr-broker
   user: fieldwork-pr-broker
-  has: GitHub write PAT
+  has: forge write token
   validates request and repo state
   |
   | if .fieldwork/approval-gate exists
@@ -57,7 +59,7 @@ pending approval queue
   -> broker revalidates
   |
   v
-GitHub branch + pull request
+GitHub branch + pull request, or GitLab branch + merge request
 ```
 
 ## Components
@@ -73,7 +75,7 @@ GitHub branch + pull request
 | `fieldwork-pr-prepare`        |                       `fieldwork` | Thin client from the agent to the prepare runner socket.                      |
 | `fieldwork-pr-prepare-runner` | `fieldwork`, systemd user manager | Runs branch/stage/commit outside the agent's cage.                            |
 | `fieldwork-pr-submit`         |                       `fieldwork` | Tokenless broker client.                                                      |
-| `fieldwork-pr-broker`         |             `fieldwork-pr-broker` | Owns GitHub credential, validates requests, pushes, creates PRs.              |
+| `fieldwork-pr-broker`         |             `fieldwork-pr-broker` | Owns forge credential, validates requests, pushes, creates PRs/MRs.          |
 | `fieldwork-bot`               |                   `fieldwork-bot` | Owns Telegram token, prompts for approval, posts decisions to approve socket. |
 | `lib/templates/repo`          |        committed into target repo | AGENTS.md, Claude guidance/hooks/skills, review templates, optional workflows.|
 
@@ -90,7 +92,7 @@ ProtectSystem=strict
 ProtectHome=read-only
 ```
 
-`fieldwork-agent-session` selects the Fieldwork-launched agent adapter. The default adapter is Claude Code remote control. The service intentionally does not inject notification tokens, GitHub tokens, or broker secrets into the agent environment.
+`fieldwork-agent-session` selects the Fieldwork-launched agent adapter. The default adapter is Claude Code remote control. The service intentionally does not inject notification tokens, forge tokens, or broker secrets into the agent environment.
 
 Codex does not use this service in the current milestone. Codex Desktop connects over SSH as `fieldwork` and starts the real `codex` CLI/app server through the remote login shell. Fieldwork provisions PATH, linger, runner sockets, `XDG_RUNTIME_DIR`, and the Codex sandbox socket allowlist, then leaves live connection and remote-project folder state to Codex Desktop.
 
@@ -121,7 +123,7 @@ The dashboard server binds only to `127.0.0.1`, accepts GET requests only, and s
 
 ## Broker Boundary
 
-The broker is the GitHub write boundary.
+The broker is the forge write boundary.
 
 The agent submits JSON to:
 
@@ -136,19 +138,26 @@ The broker:
 - validates request schema and field patterns
 - checks repo path under the configured projects root
 - reads `.fieldwork/expected-origin`
-- checks the current `origin` matches that expected GitHub repo
+- checks the current `origin` matches that expected project
 - refuses dirty worktrees
 - refuses non-`fieldwork/...` branches
 - scans PR body text with gitleaks
 - enforces replay protection by `request_id`
 - rate-limits by repo
 - pushes with `GIT_ASKPASS`
-- opens the PR with `gh pr create`
+- opens the GitHub PR with `gh pr create`, or the GitLab MR with GitLab's API
 
 `FIELDWORK_FORGE=github` selects the GitHub backend. GitHub credential source is
 a separate axis: `FIELDWORK_GITHUB_CREDENTIAL_MODE=pat` is the current default,
 and `app` uses a broker-owned GitHub App private key to mint short-lived
 installation tokens.
+
+`FIELDWORK_FORGE=gitlab` selects the GitLab backend. The broker gets its API
+host only from `FIELDWORK_GITLAB_API` (default `https://gitlab.com/api/v4`) and
+requires `.fieldwork/expected-origin` to match that pinned host exactly.
+GitLab uses a broker-owned token with `PRIVATE-TOKEN`, refuses redirects for
+token-bearing API calls, and optionally trusts `FIELDWORK_GITLAB_CA_BUNDLE` for
+self-managed instances. The agent never calls the GitLab API during onboarding.
 
 The broker pushes to a URL derived from `.fieldwork/expected-origin`; it does not trust `origin` for push authentication.
 
@@ -171,7 +180,7 @@ Approval is repo-scoped. A committed `.fieldwork/approval-gate` marker tells the
   -> approve pushes and opens PR, deny deletes pending request
 ```
 
-The bot cannot submit PR requests because it is not in the submit socket group. The agent cannot approve requests because it is not in the approve socket group. The bot and agent do not hold the GitHub credential.
+The bot cannot submit PR requests because it is not in the submit socket group. The agent cannot approve requests because it is not in the approve socket group. The bot and agent do not hold the forge credential.
 
 See [approval-gate.md](approval-gate.md).
 
@@ -186,12 +195,12 @@ Onboarding applies `lib/templates/repo` to the target repository. Important piec
 - `.fieldwork/expected-origin`: broker origin pin.
 - `.fieldwork/default-branch`: default branch captured during onboarding.
 - `.fieldwork/approval-gate`: optional marker for gated PRs.
-- `.github/`: optional workflows, CODEOWNERS, PR template, dependabot.
+- `.github/`: optional GitHub workflows, CODEOWNERS, PR template, dependabot.
 
 Onboarded repos receive copies. After Fieldwork upgrades, refresh templates with:
 
 ```sh
-fieldwork onboard <owner>/<repo> --reseed-templates
+fieldwork onboard <project> --reseed-templates
 ```
 
 ## Infrastructure Baseline
@@ -202,7 +211,7 @@ The developer preview is tested on:
 - Normal SSH (transport-agnostic: public, DNS, or a private-network name like Tailscale/WireGuard if you set it up yourself).
 - Claude Code remote control.
 - Codex Desktop + SSH preview path.
-- GitHub.
+- GitHub and core GitLab.
 - ntfy for basic mobile notifications.
 - Telegram for approval-gate prompts.
 
@@ -212,11 +221,11 @@ The broker is the most reusable component. Advanced operators can install it sta
 
 Claude Code remote control is the current full control adapter: it is how Claude mobile instructions reach the long-running Fieldwork-managed agent session. Codex support intentionally bypasses adapters because Codex Desktop owns the SSH-launched process lifecycle and remote-project picker.
 
-Optional approval transports are intentionally narrow control surfaces. They may present Approve/Deny actions for approval-gated PRs, but they do not hold the GitHub credential and do not inject free text into the agent session. The broker remains the component that validates requests and performs GitHub operations.
+Optional approval transports are intentionally narrow control surfaces. They may present Approve/Deny actions for approval-gated PRs/MRs, but they do not hold the forge credential and do not inject free text into the agent session. The broker remains the component that validates requests and performs forge operations.
 
 ## Current Constraints
 
-- GitHub only.
+- GitHub and core GitLab only. GitLab currently skips branch protection, secret scanning, CodeQL, `.github/` templates, and event-poller MR merge detection.
 - Claude Code is the supported Fieldwork-launched agent adapter.
 - Codex Desktop + SSH is supported as a developer-preview path, with no Fieldwork Codex service.
 - Codex works in the canonical checkout; concurrent Codex tasks or simultaneous Claude+Codex work on that checkout are unsupported.

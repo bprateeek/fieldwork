@@ -17,7 +17,10 @@ To separate broker problems from Claude/mobile problems:
 fieldwork smoke <owner>/<repo>
 ```
 
-When a command shows `[sudo] VPS Linux password for fieldwork:`, enter the VPS Linux password for the `fieldwork` user. It is not your Claude account password and not the GitHub PAT.
+`fieldwork smoke` is GitHub-only. For GitLab, use a throwaway project and prove
+the onboarding/broker MR path instead.
+
+When a command shows `[sudo] VPS Linux password for fieldwork:`, enter the VPS Linux password for the `fieldwork` user. It is not your Claude account password and not the broker token.
 
 ## Starting Without VPS Or SSH
 
@@ -79,16 +82,16 @@ Existing real files are backed up with `.bak.<timestamp>` before Fieldwork-manag
 Onboarded repos receive copies of `lib/templates/repo`, not live symlinks. If Fieldwork upgraded a skill or hook and the repo still has the old copy:
 
 ```sh
-fieldwork onboard <owner>/<repo> --reseed-templates
+fieldwork onboard <project> --reseed-templates
 ```
 
 Then review the generated PR like any other repo change.
 
-## Broker PAT Cannot Reach Repo
+## Broker Token Cannot Reach Project
 
-`fieldwork onboard` asks the broker over the submit socket to prove the broker-owned PAT can see the repo. It does not expose the token to the `fieldwork` user.
+`fieldwork onboard` asks the broker over the submit socket to prove the broker-owned token can see the project. It does not expose the token to the `fieldwork` user.
 
-Required PAT permissions:
+For GitHub, required PAT permissions:
 
 - Contents: read/write.
 - Pull requests: read/write.
@@ -99,6 +102,11 @@ Optional:
 - Workflows: read/write, only when pushing `.github/workflows/**`.
 
 If the fine-grained PAT is selected-repo scoped, add the repo to the existing PAT. Do not rotate unless you intend to replace the VPS token.
+
+For GitLab, use a Project Access Token on the target project with Developer role
+and `api` plus `write_repository` scopes. For self-managed GitLab, confirm
+`FIELDWORK_GITLAB_API` / `gitlab_api` is the exact `https://host/api/v4` root and
+that any private CA was uploaded through setup as `/etc/fieldwork/gitlab-ca.pem`.
 
 If the error mentions broker socket, missing token, or preflight failure:
 
@@ -421,7 +429,7 @@ Likely causes:
 Refresh repo skills if needed:
 
 ```sh
-fieldwork onboard <owner>/<repo> --reseed-templates
+fieldwork onboard <project> --reseed-templates
 ```
 
 ## GitHub Rejects Workflow Updates
@@ -468,7 +476,7 @@ ssh -t fieldwork-vps 'gh auth login --hostname github.com --git-protocol ssh --w
 ```
 
 This is for onboarding preflights. It preselects browser/device login and skips
-SSH-key upload. It is not the broker PAT.
+SSH-key upload. It is not the broker token.
 
 ## `fieldwork smoke` Fails
 
@@ -517,19 +525,19 @@ fieldwork verify-security
 Rerun the same command:
 
 ```sh
-fieldwork onboard <owner>/<repo>
+fieldwork onboard <project>
 ```
 
 Inspect checkpoint:
 
 ```sh
-fieldwork onboard <owner>/<repo> --status
+fieldwork onboard <project> --status
 ```
 
 If checkpoint state is corrupt:
 
 ```sh
-fieldwork onboard <owner>/<repo> --reset-state
+fieldwork onboard <project> --reset-state
 ```
 
 This does not delete the checkout, branch, commits, PR, deploy key, broker token, or systemd unit.

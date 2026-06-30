@@ -1,8 +1,12 @@
 # Broker Contract
 
-The PR broker is Fieldwork's write boundary.
+The PR broker is Fieldwork's forge write boundary.
 
-Claude can edit and commit in the repo workspace, but it does not receive the GitHub write token. To open a pull request, Claude writes a structured request under the repo and sends it through a tokenless Unix-socket client. The broker validates the request, pushes a branch with its own GitHub credential, and opens the PR.
+Claude or Codex can edit and commit in the repo workspace, but the agent does
+not receive the GitHub or GitLab write token. To open a pull request or merge
+request, the agent writes a structured request under the repo and sends it
+through a tokenless Unix-socket client. The broker validates the request, pushes
+a branch with its own forge credential, and opens the PR/MR.
 
 ## Request Location
 
@@ -37,7 +41,7 @@ Current required fields:
 }
 ```
 
-The broker reads the PR base from `<repo>/.fieldwork/default-branch`, falling back
+The broker reads the review base from `<repo>/.fieldwork/default-branch`, falling back
 to the configured broker default when the file is absent.
 
 ## Socket Boundary
@@ -50,7 +54,7 @@ The client sends the request to:
 
 The checked-in systemd template uses `SocketGroup=fieldwork-pr`, but the installer rewrites the installed socket group. By default the installed socket is owned by `fieldwork-pr-broker:<agent-primary-group>` with mode `0660` (for the standard install, usually `fieldwork-pr-broker:fieldwork`).
 
-The agent's primary group is preserved by the user namespace that `claude remote-control --sandbox` puts the agent into. A dedicated supplementary group would be stripped from the agent's effective group set inside the sandbox and the kernel would deny `connect()` against the 0660 group-gated socket. The broker user owns the socket and the GitHub credential, but the agent user cannot read the PAT or GitHub App private key (`/etc/fieldwork-pr-broker/gh-token` and `/etc/fieldwork-pr-broker/github-app-private-key.pem` are mode `0600`, owned by the broker user when present).
+The agent's primary group is preserved by the user namespace that `claude remote-control --sandbox` puts the agent into. A dedicated supplementary group would be stripped from the agent's effective group set inside the sandbox and the kernel would deny `connect()` against the 0660 group-gated socket. The broker user owns the socket and the forge credential, but the agent user cannot read the token or GitHub App private key (`/etc/fieldwork-pr-broker/gh-token` and `/etc/fieldwork-pr-broker/github-app-private-key.pem` are mode `0600`, owned by the broker user when present).
 
 An operator who wants to gate the socket with a dedicated group can override the default via `FIELDWORK_BROKER_SOCKET_GROUP=<group>` in `lib/broker/install.sh`, but must then arrange for the agent's userns mapping to preserve that group. Otherwise this kind of regression resurfaces.
 
@@ -70,7 +74,13 @@ Request:
 }
 ```
 
-The broker validates the owner/repo shape, obtains its own PAT or GitHub App installation token, and runs `gh repo view` in the broker environment. Success means the token can resolve the repo. A `404` response means the fine-grained PAT probably does not include that selected repository, or the GitHub App is not installed on it. This endpoint does not push, open a PR, or expose the token to the caller.
+The `repo` field is the opaque project identifier: `owner/repo` for GitHub, or
+the full project path such as `group/subgroup/project` for GitLab. GitHub
+preflight uses `gh repo view` with the broker PAT or GitHub App installation
+token. GitLab preflight calls `/projects/<urlencoded-project>` with
+`PRIVATE-TOKEN`. Success means the token can resolve the project; a `404`
+usually means the credential cannot see it. This endpoint does not push, open a
+PR/MR, or expose the token to the caller.
 
 ## Broker Validations
 
@@ -87,14 +97,19 @@ The broker rejects requests when:
 - `branch` does not match `^fieldwork/[a-z0-9][a-z0-9/_-]{1,80}$`
 - `title` is over 200 characters or contains a newline
 - `body` is over 64 KiB as UTF-8
-- `.fieldwork/expected-origin` is missing or not an HTTPS GitHub URL
+- `.fieldwork/expected-origin` is missing or not an HTTPS URL for the selected forge
 - the repo's current `origin` remote does not match `.fieldwork/expected-origin`
 - the worktree has unstaged or staged changes
 - `gitleaks` detects secret-shaped content in the PR body
 - the in-memory per-repo rate limit is exceeded
-- `git push` or `gh pr create` fails
+- `git push` or forge PR/MR creation fails
 
-The broker derives the push URL from `.fieldwork/expected-origin`; it does not trust the repo's current `origin` remote for push auth. It still checks that the current `origin` points at the same owner/repo so an attacker cannot silently swap the local checkout's origin while asking the broker to push elsewhere.
+The broker derives the push URL from `.fieldwork/expected-origin`; it does not
+trust the repo's current `origin` remote for push auth. It still checks that the
+current `origin` points at the same project so an attacker cannot silently swap
+the local checkout's origin while asking the broker to push elsewhere. For
+GitLab, `.fieldwork/expected-origin` must use the host pinned by
+`FIELDWORK_GITLAB_API`; SSH remotes are parsed only for the project path.
 
 Broker git subprocesses set `safe.directory` for the validated repo path in the broker-owned process environment. Onboarding therefore does not need to run `sudo git config --system --add safe.directory ...` for each repo after setup has removed temporary passwordless sudo.
 
@@ -140,7 +155,7 @@ The broker logs to:
 /var/log/fieldwork-pr-broker.log
 ```
 
-Logs include request IDs, validation results, push attempts, PR creation attempts, and rejection reasons. They do not include the GitHub token.
+Logs include request IDs, validation results, push attempts, PR/MR creation attempts, and rejection reasons. They do not include forge tokens.
 
 The structured audit log lives at:
 
@@ -156,7 +171,7 @@ Accepted request IDs are also recorded in the replay ledger:
 /var/lib/fieldwork-pr-broker/requests/<request_id>.json
 ```
 
-Ledger entries include request ID, created timestamp, repo, repo path, branch, and accepted timestamp.
+Ledger entries include request ID, created timestamp, project, repo path, branch, and accepted timestamp. Pending approval JSON keeps the historical key name `"repo"`, but the value is the opaque project identifier.
 
 ## Accepted And Rejected Examples
 

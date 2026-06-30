@@ -7,7 +7,7 @@ Fieldwork uses two socket-activated runners between the agent and the broker:
 
 They exist because Claude runs inside `claude remote-control --sandbox`, where child processes inherit `PR_SET_NO_NEW_PRIVS` and a user namespace. That is good for host-secret protection, but it makes `bwrap` and some git subprocess behavior unsuitable for Fieldwork's delivery path. Codex uses its own task sandbox and needs explicit Unix-socket allowlisting to reach these same runner sockets. The runners are started by `systemd --user`, outside the agent sandbox, and stream results back over Unix sockets.
 
-The runners do not hold GitHub credentials. The broker remains the only GitHub write boundary.
+The runners do not hold forge credentials. The broker remains the only forge write boundary.
 
 ## Position In The Flow
 
@@ -36,7 +36,7 @@ runner
 agent receives result
   |
   v
-fieldwork-pr-submit -> broker -> optional approval -> GitHub PR
+fieldwork-pr-submit -> broker -> optional approval -> GitHub PR or GitLab MR
 ```
 
 ## Wire Protocol
@@ -216,7 +216,7 @@ What the runners do not do:
 
 - no GitHub push
 - no `gh pr create`
-- no broker PAT read
+- no broker token read
 - no Telegram token read
 - no approval decision
 - no dependency installation

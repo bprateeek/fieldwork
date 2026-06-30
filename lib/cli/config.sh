@@ -12,6 +12,10 @@
 # A flat fieldwork.toml (no sections) is the implicit "default" profile, so
 # existing configs resolve exactly as before.
 
+_fieldwork_config_dir="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/scripts/fieldwork-project.sh
+source "$_fieldwork_config_dir/../scripts/fieldwork-project.sh"
+
 # Prints `key=value` lines for one section of a config file.
 #   want=""              -> top-level keys (the flat / "default" profile)
 #   want="profile.NAME"  -> keys under a [profile.NAME] header
@@ -60,12 +64,15 @@ fieldwork_load_config() {
   local def_default_branch="main"
   local def_notify_provider="ntfy"
   local def_forge="github"
+  local def_gitlab_api="https://gitlab.com/api/v4"
 
   local flat_ssh_host="" flat_remote_user="" flat_projects_dir=""
   local flat_default_branch="" flat_notify_provider="" flat_forge=""
-  local flat_default_profile=""
+  local flat_default_profile="" flat_gitlab_api="" flat_gitlab_ca_bundle=""
+  local flat_commit_name="" flat_commit_email=""
   local prof_ssh_host="" prof_remote_user="" prof_projects_dir=""
   local prof_default_branch="" prof_notify_provider="" prof_forge=""
+  local prof_gitlab_api="" prof_gitlab_ca_bundle="" prof_commit_name="" prof_commit_email=""
 
   local cfg="${FIELDWORK_CONFIG:-}"
   if [ -z "$cfg" ]; then
@@ -87,6 +94,10 @@ fieldwork_load_config() {
         default_branch) flat_default_branch="$v" ;;
         notify_provider) flat_notify_provider="$v" ;;
         forge) flat_forge="$v" ;;
+        gitlab_api) flat_gitlab_api="$v" ;;
+        gitlab_ca_bundle) flat_gitlab_ca_bundle="$v" ;;
+        commit_name) flat_commit_name="$v" ;;
+        commit_email) flat_commit_email="$v" ;;
         default_profile) flat_default_profile="$v" ;;
       esac
     done < <(_fieldwork_config_scan "$cfg" "")
@@ -109,6 +120,10 @@ fieldwork_load_config() {
         default_branch) prof_default_branch="$v" ;;
         notify_provider) prof_notify_provider="$v" ;;
         forge) prof_forge="$v" ;;
+        gitlab_api) prof_gitlab_api="$v" ;;
+        gitlab_ca_bundle) prof_gitlab_ca_bundle="$v" ;;
+        commit_name) prof_commit_name="$v" ;;
+        commit_email) prof_commit_email="$v" ;;
       esac
     done < <(_fieldwork_config_scan "$cfg" "profile.$profile")
     if [ "$found" = "0" ]; then
@@ -123,6 +138,10 @@ fieldwork_load_config() {
   _fieldwork_config_resolve FIELDWORK_DEFAULT_BRANCH "$def_default_branch" "$flat_default_branch" "$prof_default_branch"
   _fieldwork_config_resolve FIELDWORK_NOTIFY_PROVIDER "$def_notify_provider" "$flat_notify_provider" "$prof_notify_provider"
   _fieldwork_config_resolve FIELDWORK_FORGE "$def_forge" "$flat_forge" "$prof_forge"
+  _fieldwork_config_resolve FIELDWORK_GITLAB_API "$def_gitlab_api" "$flat_gitlab_api" "$prof_gitlab_api"
+  _fieldwork_config_resolve FIELDWORK_GITLAB_CA_BUNDLE_LOCAL "" "$flat_gitlab_ca_bundle" "$prof_gitlab_ca_bundle"
+  _fieldwork_config_resolve FIELDWORK_COMMIT_NAME "" "$flat_commit_name" "$prof_commit_name"
+  _fieldwork_config_resolve FIELDWORK_COMMIT_EMAIL "" "$flat_commit_email" "$prof_commit_email"
 
   # Identity is the resolved profile name; env already won above.
   if [ -z "${FIELDWORK_PROFILE:-}" ]; then

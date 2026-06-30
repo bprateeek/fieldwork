@@ -74,10 +74,21 @@ task_add() {
   local nbytes
   nbytes="$(printf '%s' "$prompt" | LC_ALL=C wc -c | tr -d ' ')"
 
-  # slug/profile are regex-validated above, so this hand-built header JSON is
-  # safe; the prompt rides in the body, never the header.
-  local header
-  header="{\"slug\":\"$slug\",\"profile\":\"$profile\",\"prompt_bytes\":$nbytes,\"source\":\"cli\",\"actor\":\"cli\"}"
+  local actor header
+  actor="$(id -un 2>/dev/null || whoami 2>/dev/null || printf 'unknown')"
+  header="$(FIELDWORK_TASK_SLUG="$slug" FIELDWORK_TASK_PROFILE="$profile" FIELDWORK_TASK_BYTES="$nbytes" FIELDWORK_TASK_ACTOR="$actor" python3 - <<'PY'
+import json
+import os
+
+print(json.dumps({
+    "slug": os.environ["FIELDWORK_TASK_SLUG"],
+    "profile": os.environ.get("FIELDWORK_TASK_PROFILE", ""),
+    "prompt_bytes": int(os.environ["FIELDWORK_TASK_BYTES"]),
+    "source": "cli",
+    "actor": os.environ.get("FIELDWORK_TASK_ACTOR") or "unknown",
+}, separators=(",", ":")))
+PY
+)"
 
   local task_id
   if ! task_id="$( { printf '%s\n' "$header"; printf '%s' "$prompt"; } \

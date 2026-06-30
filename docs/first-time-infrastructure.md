@@ -10,7 +10,7 @@ Use this document when setup says an infrastructure step is missing, or when you
 
 If you already have a reachable Ubuntu VPS with a `fieldwork` user, you can skip to [quickstart.md](quickstart.md).
 
-If you are starting from nothing, setup will not create external accounts, buy a VPS, edit `~/.ssh/config`, log in to Claude, log in to GitHub, or paste your broker PAT. Those stay manual because they involve billing, browser/device approvals, local workstation config, or secrets. The value of setup is that it tells you which one is next, verifies it after you do it, and rechecks the remaining steps.
+If you are starting from nothing, setup will not create external accounts, buy a VPS, edit `~/.ssh/config`, log in to Claude, log in to GitHub for GitHub profiles, or paste your broker token. Those stay manual because they involve billing, browser/device approvals, local workstation config, or secrets. The value of setup is that it tells you which one is next, verifies it after you do it, and rechecks the remaining steps.
 
 The purpose of this infrastructure is to create a narrow, repeatable control plane:
 
@@ -18,7 +18,7 @@ The purpose of this infrastructure is to create a narrow, repeatable control pla
 - The VPS runs Claude or Codex work close to the code.
 - Fieldwork uses normal SSH; if you want a private path, install Tailscale, WireGuard, or similar yourself outside Fieldwork.
 - The `fieldwork` user runs day-to-day agent work.
-- A separate broker owns the GitHub write token and only opens PRs.
+- A separate broker owns the forge write token and only opens PRs/MRs.
 
 ## How To Read Commands
 
@@ -216,7 +216,7 @@ ssh fieldwork-vps 'git clone https://github.com/bprateeek/fieldwork.git ~/fieldw
 
 Bootstrap installs the VPS runtime for remote coding work: system packages, GitHub CLI, firewall rules, fail2ban, user-mode systemd linger, rootless Docker, Claude Code, and the `fieldwork-agent@` systemd unit template.
 
-It intentionally does not log in to Claude, log in to GitHub, or place the broker PAT. Those steps require browser/device prompts or secrets, so the human should do them explicitly. If you want a private network path, install Tailscale, WireGuard, or similar yourself outside Fieldwork.
+It intentionally does not log in to Claude, log in to GitHub for GitHub profiles, or place the broker token. Those steps require browser/device prompts or secrets, so the human should do them explicitly. If you want a private network path, install Tailscale, WireGuard, or similar yourself outside Fieldwork.
 
 During bootstrap, Fieldwork prints concise phase progress and saves the full command log under `~/.cache/fieldwork/` on the VPS with private directory and file permissions. If a phase fails, it prints the last relevant log lines and the full log path. To watch every installer line as it happens, pass `--verbose`.
 
@@ -246,21 +246,21 @@ ssh -t fieldwork-vps 'gh auth login --hostname github.com --git-protocol ssh --w
 What each follow-up is for:
 
 - `~/.local/bin/claude login` authenticates Claude Code on the VPS so the long-running remote sessions can start.
-- `gh auth login --hostname github.com --git-protocol ssh --web --skip-ssh-key` authenticates GitHub CLI on the VPS for read-only preflight checks such as resolving repositories. This is separate from the broker PAT used for PR pushes; onboarding checks that PAT through the broker socket after setup hardening, not through sudo.
+- `gh auth login --hostname github.com --git-protocol ssh --web --skip-ssh-key` authenticates GitHub CLI on the VPS for GitHub read-only preflight checks such as resolving repositories. GitLab profiles skip this step and route token-required metadata through broker `/preflight`. This is separate from the broker token used for PR/MR pushes; onboarding checks that token through the broker socket after setup hardening, not through sudo.
 
 When a command shows `[sudo] VPS Linux password for fieldwork:`, enter the VPS
 Linux password for the `fieldwork` user. It is not your Claude account password or
-the GitHub PAT.
+the broker token.
 
-Fieldwork preselects GitHub.com, SSH as the preferred Git protocol, browser
-login, and skip-SSH-key upload for `gh auth login`. Do not paste the broker PAT into gh;
-the broker PAT belongs only to the `fieldwork-pr-broker` service user. Browser
+For GitHub profiles, Fieldwork preselects GitHub.com, SSH as the preferred Git protocol, browser
+login, and skip-SSH-key upload for `gh auth login`. Do not paste the broker token into gh;
+the broker token belongs only to the `fieldwork-pr-broker` service user. Browser
 login still gives GitHub CLI its own token after you approve the device code. On
 a headless VPS, `gh` may say it could not open a browser; copy the printed code
 and open `https://github.com/login/device` on your workstation. It may also warn
 that authentication credentials were saved in plain text because no OS keychain
 is available; that is the GitHub CLI token under the `fieldwork` user's config,
-not the broker PAT.
+not the broker token.
 
 If you set up a private network path (Tailscale, WireGuard, or similar that you install yourself), update `Host fieldwork-vps` to use the private hostname:
 
@@ -308,7 +308,7 @@ Keep the topic private. Anyone who knows a public ntfy topic can read pushes for
 
 `fieldwork setup` symptom: PR broker socket is missing or not writable.
 
-Create a GitHub fine-grained personal access token in GitHub settings. The broker uses this token to push branches and open PRs; Claude itself does not receive it.
+For GitHub, create a fine-grained personal access token in GitHub settings. The broker uses this token to push branches and open PRs; the agent itself does not receive it.
 
 - Repository access: selected repositories you want Fieldwork to manage.
 - Contents: read/write.
@@ -316,7 +316,13 @@ Create a GitHub fine-grained personal access token in GitHub settings. The broke
 - Metadata: read.
 - Workflows: read/write only if Fieldwork will add or update `.github/workflows/**`.
 
-Default onboarding includes workflow templates. Use `fieldwork onboard <owner>/<repo> --no-workflows` if you want to keep the broker PAT narrower and add workflows manually later.
+Default GitHub onboarding includes workflow templates. Use `fieldwork onboard <owner>/<repo> --no-workflows` if you want to keep the broker PAT narrower and add workflows manually later.
+
+For GitLab, create a Project Access Token on the target project with Developer
+role and `api` plus `write_repository` scopes. Configure `forge = "gitlab"` and,
+for self-managed GitLab, `gitlab_api = "https://host/api/v4"`. GitLab onboarding
+also requires explicit `commit_name` and `commit_email`; setup uploads
+`gitlab_ca_bundle` to `/etc/fieldwork/gitlab-ca.pem` when a private CA is needed.
 
 `fieldwork setup` normally guides this as the Install PR services step. If you
 run the installer directly, it shows concise step progress and saves the full
@@ -333,18 +339,17 @@ ssh -t fieldwork-vps "sudo -p '[sudo] VPS Linux password for fieldwork: ' env FI
 ```
 
 If sudo asks for a password, enter the VPS Linux password for the `fieldwork` user.
-This is not your Claude account password and not the GitHub PAT. After sudo
+This is not your Claude account password and not the broker token. After sudo
 succeeds, paste the token when prompted, then press Enter. The token input is
 hidden.
 
-Before storing the token, `rotate-pat` validates it against the GitHub API: it
-confirms the token is live (not expired, revoked, or mistyped) and, if you name a
-repo, that the token can reach that repo with write access. A token GitHub
-definitively rejects is **not** stored and the broker is left running on its
-previous token; a transient network failure prints a warning and stores the token
-anyway. The guided `fieldwork setup` flow offers an optional repo to validate
-against; to validate from the manual command, prefix it with
-`FIELDWORK_PAT_PROBE_REPO=<owner>/<repo>`:
+Before storing the token, `rotate-pat` validates it against the selected forge:
+GitHub uses `/rate_limit` plus an optional repo permission probe, while GitLab
+uses `/user`. A token the forge definitively rejects is **not** stored and the
+broker is left running on its previous token; a transient network failure prints
+a warning and stores the token anyway. The guided `fieldwork setup` flow offers
+an optional GitHub repo to validate against; to validate from the manual command,
+prefix it with `FIELDWORK_PAT_PROBE_REPO=<owner>/<repo>`:
 
 ```sh
 ssh -t fieldwork-vps "sudo -p '[sudo] VPS Linux password for fieldwork: ' env FIELDWORK_ROTATE_PAT_TTY=1 FIELDWORK_PAT_PROBE_REPO=<owner>/<repo> /usr/local/sbin/rotate-pat"
@@ -358,13 +363,13 @@ If setup created the `fieldwork` user for you through root SSH or another sudo-c
 fieldwork setup
 ```
 
-Setup will offer to remove the temporary passwordless sudo rule. This is the final privilege handoff: the broker service keeps the PAT, and Claude sessions should no longer have passwordless root.
+Setup will offer to remove the temporary passwordless sudo rule. This is the final privilege handoff: the broker service keeps the token, and agent sessions should no longer have passwordless root.
 
-## 8. Create Or Choose A GitHub Repo
+## 8. Create Or Choose A Repo Or Project
 
-Fieldwork onboards a repo that already exists on GitHub and records its default branch.
+Fieldwork onboards a repo or project that already exists on GitHub or GitLab and records its default branch.
 
-If you create the repo after creating the broker PAT, widen the existing fine-grained PAT to include the new repo. The deploy key used by `fieldwork onboard` is separate and stays read-only.
+If you create the GitHub repo after creating the broker PAT, widen the existing fine-grained PAT or GitHub App installation to include the new repo. For GitLab, create or rotate a Project Access Token on the project. The deploy key used by `fieldwork onboard` is separate and stays read-only.
 
 ## 9. Verify
 
@@ -378,7 +383,7 @@ fieldwork verify-security
 
 Expected:
 
-- `claude`, `gh`, and the projects directory are ready.
+- `claude`, GitHub `gh` when using GitHub, and the projects directory are ready.
 - remote `notify.env` is present.
 - `fieldwork-agent@` user unit is installed.
 - PR broker socket is present.
@@ -388,5 +393,5 @@ Expected:
 Then continue with:
 
 ```sh
-fieldwork onboard <owner>/<repo>
+fieldwork onboard <project>
 ```
