@@ -28,13 +28,16 @@ from datetime import datetime, timezone
 import json
 import logging
 import os
+import ipaddress
 import re
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from pathlib import Path
@@ -105,6 +108,8 @@ NOTIFY_ON_PR_OPENED = os.environ.get("FIELDWORK_BROKER_NOTIFY_ON_PR_OPENED", "0"
 NOTIFICATION_SCHEMA = 1
 FORGE = os.environ.get("FIELDWORK_FORGE", "github").strip().lower() or "github"
 GITHUB_CREDENTIAL_MODE = os.environ.get("FIELDWORK_GITHUB_CREDENTIAL_MODE", "pat").strip().lower() or "pat"
+GITLAB_API = (os.environ.get("FIELDWORK_GITLAB_API", "https://gitlab.com/api/v4").strip() or "https://gitlab.com/api/v4").rstrip("/")
+GITLAB_CA_BUNDLE = os.environ.get("FIELDWORK_GITLAB_CA_BUNDLE", "").strip()
 # Approve-socket path used to identify the second systemd-passed listening
 # socket. Connections on any other listening socket are treated as agent
 # requests and never see the /approve route.
@@ -133,6 +138,8 @@ BASE_BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$")
 OWNER_REPO_RE = re.compile(r"^([A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?)/([A-Za-z0-9._-]{1,100})$")
 ORIGIN_RE = re.compile(r"^https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(\.git)?$")
 SSH_ORIGIN_RE = re.compile(r"^git@[^:]+:([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(\.git)?$")
+GITLAB_SSH_ORIGIN_RE = re.compile(r"^git@[^:]+:([A-Za-z0-9][A-Za-z0-9._-]*(?:/[A-Za-z0-9][A-Za-z0-9._-]*)+?)(\.git)?$")
+GITLAB_PROJECT_SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 TITLE_MAX = 200
 BODY_MAX = 64 * 1024
 CREATED_AT_RE = re.compile(r"^20[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
@@ -172,8 +179,7 @@ class ValidatedRequest:
     branch: str
     title: str
     body: str
-    owner: str
-    repo: str
+    project: str
     base_branch: str
 
 
@@ -387,7 +393,9 @@ def validate_json_schema(req: object) -> dict:
 
 
 def normalize_github_origin(origin: str) -> tuple[str, str]:
-    return GitHubBackend(PatCredentialProvider()).parse_origin(origin)
+    project = GitHubBackend(PatCredentialProvider()).parse_origin(origin)
+    owner, repo = project.split("/", 1)
+    return owner, repo
 
 
 def ensure_readable_git_repo(repo_path: str) -> None:
@@ -448,28 +456,29 @@ def read_default_branch(repo_path: str) -> str:
     return validate_base_branch(DEFAULT_BRANCH)
 
 
-def validate_origin_remote(repo_path: str, owner: str, repo: str) -> None:
-    return forge_backend().validate_origin_remote(repo_path, owner, repo)
+def validate_origin_remote(repo_path: str, project: str) -> None:
+    return forge_backend().validate_origin_remote(repo_path, project)
 
 
-def validate_owner_repo(value: object) -> tuple[str, str]:
+def validate_github_project(value: object) -> str:
     if not isinstance(value, str):
         raise RequestError("repo must be a string like owner/repo")
     m = OWNER_REPO_RE.fullmatch(value)
     if not m or "--" in m.group(1):
         raise RequestError("repo must be a valid GitHub owner/repo")
-    return m.group(1), m.group(2)
+    return f"{m.group(1)}/{m.group(2)}"
 
 
 def broker_token() -> str:
+    label = "GitLab token" if FORGE == "gitlab" else "GitHub PAT"
     try:
         token = Path(TOKEN_PATH).read_text().strip()
     except FileNotFoundError:
-        raise RequestError("broker GitHub PAT is not stored; run rotate-pat", status=503)
+        raise RequestError(f"broker {label} is not stored; run rotate-pat", status=503)
     except PermissionError:
-        raise RequestError(f"broker cannot read its GitHub PAT; repair {TOKEN_PATH} ownership", status=503)
+        raise RequestError(f"broker cannot read its {label}; repair {TOKEN_PATH} ownership", status=503)
     if not token:
-        raise RequestError("broker GitHub PAT is empty; run rotate-pat", status=503)
+        raise RequestError(f"broker {label} is empty; run rotate-pat", status=503)
     return token
 
 
@@ -491,7 +500,18 @@ def broker_git_env(repo_path: str) -> dict[str, str]:
         "GIT_CONFIG_KEY_1": "core.hooksPath",
         "GIT_CONFIG_VALUE_1": "/dev/null",
     })
+    if FORGE == "gitlab" and GITLAB_CA_BUNDLE:
+        ensure_gitlab_ca_bundle()
+        env["GIT_SSL_CAINFO"] = GITLAB_CA_BUNDLE
     return env
+
+
+def ensure_gitlab_ca_bundle() -> None:
+    if not GITLAB_CA_BUNDLE:
+        return
+    path = Path(GITLAB_CA_BUNDLE)
+    if not path.is_file() or not os.access(path, os.R_OK):
+        raise RequestError("FIELDWORK_GITLAB_CA_BUNDLE is set but is not a readable regular file", status=503)
 
 
 class CredentialProvider:
@@ -631,17 +651,35 @@ def github_credential_provider() -> CredentialProvider:
 class ForgeBackend:
     forge = ""
 
-    def parse_origin(self, origin: str) -> tuple[str, str]:
+    def parse_expected_origin(self, origin: str) -> str:
         raise NotImplementedError
 
-    def validate_origin_remote(self, repo_path: str, owner: str, repo: str) -> None:
+    def parse_origin(self, origin: str) -> str:
         raise NotImplementedError
+
+    def validate_origin_remote(self, repo_path: str, project: str) -> None:
+        try:
+            result = subprocess.run(
+                ["git", "-C", repo_path, "config", "--get", "remote.origin.url"],
+                env=broker_git_env(repo_path),
+                capture_output=True, text=True,
+            )
+        except FileNotFoundError:
+            raise RequestError("git is missing in the broker environment", status=503)
+        if result.returncode != 0 or not result.stdout.strip():
+            raise RequestError("missing git remote origin")
+        origin_project = self.parse_origin(result.stdout.strip())
+        if origin_project != project:
+            raise RequestError("origin remote does not match .fieldwork/expected-origin")
 
     def preflight(self, req: object) -> dict[str, str]:
         raise NotImplementedError
 
     def push_and_open_pr(self, req: ValidatedRequest) -> str:
         raise NotImplementedError
+
+    def credential_error_hint(self, cmd: str, detail: str) -> str:
+        return "git/forge failure (see broker log)"
 
 
 def write_request_token_file(token: str) -> str:
@@ -682,30 +720,22 @@ class GitHubBackend(ForgeBackend):
             return "broker GitHub App installation"
         return "broker PAT"
 
-    def parse_origin(self, origin: str) -> tuple[str, str]:
+    def parse_expected_origin(self, origin: str) -> str:
+        origin = origin.strip()
+        m = ORIGIN_RE.match(origin)
+        if not m:
+            raise RequestError("expected-origin must be an HTTPS URL for the configured forge")
+        return f"{m.group(1)}/{m.group(2)}"
+
+    def parse_origin(self, origin: str) -> str:
         origin = origin.strip()
         m = ORIGIN_RE.match(origin)
         if m:
-            return m.group(1), m.group(2)
+            return f"{m.group(1)}/{m.group(2)}"
         m = SSH_ORIGIN_RE.match(origin)
         if m:
-            return m.group(1), m.group(2)
+            return f"{m.group(1)}/{m.group(2)}"
         raise RequestError("origin remote must be a GitHub HTTPS URL or git@github alias URL")
-
-    def validate_origin_remote(self, repo_path: str, owner: str, repo: str) -> None:
-        try:
-            result = subprocess.run(
-                ["git", "-C", repo_path, "config", "--get", "remote.origin.url"],
-                env=broker_git_env(repo_path),
-                capture_output=True, text=True,
-            )
-        except FileNotFoundError:
-            raise RequestError("git is missing in the broker environment", status=503)
-        if result.returncode != 0 or not result.stdout.strip():
-            raise RequestError("missing git remote origin")
-        origin_owner, origin_repo = self.parse_origin(result.stdout.strip())
-        if (origin_owner, origin_repo) != (owner, repo):
-            raise RequestError("origin remote does not match .fieldwork/expected-origin")
 
     def preflight(self, req: object) -> dict[str, str]:
         if not isinstance(req, dict):
@@ -716,8 +746,7 @@ class GitHubBackend(ForgeBackend):
         if "repo" not in req:
             raise RequestError("preflight request missing required field: repo")
 
-        owner, repo = validate_owner_repo(req["repo"])
-        owner_repo = f"{owner}/{repo}"
+        owner_repo = validate_github_project(req["repo"])
         env = {**github_env(), "GH_TOKEN": self.credentials.acquire_token()}
         try:
             out = subprocess.run(
@@ -755,16 +784,20 @@ class GitHubBackend(ForgeBackend):
         default_branch = ""
         if isinstance(info.get("defaultBranchRef"), dict):
             default_branch = str(info["defaultBranchRef"].get("name") or "")
+        name_with_owner = str(info.get("nameWithOwner") or owner_repo)
         return {
             "repo": owner_repo,
-            "nameWithOwner": str(info.get("nameWithOwner") or owner_repo),
+            "project": name_with_owner,
+            "nameWithOwner": name_with_owner,
+            "expected_origin": f"https://github.com/{name_with_owner}.git",
+            "default_branch": default_branch,
             "defaultBranch": default_branch,
             "visibility": str(info.get("visibility") or ""),
         }
 
     def push_and_open_pr(self, req: ValidatedRequest) -> str:
         """Returns the PR URL."""
-        push_url = f"https://github.com/{req.owner}/{req.repo}.git"
+        push_url = f"https://github.com/{req.project}.git"
 
         # `git push`: token reaches git ONLY via the askpass helper. Not in argv, not in env.
         push_env = broker_git_env(req.repo_path)
@@ -780,7 +813,7 @@ class GitHubBackend(ForgeBackend):
             audit_event(
                 "push_attempted",
                 request_id=req.request_id,
-                repo=f"{req.owner}/{req.repo}",
+                repo=req.project,
                 repo_path_slug=repo_slug(req.repo_path),
                 branch=req.branch,
                 base_branch=req.base_branch,
@@ -797,11 +830,11 @@ class GitHubBackend(ForgeBackend):
                 token = self.credentials.acquire_token()
             gh_env = {**push_env, "GH_TOKEN": token}
             log.info(
-                "rid=%s gh pr create %s/%s base=%s head=%s",
-                req.request_id, req.owner, req.repo, req.base_branch, req.branch,
+                "rid=%s gh pr create %s base=%s head=%s",
+                req.request_id, req.project, req.base_branch, req.branch,
             )
             out = subprocess.run(
-                ["gh", "pr", "create", "--repo", f"{req.owner}/{req.repo}",
+                ["gh", "pr", "create", "--repo", req.project,
                  "--base", req.base_branch, "--head", req.branch,
                  "--title", req.title, "--body", req.body],
                 env=gh_env, check=True, timeout=120, capture_output=True, text=True,
@@ -810,7 +843,7 @@ class GitHubBackend(ForgeBackend):
             audit_event(
                 "pr_opened",
                 request_id=req.request_id,
-                repo=f"{req.owner}/{req.repo}",
+                repo=req.project,
                 repo_path_slug=repo_slug(req.repo_path),
                 branch=req.branch,
                 base_branch=req.base_branch,
@@ -852,10 +885,306 @@ class GitHubBackend(ForgeBackend):
                 except OSError:
                     log.warning("rid=%s app_token_cleanup_failed path=%s", req.request_id, token_path)
 
+    def credential_error_hint(self, cmd: str, detail: str) -> str:
+        lower = detail.lower()
+        cmd_lower = cmd.lower()
+        credential_label = "broker GitHub App installation" if self.credentials.mode == "app" else "broker PAT"
+        repo_scope = "GitHub App installation access" if self.credentials.mode == "app" else "selected-repository access"
+
+        if "refusing to allow a personal access token to create or update workflow" in lower or "workflow scope" in lower:
+            return (
+                f"{credential_label} lacks Workflows read/write for workflow file changes; "
+                "grant Workflows read/write or rerun onboarding with --no-workflows after resetting the init branch"
+            )
+        if "write access to repository not granted" in lower or "permission denied" in lower or "403" in lower:
+            if "git" in cmd_lower and "push" in cmd_lower:
+                return f"{credential_label} lacks Contents read/write or {repo_scope} for git push"
+            if "gh" in cmd_lower and "pr" in cmd_lower:
+                return f"{credential_label} lacks Pull requests read/write for gh pr create"
+            return f"{credential_label} lacks required GitHub write permissions"
+        if "no commits between" in lower:
+            return "GitHub reports no commits between the base branch and the requested branch"
+        return "git/gh failure (see broker log)"
+
+
+class NoTokenRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(req.full_url, code, "GitLab API redirect refused", headers, fp)
+
+
+class GitLabBackend(ForgeBackend):
+    forge = "gitlab"
+
+    def __init__(self, credentials: CredentialProvider):
+        self.credentials = credentials
+        self.api_base, self.allowed_host = self._validate_api_base(GITLAB_API)
+        ensure_gitlab_ca_bundle()
+        self.ssl_context = ssl.create_default_context(cafile=GITLAB_CA_BUNDLE or None)
+        self.opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}),
+            urllib.request.HTTPSHandler(context=self.ssl_context),
+            NoTokenRedirectHandler(),
+        )
+
+    @staticmethod
+    def _normalized_netloc(parsed: urllib.parse.ParseResult, *, field: str) -> str:
+        if parsed.scheme != "https":
+            raise RequestError(f"{field} must use https", status=503 if field == "FIELDWORK_GITLAB_API" else 400)
+        if parsed.username or parsed.password or "@" in parsed.netloc:
+            raise RequestError(f"{field} must not include userinfo", status=503 if field == "FIELDWORK_GITLAB_API" else 400)
+        if parsed.query or parsed.fragment:
+            raise RequestError(f"{field} must not include query or fragment", status=503 if field == "FIELDWORK_GITLAB_API" else 400)
+        host = parsed.hostname or ""
+        if not host:
+            raise RequestError(f"{field} host is empty", status=503 if field == "FIELDWORK_GITLAB_API" else 400)
+        host = host.lower()
+        if parsed.port is not None:
+            return f"{host}:{parsed.port}"
+        return host
+
+    @classmethod
+    def _validate_api_base(cls, api: str) -> tuple[str, str]:
+        parsed = urllib.parse.urlparse(api)
+        netloc = cls._normalized_netloc(parsed, field="FIELDWORK_GITLAB_API")
+        if parsed.path.rstrip("/") != "/api/v4":
+            raise RequestError("FIELDWORK_GITLAB_API path must be exactly /api/v4 (path-prefixed GitLab is not supported)", status=503)
+        return f"https://{netloc}/api/v4", netloc
+
+    @staticmethod
+    def _is_ip_literal(host: str) -> bool:
+        try:
+            ipaddress.ip_address(host.strip("[]"))
+            return True
+        except ValueError:
+            return False
+
+    @staticmethod
+    def _validate_dns_host(host: str) -> None:
+        if host.startswith(".") or host.endswith(".") or "_" in host:
+            raise RequestError("expected-origin GitLab host is invalid")
+        if any(ch.isspace() or ord(ch) < 32 for ch in host):
+            raise RequestError("expected-origin GitLab host is invalid")
+        labels = host.split(".")
+        if any(not label for label in labels):
+            raise RequestError("expected-origin GitLab host is invalid")
+        label_re = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+        if any(not label_re.fullmatch(label) for label in labels):
+            raise RequestError("expected-origin GitLab host is invalid")
+
+    @classmethod
+    def _validate_project(cls, value: object) -> str:
+        if not isinstance(value, str):
+            raise RequestError("repo must be a GitLab project path like group/project")
+        project = value.strip().strip("/")
+        if project.endswith(".git"):
+            project = project[:-4]
+        segments = project.split("/")
+        if len(segments) < 2 or any(not GITLAB_PROJECT_SEGMENT_RE.fullmatch(seg) for seg in segments):
+            raise RequestError("repo must be a valid GitLab project path like group/project")
+        return "/".join(segments)
+
+    def parse_expected_origin(self, origin: str) -> str:
+        parsed = urllib.parse.urlparse(origin.strip())
+        netloc = self._normalized_netloc(parsed, field="expected-origin")
+        host = (parsed.hostname or "").lower()
+        if self._is_ip_literal(host):
+            if netloc != self.allowed_host:
+                raise RequestError("expected-origin GitLab host must match FIELDWORK_GITLAB_API")
+        else:
+            self._validate_dns_host(host)
+        if netloc != self.allowed_host:
+            raise RequestError("expected-origin GitLab host must match FIELDWORK_GITLAB_API")
+        return self._validate_project(parsed.path)
+
+    def parse_origin(self, origin: str) -> str:
+        m = GITLAB_SSH_ORIGIN_RE.match(origin.strip())
+        if m:
+            return self._validate_project(m.group(1))
+        parsed = urllib.parse.urlparse(origin.strip())
+        if parsed.scheme == "https":
+            return self._validate_project(parsed.path)
+        raise RequestError("origin remote must be a GitLab git@alias URL")
+
+    def _project_url(self, project: str) -> str:
+        return urllib.parse.quote(project, safe="")
+
+    def _api_json(
+        self,
+        method: str,
+        url: str,
+        *,
+        token: str,
+        payload: dict[str, object] | None = None,
+        action: str,
+        allow_http_error: set[int] | None = None,
+    ) -> object:
+        data = None
+        headers = {"PRIVATE-TOKEN": token, "Accept": "application/json"}
+        if payload is not None:
+            data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        request = urllib.request.Request(url, data=data, headers=headers, method=method)
+        try:
+            with self.opener.open(request, timeout=30) as response:
+                body = response.read()
+        except urllib.error.HTTPError as exc:
+            if allow_http_error and exc.code in allow_http_error:
+                raise
+            self._raise_http_error(exc, action)
+        except urllib.error.URLError as exc:
+            log.error("GitLab %s could not reach %s: %s", action, url, exc)
+            raise RequestError(f"GitLab {action} could not reach the pinned API host", status=502)
+        except TimeoutError:
+            raise RequestError(f"GitLab {action} timed out", status=504)
+        try:
+            return json.loads(body)
+        except json.JSONDecodeError:
+            raise RequestError(f"GitLab {action} returned invalid JSON", status=502)
+
+    def _raise_http_error(self, exc: urllib.error.HTTPError, action: str) -> None:
+        if exc.code in (301, 302, 303, 307, 308):
+            raise RequestError(f"GitLab {action} redirected; refusing to replay the token", status=502)
+        if exc.code in (401, 403):
+            raise RequestError(
+                "GitLab token invalid or insufficient; use a Project Access Token with api and write_repository scopes and Developer role",
+                status=403,
+            )
+        if exc.code == 404:
+            raise RequestError("GitLab project not found, or the token cannot see it", status=404)
+        log.error("GitLab %s failed status=%s", action, exc.code)
+        raise RequestError(f"GitLab {action} failed (see broker log)", status=502)
+
+    def preflight(self, req: object) -> dict[str, str]:
+        if not isinstance(req, dict):
+            raise RequestError("preflight request body must be a JSON object")
+        extras = sorted(set(req.keys()) - {"repo"})
+        if extras:
+            raise RequestError(f"preflight request has unexpected field: {extras[0]}")
+        if "repo" not in req:
+            raise RequestError("preflight request missing required field: repo")
+
+        project = self._validate_project(req["repo"])
+        token = self.credentials.acquire_token()
+        info = self._api_json(
+            "GET",
+            f"{self.api_base}/projects/{self._project_url(project)}",
+            token=token,
+            action="preflight",
+        )
+        if not isinstance(info, dict):
+            raise RequestError("GitLab preflight returned invalid project data", status=502)
+        project_name = str(info.get("path_with_namespace") or project)
+        default_branch = str(info.get("default_branch") or "")
+        visibility = str(info.get("visibility") or "")
+        return {
+            "repo": project_name,
+            "project": project_name,
+            "expected_origin": f"https://{self.allowed_host}/{project_name}.git",
+            "default_branch": default_branch,
+            "visibility": visibility,
+        }
+
+    def push_and_open_pr(self, req: ValidatedRequest) -> str:
+        push_url = f"https://{self.allowed_host}/{req.project}.git"
+        push_env = broker_git_env(req.repo_path)
+        token = self.credentials.acquire_token()
+        log.info("rid=%s gitlab push %s -> %s", req.request_id, req.repo_path, req.branch)
+        audit_event(
+            "push_attempted",
+            request_id=req.request_id,
+            repo=req.project,
+            repo_path_slug=repo_slug(req.repo_path),
+            branch=req.branch,
+            base_branch=req.base_branch,
+            actor="broker",
+            transport="gitlab",
+        )
+        subprocess.run(
+            ["git", "-C", req.repo_path, "push", "--no-verify", push_url, f"HEAD:refs/heads/{req.branch}"],
+            env=push_env, check=True, timeout=120, capture_output=True,
+        )
+
+        project_id = self._project_url(req.project)
+        create_url = f"{self.api_base}/projects/{project_id}/merge_requests"
+        payload = {
+            "source_branch": req.branch,
+            "target_branch": req.base_branch,
+            "title": req.title,
+            "description": req.body,
+            "remove_source_branch": False,
+        }
+        try:
+            mr = self._api_json("POST", create_url, token=token, payload=payload, action="merge request create", allow_http_error={409})
+        except urllib.error.HTTPError as exc:
+            if exc.code != 409:
+                self._raise_http_error(exc, "merge request create")
+            mr = self._lookup_existing_mr(req, token)
+        if not isinstance(mr, dict):
+            raise RequestError("GitLab merge request response was invalid", status=502)
+        pr_url = str(mr.get("web_url") or "")
+        if not pr_url:
+            raise RequestError("GitLab merge request response missing web_url", status=502)
+        audit_event(
+            "pr_opened",
+            request_id=req.request_id,
+            repo=req.project,
+            repo_path_slug=repo_slug(req.repo_path),
+            branch=req.branch,
+            base_branch=req.base_branch,
+            actor="broker",
+            transport="gitlab",
+            pr_url=pr_url,
+        )
+        notify_lifecycle(
+            "pr_opened",
+            repo_slug_value=repo_slug(req.repo_path),
+            request_id=req.request_id,
+            branch=req.branch,
+            pr_url=pr_url,
+        )
+        iid = mr.get("iid")
+        if iid is not None:
+            label_query = urllib.parse.urlencode({"add_labels": "ready for review"})
+            label_url = f"{self.api_base}/projects/{project_id}/merge_requests/{iid}?{label_query}"
+            try:
+                self._api_json("PUT", label_url, token=token, action="merge request label")
+            except RequestError as exc:
+                log.warning("rid=%s gitlab_label_apply_failed pr=%s error=%s", req.request_id, pr_url, exc.message)
+        return pr_url
+
+    def _lookup_existing_mr(self, req: ValidatedRequest, token: str) -> dict:
+        query = urllib.parse.urlencode({
+            "state": "opened",
+            "source_branch": req.branch,
+            "target_branch": req.base_branch,
+        })
+        url = f"{self.api_base}/projects/{self._project_url(req.project)}/merge_requests?{query}"
+        matches = self._api_json("GET", url, token=token, action="merge request lookup")
+        if not isinstance(matches, list):
+            raise RequestError("GitLab merge request lookup returned invalid JSON", status=502)
+        if len(matches) == 1 and isinstance(matches[0], dict) and matches[0].get("web_url"):
+            return matches[0]
+        if len(matches) == 0:
+            raise RequestError("GitLab reported an existing merge request, but none matched this branch", status=409)
+        raise RequestError("GitLab reported multiple open merge requests for this branch; resolve them manually", status=409)
+
+    def credential_error_hint(self, cmd: str, detail: str) -> str:
+        lower = detail.lower()
+        cmd_lower = cmd.lower()
+        if "git" in cmd_lower and "push" in cmd_lower:
+            return "GitLab token lacks write_repository scope or Developer role for git push"
+        if "merge_request" in cmd_lower or "merge request" in lower:
+            return "GitLab token lacks api scope for merge request creation"
+        if "permission denied" in lower or "403" in lower:
+            return "GitLab token lacks required api/write_repository permissions"
+        return "git/GitLab failure (see broker log)"
+
 
 def forge_backend() -> ForgeBackend:
     if FORGE == "github":
         return GitHubBackend(github_credential_provider())
+    if FORGE == "gitlab":
+        return GitLabBackend(PatCredentialProvider())
     raise RequestError(f"unsupported forge backend: {FORGE}", status=503)
 
 
@@ -898,11 +1227,8 @@ def validate(req: object) -> ValidatedRequest:
         raise RequestError(f"body >{BODY_MAX} bytes")
 
     origin = read_expected_origin(repo_path)
-    m = ORIGIN_RE.match(origin)
-    if not m:
-        raise RequestError("expected-origin must be an https://github.com URL (HTTPS, not SSH)")
-    owner, repo = m.group(1), m.group(2)
-    validate_origin_remote(repo_path, owner, repo)
+    project = forge_backend().parse_expected_origin(origin)
+    validate_origin_remote(repo_path, project)
     base_branch = read_default_branch(repo_path)
 
     # Worktree must be clean.
@@ -928,7 +1254,7 @@ def validate(req: object) -> ValidatedRequest:
     if result.returncode != 0:
         raise RequestError("body contains secret-shaped content (gitleaks)")
 
-    return ValidatedRequest(request_id, created_at, repo_path, branch, title, body, owner, repo, base_branch)
+    return ValidatedRequest(request_id, created_at, repo_path, branch, title, body, project, base_branch)
 
 
 def rate_limit(repo: str) -> None:
@@ -948,7 +1274,7 @@ def reserve_request_id(req: ValidatedRequest) -> None:
     record = {
         "request_id": req.request_id,
         "created_at": req.created_at,
-        "repo": f"{req.owner}/{req.repo}",
+        "repo": req.project,
         "repo_path": req.repo_path,
         "branch": req.branch,
         "base_branch": req.base_branch,
@@ -1099,9 +1425,7 @@ def queue_pending(req: ValidatedRequest) -> str:
         "created_at": req.created_at,
         "queued_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "expires_at": expires_at,
-        "repo": f"{req.owner}/{req.repo}",
-        "owner": req.owner,
-        "repo_name": req.repo,
+        "repo": req.project,
         "repo_path": req.repo_path,
         "branch": req.branch,
         "base_branch": req.base_branch,
@@ -1211,21 +1535,20 @@ def revalidate_pending_for_push(record: dict) -> ValidatedRequest:
         branch = record["branch"]
         title = record["title"]
         body = record["body"]
-        owner = record["owner"]
-        repo = record["repo_name"]
+        project = record["repo"]
         created_at = record["created_at"]
         base_branch = record.get("base_branch") or read_default_branch(repo_path)
     except KeyError as e:
         raise RequestError(f"pending request missing field {e!s}", status=500)
 
     ensure_readable_git_repo(repo_path)
-    validate_origin_remote(repo_path, owner, repo)
+    validate_origin_remote(repo_path, project)
     base_branch = validate_base_branch(str(base_branch))
     for cmd in (["git", "-C", repo_path, "diff", "--quiet"],
                 ["git", "-C", repo_path, "diff", "--cached", "--quiet"]):
         if subprocess.run(cmd, env=broker_git_env(repo_path), capture_output=True).returncode != 0:
             raise RequestError("worktree not clean, commit before submitting", status=409)
-    return ValidatedRequest(rid, created_at, repo_path, branch, title, body, owner, repo, base_branch)
+    return ValidatedRequest(rid, created_at, repo_path, branch, title, body, project, base_branch)
 
 
 def approve(req: object) -> dict:
@@ -1293,7 +1616,7 @@ def approve(req: object) -> dict:
     audit_event(
         "request_approved",
         request_id=request_id,
-        repo=f"{validated.owner}/{validated.repo}",
+        repo=validated.project,
         repo_path_slug=repo_slug(validated.repo_path),
         branch=validated.branch,
         base_branch=validated.base_branch,
@@ -1335,26 +1658,8 @@ def subprocess_stream_text(value: object) -> str:
 
 def broker_subprocess_error_message(e: subprocess.CalledProcessError) -> str:
     detail = f"{subprocess_stream_text(getattr(e, 'stdout', ''))}\n{subprocess_stream_text(getattr(e, 'stderr', ''))}".strip()
-    lower = detail.lower()
     cmd = " ".join(str(part) for part in getattr(e, "cmd", []) or [])
-    cmd_lower = cmd.lower()
-    credential_label = "broker GitHub App installation" if GITHUB_CREDENTIAL_MODE == "app" else "broker PAT"
-    repo_scope = "GitHub App installation access" if GITHUB_CREDENTIAL_MODE == "app" else "selected-repository access"
-
-    if "refusing to allow a personal access token to create or update workflow" in lower or "workflow scope" in lower:
-        return (
-            f"{credential_label} lacks Workflows read/write for workflow file changes; "
-            "grant Workflows read/write or rerun onboarding with --no-workflows after resetting the init branch"
-        )
-    if "write access to repository not granted" in lower or "permission denied" in lower or "403" in lower:
-        if "git" in cmd_lower and "push" in cmd_lower:
-            return f"{credential_label} lacks Contents read/write or {repo_scope} for git push"
-        if "gh" in cmd_lower and "pr" in cmd_lower:
-            return f"{credential_label} lacks Pull requests read/write for gh pr create"
-        return f"{credential_label} lacks required GitHub write permissions"
-    if "no commits between" in lower:
-        return "GitHub reports no commits between the base branch and the requested branch"
-    return "git/gh failure (see broker log)"
+    return forge_backend().credential_error_hint(cmd, detail)
 
 
 def handle(conn: socket.socket, socket_type: str = "agent") -> None:
@@ -1444,15 +1749,15 @@ def handle(conn: socket.socket, socket_type: str = "agent") -> None:
             request_id = validated.request_id
             audit_context.update({
                 "request_id": request_id,
-                "repo": f"{validated.owner}/{validated.repo}",
+                "repo": validated.project,
                 "repo_path_slug": repo_slug(validated.repo_path),
                 "branch": validated.branch,
                 "base_branch": validated.base_branch,
             })
             audit_event("request_received", **audit_context)
-            rate_limit(f"{validated.owner}/{validated.repo}")
+            rate_limit(validated.project)
             reserve_request_id(validated)
-            log.info("rid=%s validated %s/%s branch=%s", request_id, validated.owner, validated.repo, validated.branch)
+            log.info("rid=%s validated %s branch=%s", request_id, validated.project, validated.branch)
 
             sweep_expired_pending()
             if approval_gate_enabled(validated.repo_path):

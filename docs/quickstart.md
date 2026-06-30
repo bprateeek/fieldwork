@@ -7,6 +7,7 @@ The public command is resumable:
 
 ```sh
 fieldwork quickstart --agent codex
+fieldwork quickstart <project> --agent codex --with-approval-gate
 fieldwork quickstart <owner>/<repo> --agent codex --with-approval-gate
 ```
 
@@ -19,6 +20,7 @@ To preview remaining setup friction without changing the VPS, repo, or local
 quickstart ledger, run:
 
 ```sh
+fieldwork quickstart <project> --dry-run
 fieldwork quickstart <owner>/<repo> --dry-run
 ```
 
@@ -33,11 +35,14 @@ The VPS path assumes you either already have, or are ready to create:
 
 - a Mac or Linux workstation with `git`, `ssh`, `jq`, and `bash`
 - an Ubuntu 24.04 VPS; Hetzner is the known-good tested baseline
-- a GitHub repo
+- a GitHub repo or GitLab project
 - a Claude Code account for `--agent claude`, or an OpenAI/Codex account for `--agent codex`
 
-If you do not have the VPS user, SSH alias, or GitHub token yet, quickstart's
-setup phase will guide the next step.
+If you do not have the VPS user, SSH alias, or broker token yet, quickstart's
+setup phase will guide the next step. GitHub is the default forge. For GitLab,
+set `forge = "gitlab"` in config or export `FIELDWORK_FORGE=gitlab`; self-managed
+GitLab also needs `gitlab_api = "https://host/api/v4"` and GitLab projects need
+explicit `commit_name` and `commit_email`.
 
 ## Infrastructure Overview
 
@@ -46,7 +51,7 @@ Fieldwork is intentionally opinionated for developer preview:
 - **VPS**: use a small Ubuntu 24.04 server. The original tested path uses Hetzner, but any equivalent Ubuntu VPS should work.
 - **SSH access**: Fieldwork uses normal SSH. Configure `~/.ssh/config` however you like: public IP, DNS name, a private-network name (Tailscale, WireGuard, or similar that you install yourself), VPN address, or a bastion-backed SSH config. Bootstrap opens public port 22 with fail2ban; restricting it later is your call.
 - **Notifications**: optional. Use ntfy if you want mobile pushes when Claude needs input, finishes a turn, or fails. Codex lifecycle notifications are not wired in this milestone.
-- **Source control**: use GitHub. The broker opens PRs; humans still merge.
+- **Source control**: use GitHub or core GitLab. The broker opens PRs/MRs; humans still merge.
 
 ## 1. Install Fieldwork Locally
 
@@ -57,7 +62,7 @@ bash install.sh
 fieldwork setup --agent claude
 ```
 
-`bash install.sh` links the local `fieldwork` command into `~/.local/bin`, links Fieldwork-owned scripts/templates/infra into `~/.fieldwork`, and keeps Claude discovery assets under `~/.claude`. It does not install secrets or change GitHub repositories.
+`bash install.sh` links the local `fieldwork` command into `~/.local/bin`, links Fieldwork-owned scripts/templates/infra into `~/.fieldwork`, and keeps Claude discovery assets under `~/.claude`. It does not install secrets or change repositories.
 
 If `--agent` is omitted, setup prompts in an interactive terminal and defaults to `claude`. Use `fieldwork setup --agent codex` for the Codex Desktop + SSH path, or `--agent both` if you want both surfaces on one VPS.
 
@@ -101,7 +106,7 @@ For first-time SSH key and VPS user setup details, use [first-time-infrastructur
 You can override the alias with:
 
 ```sh
-FIELDWORK_SSH_HOST=my-vps fieldwork onboard <owner/repo>
+FIELDWORK_SSH_HOST=my-vps fieldwork onboard <project>
 ```
 
 ## 3. Bootstrap The VPS When Setup Asks
@@ -128,11 +133,24 @@ ssh -t fieldwork-vps '~/.local/bin/claude login'
 ssh -t fieldwork-vps 'gh auth login --hostname github.com --git-protocol ssh --web --skip-ssh-key'
 ```
 
-These commands authenticate Claude Code on the VPS and authenticate GitHub CLI for repo-resolution preflights. For Codex, setup guides `codex login`, verifies Codex resolves on the SSH login PATH, enables linger/runner sockets, and checks the Codex sandbox Unix-socket allowlist. Fieldwork preselects GitHub.com, SSH git protocol, browser/device auth, and skip-SSH-key upload for `gh auth login`; do not paste the broker PAT there. Browser login still gives GitHub CLI its own token after you approve the device code; on a headless VPS, `gh` may warn that credentials were saved in plain text because no OS keychain is available. That token is separate from the broker PAT, which is checked later through the broker socket, without sudo impersonation. Bootstrap installs the `fieldwork-agent@` systemd user unit template for Claude and the runner socket units used by both agents.
+These commands authenticate Claude Code on the VPS and, for GitHub profiles,
+authenticate GitHub CLI for repo-resolution preflights. For GitLab profiles,
+setup skips the `gh auth login` step and routes token-required project metadata
+through broker `/preflight`. For Codex, setup guides `codex login`, verifies
+Codex resolves on the SSH login PATH, enables linger/runner sockets, and checks
+the Codex sandbox Unix-socket allowlist. Fieldwork preselects GitHub.com, SSH
+git protocol, browser/device auth, and skip-SSH-key upload for `gh auth login`;
+do not paste the broker token there. Browser login still gives GitHub CLI its own
+token after you approve the device code; on a headless VPS, `gh` may warn that
+credentials were saved in plain text because no OS keychain is available. That
+token is separate from the broker token, which is checked later through the broker
+socket, without sudo impersonation. Bootstrap installs the `fieldwork-agent@`
+systemd user unit template for Claude and the runner socket units used by both
+agents.
 
 When a command shows `[sudo] VPS Linux password for fieldwork:`, enter the VPS
 Linux password for the `fieldwork` user. It is not your Claude account password or
-the GitHub PAT.
+the broker token.
 
 Once a private SSH path is working (Tailscale, WireGuard, or similar that you set up yourself), consider restricting public SSH:
 
@@ -150,13 +168,19 @@ directly, it shows concise step progress and saves the full root-only log under
 ssh -t fieldwork-vps "sudo -p '[sudo] VPS Linux password for fieldwork: ' bash ~/.fieldwork/infra/fieldwork-pr-broker/install.sh"
 ```
 
-By default, create a fine-grained GitHub PAT with:
+By default for GitHub, create a fine-grained GitHub PAT with:
 
 - Contents: read/write
 - Pull requests: read/write
 - Metadata: read
 
-The default onboarding template includes `.github/workflows/**`, so it also needs Workflows read/write. If you want a narrower token or do not want Fieldwork's workflow templates in the init PR, onboard with `fieldwork onboard <owner>/<repo> --no-workflows` and add workflow files manually later.
+The default GitHub onboarding template includes `.github/workflows/**`, so it
+also needs Workflows read/write. If you want a narrower token or do not want
+Fieldwork's workflow templates in the init PR, onboard with
+`fieldwork onboard <owner>/<repo> --no-workflows` and add workflow files
+manually later. For GitLab, create a Project Access Token with Developer role
+and `api` plus `write_repository` scopes; GitLab onboarding skips `.github/`,
+branch protection, secret scanning, and CodeQL setup.
 
 Place the token interactively so it does not land in shell history:
 
@@ -165,13 +189,13 @@ ssh -t fieldwork-vps "sudo -p '[sudo] VPS Linux password for fieldwork: ' env FI
 ```
 
 If sudo asks for a password, enter the VPS Linux password for the `fieldwork` user.
-This is not your Claude account password and not the GitHub PAT. After sudo
+This is not your Claude account password and not the broker token. After sudo
 succeeds, paste the token when prompted, then press Enter. The token input is
 hidden.
 
 If the broker socket is reported as not writable, run `fieldwork doctor --remote --explain`. In the default install the submit socket uses the `fieldwork` user's primary group; custom socket-group overrides may require reconnecting to pick up group membership.
 
-If setup created the `fieldwork` user for you over root SSH or another sudo-capable VPS account, rerun `fieldwork setup` after the broker socket is writable. It will offer to remove the temporary passwordless sudo rule so the broker PAT remains isolated from agent sessions. Bootstrap disables root SSH, so keep another sudo-capable account if you plan to delete and recreate `fieldwork` later.
+If setup created the `fieldwork` user for you over root SSH or another sudo-capable VPS account, rerun `fieldwork setup` after the broker socket is writable. It will offer to remove the temporary passwordless sudo rule so the broker token remains isolated from agent sessions. Bootstrap disables root SSH, so keep another sudo-capable account if you plan to delete and recreate `fieldwork` later.
 
 Verify the remote setup:
 
@@ -190,7 +214,7 @@ fieldwork verify-security
 On your local machine:
 
 ```sh
-fieldwork quickstart <owner>/<repo> --with-approval-gate
+fieldwork quickstart <project> --with-approval-gate
 ```
 
 This resumes from the first incomplete quickstart phase. If setup has already
@@ -198,15 +222,15 @@ completed through quickstart, it will not run setup again. If you prefer to driv
 only the repo onboarding phase directly, use:
 
 ```sh
-fieldwork onboard <owner>/<repo> --with-approval-gate
+fieldwork onboard <project> --with-approval-gate
 ```
 
-Use plain `fieldwork onboard <owner>/<repo>` only if you do not want Telegram approval before broker pushes.
+Use plain `fieldwork onboard <project>` only if you do not want Telegram approval before broker pushes.
 
 Use `--no-workflows` if the broker PAT should not have Workflows read/write permission:
 
 ```sh
-fieldwork onboard <owner>/<repo> --no-workflows
+fieldwork onboard <project> --no-workflows
 ```
 
 Advanced: the broker can use a GitHub App instead of a PAT by running
@@ -215,7 +239,7 @@ installation id, and the App private key PEM.
 
 In Claude mode, the command pauses for three manual actions:
 
-- paste a read-only deploy key into GitHub
+- paste a read-only deploy key into GitHub or GitLab
 - run Claude's workspace-trust prompt; Fieldwork cannot safely automate this
 - run Claude's remote-control consent prompt; Fieldwork cannot safely automate this
 
@@ -224,13 +248,13 @@ In Codex mode, Codex Desktop owns the SSH session lifecycle and remote-project p
 To inspect progress without changing anything:
 
 ```sh
-fieldwork onboard <owner>/<repo> --status
+fieldwork onboard <project> --status
 ```
 
 If the checkpoint looks stale or corrupt, remove only that checkpoint and let Fieldwork recompute what it can:
 
 ```sh
-fieldwork onboard <owner>/<repo> --reset-state
+fieldwork onboard <project> --reset-state
 ```
 
 ## 6. Prove The Broker Path
@@ -241,11 +265,12 @@ Before testing mobile-agent behavior, create a tiny PR through the broker only:
 fieldwork smoke <owner>/<repo>
 ```
 
-This does not use Claude or Codex. It proves the onboarded checkout, broker socket, broker PAT, GitHub branch push, and PR creation path. If the repo is approval-gated, approve the queued smoke request first; then review and close or merge the smoke PR after it opens.
+This does not use Claude or Codex. It proves the onboarded checkout, broker socket, broker token, GitHub branch push, and PR creation path. If the repo is approval-gated, approve the queued smoke request first; then review and close or merge the smoke PR after it opens.
+`fieldwork smoke` is GitHub-only. For GitLab, use a throwaway project and run the live onboarding/broker path instead.
 
 ## 7. Use It Day to Day
 
-For Claude, open Claude mobile, select `vps-<repo-slug>`, and describe the task. Claude works on the VPS, opens a PR through the broker, and ntfy tells you when input or review is needed.
+For Claude, open Claude mobile, select `vps-<repo-slug>`, and describe the task. Claude works on the VPS, opens a PR or MR through the broker, and ntfy tells you when input or review is needed.
 
 For Codex, open Codex Desktop, go to `Connections -> SSH`, add or open the VPS
 connection as `fieldwork`, and in Details enable `"Available from signed-in devices"`

@@ -1,17 +1,17 @@
 # Approval Gate
 
-The approval gate makes every PR request from an opted-in repo wait for a human tap before the broker pushes a branch or opens a PR.
+The approval gate makes every PR/MR request from an opted-in repo wait for a human tap before the broker pushes a branch or opens a PR/MR.
 
 It extends Fieldwork's token split:
 
 ```text
 tokenless agent
-  -> broker with GitHub PAT
+  -> broker with forge credential
   -> tokenless Telegram approver
-  -> GitHub PR
+  -> GitHub PR or GitLab MR
 ```
 
-The approver does not hold GitHub credentials. It can only tell the broker to approve or deny a pending request.
+The approver does not hold forge credentials. It can only tell the broker to approve or deny a pending request.
 
 ## Quick Flow
 
@@ -25,7 +25,7 @@ Claude prepares PR request
   -> human taps a button
   -> bot posts /approve to broker approve socket
   -> broker revalidates repo state
-  -> approve: push branch and open PR
+  -> approve: push branch and open PR/MR
   -> deny: delete pending request
 ```
 
@@ -44,7 +44,7 @@ The file can be empty. Presence is the v1 policy signal.
 At onboarding time:
 
 ```sh
-fieldwork onboard <owner>/<repo> --with-approval-gate
+fieldwork onboard <project> --with-approval-gate
 ```
 
 For an already onboarded repo, add and commit the marker. The broker checks it on each request, so no broker restart is needed.
@@ -79,7 +79,7 @@ It long-polls Telegram. It does not open an inbound public port.
 
 ## Trust Model
 
-| Identity | Holds GitHub PAT | Holds Telegram token | Can submit `/pr` | Can call `/approve` |
+| Identity | Holds forge token | Holds Telegram token | Can submit `/pr` | Can call `/approve` |
 |---|---:|---:|---:|---:|
 | `fieldwork` agent user | no | no | yes | no |
 | `fieldwork-pr-broker` broker user | yes | no | broker owns socket | broker owns socket |
@@ -118,7 +118,7 @@ On approval, the broker reloads the pending record and revalidates drift-sensiti
 - worktree is still clean
 - request has not expired
 
-Then it uses the same push and PR creation path as a non-gated request.
+Then it uses the same push and PR/MR creation path as a non-gated request.
 
 On denial, the broker deletes the pending file and sidecar notification file.
 
@@ -137,7 +137,7 @@ Callbacks from non-allowlisted chats are logged and silently ignored.
 
 ## Day-To-Day Use
 
-When Claude submits a PR request for a gated repo, `fieldwork-pr-submit` prints:
+When an agent submits a PR/MR request for a gated repo, `fieldwork-pr-submit` prints:
 
 ```text
 queued for human approval; expires at <UTC timestamp>
@@ -152,7 +152,7 @@ Telegram shows:
 - request ID
 - Approve and Deny buttons
 
-After approval, the bot edits the original message to include the PR URL. After denial, it edits the message to show the denial. The agent has already exited successfully after queueing; there is no callback into the agent session.
+After approval, the bot edits the original message to include the PR/MR URL. After denial, it edits the message to show the denial. The agent has already exited successfully after queueing; there is no callback into the agent session.
 
 ## Health And Status
 
@@ -209,4 +209,4 @@ The approval gate is:
 - not a defense against compromised VPS root
 - not a replacement for GitHub review and merge discipline
 
-It is the human control point before a prepared PR request becomes a broker-owned GitHub push.
+It is the human control point before a prepared request becomes a broker-owned forge push.

@@ -66,6 +66,7 @@ if [ -f /etc/fieldwork-bot/config.toml ] && [ -d "$bot_drop" ] && [ -w "$bot_dro
     FW_NOTIFY_EVENT="$event" \
     FW_NOTIFY_REPO_SLUG="$project" \
     FW_NOTIFY_BRANCH="$branch" \
+    FW_NOTIFY_PROFILE="${FIELDWORK_PROFILE:-default}" \
     FW_NOTIFY_UUID="$uuid" \
     python3 - "$tmp" <<'PY'
 import json
@@ -76,6 +77,7 @@ out = sys.argv[1]
 event = os.environ.get("FW_NOTIFY_EVENT") or "unknown"
 repo_slug = os.environ.get("FW_NOTIFY_REPO_SLUG") or "unknown"
 branch = os.environ.get("FW_NOTIFY_BRANCH") or "-"
+profile = os.environ.get("FW_NOTIFY_PROFILE") or "default"
 uid = os.environ.get("FW_NOTIFY_UUID") or "unknown"
 payload = {
     "schema": 1,
@@ -85,6 +87,7 @@ payload = {
     "repo_slug": repo_slug,
     "request_id": None,
     "branch": branch,
+    "profile": profile,
     "dedupe_key": f"agent_lifecycle:{repo_slug}:{branch}:{event}:{uid}",
     "text": os.environ.get("FW_NOTIFY_TEXT") or "",
 }

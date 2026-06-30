@@ -1,26 +1,40 @@
 #!/usr/bin/env bash
 # Unit tests for the PAT validation in lib/broker/rotate-pat.
 # Sources rotate-pat in source-only mode (so the root check / token read are
-# skipped) and exercises fieldwork_validate_pat with a stubbed `curl`. No
+# skipped) and exercises fieldwork_validate_pat with a stubbed `python3`. No
 # network, no root.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+work="$(mktemp -d "${TMPDIR:-/tmp}/fieldwork-rotate-pat-test.XXXXXX")"
+trap 'rm -rf "$work"' EXIT
+TEST_PYTHON_LOG="$work/python.log"
 
-# A stub `curl` keyed by URL. Liveness uses `-o /dev/null -w %{http_code}` so it
-# prints only the code; the repo probe uses `-w \n%{http_code}` so it prints the
-# body, a newline, then the code. *_FAIL=1 makes curl exit non-zero (network).
-CURL_CALLED=0
-curl() {
-  CURL_CALLED=1
+# A stub `python3` keyed by URL. rotate-pat passes the token on stdin to a
+# urllib helper, never in argv.
+PYTHON_CALLED=0
+PYTHON_ARGV_LOG=""
+python3() {
+  PYTHON_CALLED=1
+  PYTHON_ARGV_LOG="$*"
+  printf '%s\n' "$*" >>"$TEST_PYTHON_LOG"
+  local token
+  token="$(cat)"
   case "$*" in
     *"/rate_limit"*)
+      case "$PYTHON_ARGV_LOG" in *"$token"*) return 9 ;; esac
       [ "${LIVENESS_FAIL:-0}" = "1" ] && return 1
-      printf '%s' "${LIVENESS_CODE:-200}"
+      printf '\n%s\n' "${LIVENESS_CODE:-200}"
       return 0 ;;
     *"/repos/"*)
+      case "$PYTHON_ARGV_LOG" in *"$token"*) return 9 ;; esac
       [ "${REPO_FAIL:-0}" = "1" ] && return 1
       printf '%s\n%s' "${REPO_BODY:-}" "${REPO_CODE:-200}"
+      return 0 ;;
+    *"/user"*)
+      case "$PYTHON_ARGV_LOG" in *"$token"*) return 9 ;; esac
+      [ "${GITLAB_FAIL:-0}" = "1" ] && return 1
+      printf '\n%s\n' "${GITLAB_CODE:-200}"
       return 0 ;;
   esac
   return 0
@@ -69,14 +83,20 @@ expect_rc "repo-403-rejected" 1 \
 expect_rc "repo-network-warn" 2 \
   LIVENESS_CODE=200 FIELDWORK_PAT_PROBE_REPO=o/r REPO_FAIL=1
 
-# Non-github forge is skipped entirely (no curl call).
-CURL_CALLED=0
-FIELDWORK_FORGE=gitlab fieldwork_validate_pat "glpat-xxx"; rc=$?
-if [ "$rc" = "0" ] && [ "$CURL_CALLED" = "0" ]; then
-  echo "  ok   non-github-forge-skips (rc=0, no curl)"
+PYTHON_CALLED=0
+>"$TEST_PYTHON_LOG"
+FIELDWORK_FORGE=gitlab
+GITLAB_CODE=200
+fieldwork_validate_pat "not-prefixed"; rc=$?
+if [ "$rc" = "0" ] && [ -s "$TEST_PYTHON_LOG" ] && ! grep -Fq "not-prefixed" "$TEST_PYTHON_LOG"; then
+  echo "  ok   gitlab-liveness-200-no-prefix"
 else
-  echo "  FAIL non-github-forge-skips: rc=$rc curl_called=$CURL_CALLED" >&2; fail=1
+  echo "  FAIL gitlab-liveness-200-no-prefix: rc=$rc python_log=$(cat "$TEST_PYTHON_LOG" 2>/dev/null)" >&2; fail=1
 fi
+GITLAB_CODE=403
+fieldwork_validate_pat "not-prefixed"; rc=$?
+[ "$rc" = "1" ] && echo "  ok   gitlab-liveness-403-rejected" || { echo "  FAIL gitlab-liveness-403-rejected: rc=$rc" >&2; fail=1; }
+unset FIELDWORK_FORGE GITLAB_CODE
 
 echo "[rotate-pat] GitHub App validation"
 if fieldwork_validate_github_app_ids 123 456; then

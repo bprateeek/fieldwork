@@ -398,7 +398,7 @@ EXPECTED_USER="${FIELDWORK_REMOTE_USER:-fieldwork}"
 echo "VPS bootstrap"
 note "configured agent support: $FIELDWORK_BOOTSTRAP_AGENTS"
 if ! sudo_ready_without_prompt; then
-  note "sudo may prompt for the Linux password for '$USER' (not your Claude/Codex account password or GitHub token)"
+  note "sudo may prompt for the Linux password for '$USER' (not your Claude/Codex account password or broker token)"
 fi
 note "log: $LOG_FILE"
 refresh_sudo

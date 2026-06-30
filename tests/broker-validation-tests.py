@@ -18,6 +18,8 @@ import sys
 import tempfile
 import threading
 import unittest
+import urllib.error
+import urllib.request
 import uuid
 from pathlib import Path
 
@@ -88,7 +90,10 @@ class BrokerValidationTests(unittest.TestCase):
         if self.audit.exists():
             self.audit.unlink()
         self.server.GITHUB_CREDENTIAL_MODE = "pat"
+        self.server.FORGE = "github"
         self.server.GITHUB_API = "https://api.github.com"
+        self.server.GITLAB_API = "https://gitlab.com/api/v4"
+        self.server.GITLAB_CA_BUNDLE = ""
         self.server.GITHUB_APP_ID = ""
         self.server.GITHUB_APP_INSTALLATION_ID = ""
         self.server.GITHUB_APP_PRIVATE_KEY_PATH = "/etc/fieldwork-pr-broker/github-app-private-key.pem"
@@ -137,6 +142,23 @@ class BrokerValidationTests(unittest.TestCase):
             (path / "README.md").write_text("dirty\n")
         return path
 
+    def make_gitlab_repo(self, slug: str = "project", project: str = "group/sub/project") -> Path:
+        path = self.projects / slug
+        if path.exists():
+            shutil.rmtree(path)
+        path.mkdir()
+        self.git("init", "-q", cwd=path)
+        self.git("config", "user.email", "test@example.com", cwd=path)
+        self.git("config", "user.name", "Fieldwork Test", cwd=path)
+        (path / "README.md").write_text("hello\n")
+        (path / ".claude").mkdir()
+        (path / ".fieldwork").mkdir()
+        (path / ".fieldwork/expected-origin").write_text(f"https://gitlab.example.com/{project}.git\n")
+        self.git("remote", "add", "origin", f"git@gitlab-{slug}:{project}.git", cwd=path)
+        self.git("add", ".", cwd=path)
+        self.git("commit", "-m", "init", cwd=path)
+        return path
+
     def request(self, path: Path, **overrides: object) -> dict:
         req = {
             "request_id": str(uuid.uuid4()),
@@ -162,8 +184,7 @@ class BrokerValidationTests(unittest.TestCase):
     def test_valid_request_accepted(self) -> None:
         repo = self.make_repo()
         validated = self.server.validate(self.request(repo))
-        self.assertEqual(validated.owner, "owner")
-        self.assertEqual(validated.repo, "fieldwork-smoke")
+        self.assertEqual(validated.project, "owner/fieldwork-smoke")
         self.assertEqual(validated.base_branch, "main")
 
     def test_default_branch_file_sets_pr_base(self) -> None:
@@ -851,6 +872,298 @@ class BrokerValidationTests(unittest.TestCase):
         self.assertEqual(push["env"]["GIT_ASKPASS"], self.server.ASKPASS_PATH)
         self.assertIn("FIELDWORK_BROKER_TOKEN_PATH", push["env"])
         self.assertNotIn("GH_TOKEN", push["env"])
+
+    def test_old_format_pending_record_revalidates_from_repo_key(self) -> None:
+        repo = self.make_repo()
+        validated = self.server.validate(self.request(repo))
+        record = {
+            "request_id": validated.request_id,
+            "created_at": validated.created_at,
+            "repo": validated.project,
+            "owner": "owner",
+            "repo_name": "fieldwork-smoke",
+            "repo_path": validated.repo_path,
+            "branch": validated.branch,
+            "base_branch": validated.base_branch,
+            "title": validated.title,
+            "body": validated.body,
+        }
+        rebuilt = self.server.revalidate_pending_for_push(record)
+        self.assertEqual(rebuilt.project, "owner/fieldwork-smoke")
+
+    def test_gitlab_nested_project_validates_with_pinned_expected_origin(self) -> None:
+        self.server.FORGE = "gitlab"
+        self.server.GITLAB_API = "https://gitlab.example.com/api/v4"
+        repo = self.make_gitlab_repo()
+        validated = self.server.validate(self.request(repo))
+        self.assertEqual(validated.project, "group/sub/project")
+
+    def test_gitlab_expected_origin_host_must_match_pin(self) -> None:
+        self.server.FORGE = "gitlab"
+        self.server.GITLAB_API = "https://gitlab.example.com/api/v4"
+        repo = self.make_gitlab_repo()
+        (repo / ".fieldwork/expected-origin").write_text("https://attacker.example.com/group/sub/project.git\n")
+        self.git("add", ".fieldwork/expected-origin", cwd=repo)
+        self.git("commit", "-m", "spoof expected origin", cwd=repo)
+        self.assert_rejects(self.request(repo), "must match FIELDWORK_GITLAB_API")
+
+    def test_gitlab_api_rejects_path_prefixed_instances(self) -> None:
+        self.server.GITLAB_API = "https://gitlab.example.com/gitlab/api/v4"
+        with self.assertRaises(self.server.RequestError) as ctx:
+            self.server.GitLabBackend(self.server.PatCredentialProvider())
+        self.assertIn("path must be exactly /api/v4", ctx.exception.message)
+
+    def test_gitlab_preflight_uses_private_token_and_encoded_project(self) -> None:
+        self.server.GITLAB_API = "https://gitlab.example.com/api/v4"
+        (self.tmp / "gh-token").write_text("gitlab-token\n")
+        captured: list[dict] = []
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+            def __exit__(self, *_args: object) -> None:
+                return None
+            def read(self) -> bytes:
+                return json.dumps({
+                    "path_with_namespace": "group/sub/project",
+                    "default_branch": "trunk",
+                    "visibility": "private",
+                }).encode()
+
+        backend = self.server.GitLabBackend(self.server.PatCredentialProvider())
+
+        def fake_open(request, timeout):
+            captured.append({
+                "url": request.full_url,
+                "headers": dict(request.header_items()),
+                "timeout": timeout,
+            })
+            return FakeResponse()
+
+        backend.opener.open = fake_open
+        result = backend.preflight({"repo": "group/sub/project"})
+        self.assertEqual(result["project"], "group/sub/project")
+        self.assertEqual(result["default_branch"], "trunk")
+        self.assertEqual(captured[0]["url"], "https://gitlab.example.com/api/v4/projects/group%2Fsub%2Fproject")
+        self.assertEqual(captured[0]["headers"].get("Private-token"), "gitlab-token")
+        self.assertEqual(captured[0]["timeout"], 30)
+
+    def test_gitlab_push_creates_mr_with_json_body_and_nonfatal_label(self) -> None:
+        self.server.FORGE = "gitlab"
+        self.server.GITLAB_API = "https://gitlab.example.com/api/v4"
+        (self.tmp / "gh-token").write_text("gitlab-token\n")
+        repo = self.make_gitlab_repo()
+        validated = self.server.validate(self.request(repo, branch="fieldwork/project-abc123"))
+        calls: list[dict] = []
+
+        class FakeResponse:
+            def __init__(self, payload: object):
+                self.payload = payload
+            def __enter__(self):
+                return self
+            def __exit__(self, *_args: object) -> None:
+                return None
+            def read(self) -> bytes:
+                return json.dumps(self.payload).encode()
+
+        backend = self.server.GitLabBackend(self.server.PatCredentialProvider())
+
+        def fake_open(request, timeout):
+            calls.append({
+                "url": request.full_url,
+                "method": request.get_method(),
+                "headers": dict(request.header_items()),
+                "body": request.data.decode() if request.data else "",
+            })
+            if request.get_method() == "PUT":
+                raise self.server.RequestError("label denied")
+            return FakeResponse({"iid": 7, "web_url": "https://gitlab.example.com/group/sub/project/-/merge_requests/7"})
+
+        def fake_run(argv, *args, **kwargs):
+            self.assertEqual(argv[-1], "HEAD:refs/heads/fieldwork/project-abc123")
+            self.assertEqual(argv[-2], "https://gitlab.example.com/group/sub/project.git")
+            self.assertIn("GIT_ASKPASS", kwargs["env"])
+            class _R:
+                returncode = 0
+            return _R()
+
+        backend.opener.open = fake_open
+        from unittest.mock import patch
+        with patch.object(self.server.subprocess, "run", side_effect=fake_run):
+            url = backend.push_and_open_pr(validated)
+
+        self.assertEqual(url, "https://gitlab.example.com/group/sub/project/-/merge_requests/7")
+        create = calls[0]
+        self.assertEqual(create["method"], "POST")
+        self.assertEqual(create["headers"].get("Content-type"), "application/json")
+        body = json.loads(create["body"])
+        self.assertEqual(body["source_branch"], "fieldwork/project-abc123")
+        self.assertEqual(body["target_branch"], "main")
+        self.assertIs(body["remove_source_branch"], False)
+        self.assertIn("?add_labels=ready+for+review", calls[1]["url"])
+
+    def test_gitlab_conflict_lookup_returns_single_existing_mr(self) -> None:
+        self.server.FORGE = "gitlab"
+        self.server.GITLAB_API = "https://gitlab.example.com/api/v4"
+        (self.tmp / "gh-token").write_text("gitlab-token\n")
+        repo = self.make_gitlab_repo()
+        validated = self.server.validate(self.request(repo))
+
+        class FakeResponse:
+            def __init__(self, payload: object):
+                self.payload = payload
+            def __enter__(self):
+                return self
+            def __exit__(self, *_args: object) -> None:
+                return None
+            def read(self) -> bytes:
+                return json.dumps(self.payload).encode()
+
+        backend = self.server.GitLabBackend(self.server.PatCredentialProvider())
+        seen: list[str] = []
+
+        def fake_open(request, timeout):
+            seen.append(request.full_url)
+            if request.get_method() == "POST":
+                raise urllib.error.HTTPError(request.full_url, 409, "Conflict", {}, None)
+            return FakeResponse([{"iid": 9, "web_url": "https://gitlab.example.com/group/sub/project/-/merge_requests/9"}])
+
+        def fake_run(argv, *args, **kwargs):
+            class _R:
+                returncode = 0
+            return _R()
+
+        import urllib.error
+        backend.opener.open = fake_open
+        from unittest.mock import patch
+        with patch.object(self.server.subprocess, "run", side_effect=fake_run):
+            url = backend.push_and_open_pr(validated)
+        self.assertEqual(url, "https://gitlab.example.com/group/sub/project/-/merge_requests/9")
+        self.assertIn("source_branch=fieldwork%2Ftest-change", seen[1])
+
+    def test_gitlab_api_self_validation_rejects_unsafe_bases(self) -> None:
+        for api, needle in (
+            ("http://gitlab.example.com/api/v4", "must use https"),
+            ("https://user@gitlab.example.com/api/v4", "must not include userinfo"),
+            ("https://gitlab.example.com/api/v4?x=1", "must not include query or fragment"),
+        ):
+            self.server.GITLAB_API = api
+            with self.assertRaises(self.server.RequestError) as ctx:
+                self.server.GitLabBackend(self.server.PatCredentialProvider())
+            self.assertIn(needle, ctx.exception.message)
+
+    def test_gitlab_expected_origin_rejects_unsafe_scheme_and_userinfo(self) -> None:
+        # An agent-writable expected-origin must not smuggle a non-https scheme
+        # or userinfo past the host pin (SSRF / credential-courier guard).
+        self.server.GITLAB_API = "https://gitlab.example.com/api/v4"
+        backend = self.server.GitLabBackend(self.server.PatCredentialProvider())
+        with self.assertRaises(self.server.RequestError) as ctx:
+            backend.parse_expected_origin("http://gitlab.example.com/group/sub/project.git")
+        self.assertIn("must use https", ctx.exception.message)
+        with self.assertRaises(self.server.RequestError) as ctx:
+            backend.parse_expected_origin("https://user@gitlab.example.com/group/sub/project.git")
+        self.assertIn("must not include userinfo", ctx.exception.message)
+
+    def test_gitlab_redirect_refused_and_leaks_no_token(self) -> None:
+        # The redirect handler refuses outright; defense-in-depth, a 302 HTTPError
+        # surfacing through _api_json maps to a token-free RequestError.
+        import urllib.error
+        self.server.GITLAB_API = "https://gitlab.example.com/api/v4"
+        (self.tmp / "gh-token").write_text("gitlab-secret-token\n")
+        backend = self.server.GitLabBackend(self.server.PatCredentialProvider())
+        with self.assertRaises(urllib.error.HTTPError):
+            backend.opener.handlers  # touch to ensure opener is built
+            self.server.NoTokenRedirectHandler().redirect_request(
+                urllib.request.Request("https://gitlab.example.com/api/v4/projects/x"),
+                None, 302, "Found", {}, "https://169.254.169.254/api/v4/projects/x",
+            )
+
+        def fake_open(request, timeout):
+            raise urllib.error.HTTPError(request.full_url, 302, "Found", {}, None)
+
+        backend.opener.open = fake_open
+        with self.assertRaises(self.server.RequestError) as ctx:
+            backend.preflight({"repo": "group/sub/project"})
+        self.assertIn("refusing to replay the token", ctx.exception.message)
+        self.assertNotIn("gitlab-secret-token", ctx.exception.message)
+
+    def test_gitlab_opener_disables_ambient_proxy(self) -> None:
+        # ProxyHandler({}) neutralizes HTTPS_PROXY so a proxy cannot exfil the
+        # token or bypass the host pin. build_opener drops the empty handler and
+        # skips the default env-reading one, so no proxy ever routes the call.
+        self.server.GITLAB_API = "https://gitlab.example.com/api/v4"
+        saved = os.environ.get("HTTPS_PROXY")
+        os.environ["HTTPS_PROXY"] = "http://attacker.proxy.example:3128"
+        try:
+            backend = self.server.GitLabBackend(self.server.PatCredentialProvider())
+        finally:
+            if saved is None:
+                os.environ.pop("HTTPS_PROXY", None)
+            else:
+                os.environ["HTTPS_PROXY"] = saved
+        active_proxies = [
+            h.proxies for h in backend.opener.handlers
+            if isinstance(h, urllib.request.ProxyHandler) and h.proxies
+        ]
+        self.assertEqual(active_proxies, [])
+
+    def test_gitlab_ca_bundle_fail_closed_when_unreadable(self) -> None:
+        self.server.GITLAB_API = "https://gitlab.example.com/api/v4"
+        self.server.GITLAB_CA_BUNDLE = str(self.tmp / "missing-ca.pem")
+        with self.assertRaises(self.server.RequestError) as ctx:
+            self.server.GitLabBackend(self.server.PatCredentialProvider())
+        self.assertIn("readable regular file", ctx.exception.message)
+
+    def test_gitlab_conflict_lookup_zero_and_multiple_rejected(self) -> None:
+        import urllib.error
+        self.server.FORGE = "gitlab"
+        self.server.GITLAB_API = "https://gitlab.example.com/api/v4"
+        (self.tmp / "gh-token").write_text("gitlab-token\n")
+        repo = self.make_gitlab_repo()
+        validated = self.server.validate(self.request(repo))
+
+        class FakeResponse:
+            def __init__(self, payload: object):
+                self.payload = payload
+            def __enter__(self):
+                return self
+            def __exit__(self, *_args: object) -> None:
+                return None
+            def read(self) -> bytes:
+                return json.dumps(self.payload).encode()
+
+        def make_open(lookup_payload):
+            def fake_open(request, timeout):
+                if request.get_method() == "POST":
+                    raise urllib.error.HTTPError(request.full_url, 409, "Conflict", {}, None)
+                return FakeResponse(lookup_payload)
+            return fake_open
+
+        def fake_run(argv, *args, **kwargs):
+            class _R:
+                returncode = 0
+            return _R()
+
+        from unittest.mock import patch
+        for payload in ([], [{"web_url": "a"}, {"web_url": "b"}]):
+            backend = self.server.GitLabBackend(self.server.PatCredentialProvider())
+            backend.opener.open = make_open(payload)
+            with patch.object(self.server.subprocess, "run", side_effect=fake_run):
+                with self.assertRaises(self.server.RequestError) as ctx:
+                    backend.push_and_open_pr(validated)
+            self.assertEqual(ctx.exception.status, 409)
+
+    def test_gitlab_credential_error_hint_strings(self) -> None:
+        self.server.GITLAB_API = "https://gitlab.example.com/api/v4"
+        backend = self.server.GitLabBackend(self.server.PatCredentialProvider())
+        self.assertIn(
+            "write_repository",
+            backend.credential_error_hint("git -C /x push --no-verify ...", "remote rejected"),
+        )
+        self.assertIn(
+            "api scope",
+            backend.credential_error_hint("merge_request create", "denied"),
+        )
 
     def test_push_succeeds_when_label_apply_fails(self) -> None:
         # gh pr edit returns nonzero (e.g. label not defined on the repo).

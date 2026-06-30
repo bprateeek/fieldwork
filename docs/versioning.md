@@ -22,5 +22,5 @@ fieldwork doctor --remote --explain
 If repo templates changed, refresh onboarded repos explicitly:
 
 ```sh
-fieldwork onboard <owner>/<repo> --reseed-templates
+fieldwork onboard <project> --reseed-templates
 ```

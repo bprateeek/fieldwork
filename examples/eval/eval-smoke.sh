@@ -71,7 +71,7 @@ validated = server.validate(req)
 server.audit_event(
     "request_received",
     request_id=validated.request_id,
-    repo=f"{validated.owner}/{validated.repo}",
+    repo=validated.project,
     repo_path_slug=Path(validated.repo_path).name,
     branch=validated.branch,
     base_branch=validated.base_branch,
@@ -83,7 +83,7 @@ expires_at = server.queue_pending(validated)
 server.audit_event(
     "request_queued",
     request_id=validated.request_id,
-    repo=f"{validated.owner}/{validated.repo}",
+    repo=validated.project,
     repo_path_slug=Path(validated.repo_path).name,
     branch=validated.branch,
     base_branch=validated.base_branch,
@@ -97,7 +97,7 @@ def fake_push(req):
     server.audit_event(
         "push_attempted",
         request_id=req.request_id,
-        repo=f"{req.owner}/{req.repo}",
+        repo=req.project,
         repo_path_slug=Path(req.repo_path).name,
         branch=req.branch,
         base_branch=req.base_branch,
@@ -108,7 +108,7 @@ def fake_push(req):
     server.audit_event(
         "pr_opened",
         request_id=req.request_id,
-        repo=f"{req.owner}/{req.repo}",
+        repo=req.project,
         repo_path_slug=Path(req.repo_path).name,
         branch=req.branch,
         base_branch=req.base_branch,

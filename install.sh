@@ -291,7 +291,7 @@ link_one "$HOME/.fieldwork/scripts/fieldwork-task-dispatcher" "$HOME/.local/bin/
 record_group_state command
 
 start_group "Claude helpers"
-for script in fieldwork-status fieldwork-status-snapshot fieldwork-dashboard-server fieldwork-clone fieldwork-init fieldwork-launch fieldwork-pr-submit fieldwork-agent-session fieldwork-task-enqueue fieldwork-task-run fieldwork-task-dispatcher fieldwork-event-poll fieldwork-setup-probe fieldwork-session-probe fieldwork-codex-sandbox fieldwork-verify fieldwork-verify-runner fieldwork-verify-pipeline fieldwork-pr-prepare fieldwork-pr-prepare-runner fieldwork-pr-prepare-impl notify.sh; do
+for script in fieldwork-project.sh fieldwork-status fieldwork-status-snapshot fieldwork-dashboard-server fieldwork-clone fieldwork-init fieldwork-launch fieldwork-pr-submit fieldwork-agent-session fieldwork-task-enqueue fieldwork-task-run fieldwork-task-dispatcher fieldwork-event-poll fieldwork-setup-probe fieldwork-session-probe fieldwork-codex-sandbox fieldwork-verify fieldwork-verify-runner fieldwork-verify-pipeline fieldwork-pr-prepare fieldwork-pr-prepare-runner fieldwork-pr-prepare-impl notify.sh; do
   link_one "$ROOT/lib/scripts/$script" "$HOME/.fieldwork/scripts/$script"
 done
 link_one "$ROOT/lib/claude/CLAUDE.md" "$HOME/.claude/CLAUDE.md"

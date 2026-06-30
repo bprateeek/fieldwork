@@ -369,7 +369,7 @@ EOF
       security_fail "repo expected-origin file missing" "Run: fieldwork onboard <owner>/$slug or inspect $repo_path/.fieldwork/expected-origin on the VPS."
     fi
 
-    if ssh "$FIELDWORK_SSH_HOST" "repo_path=$repo_path_q; expected=\$(cat \"\$repo_path/.fieldwork/expected-origin\" 2>/dev/null) || exit 10; origin=\$(git -C \"\$repo_path\" config --get remote.origin.url 2>/dev/null) || exit 11; expected_norm=\$(printf '%s' \"\$expected\" | sed -E 's#^https://github.com/##; s#\\.git\$##'); origin_norm=\$(printf '%s' \"\$origin\" | sed -E 's#^https://github\\.com/##; s#^git@[^:]+:##; s#\\.git\$##'); [ \"\$expected_norm\" = \"\$origin_norm\" ]" >/dev/null 2>&1; then
+    if ssh "$FIELDWORK_SSH_HOST" "repo_path=$repo_path_q; expected=\$(cat \"\$repo_path/.fieldwork/expected-origin\" 2>/dev/null) || exit 10; origin=\$(git -C \"\$repo_path\" config --get remote.origin.url 2>/dev/null) || exit 11; expected_norm=\$(printf '%s' \"\$expected\" | sed -E 's#^https://[^/]+/##; s#\\.git\$##'); origin_norm=\$(printf '%s' \"\$origin\" | sed -E 's#^https://[^/]+/##; s#^git@[^:]+:##; s#\\.git\$##'); [ \"\$expected_norm\" = \"\$origin_norm\" ]" >/dev/null 2>&1; then
       security_ok "repo origin matches .fieldwork/expected-origin"
     else
       security_fail "repo origin does not match .fieldwork/expected-origin" "On the VPS, inspect: cd $repo_path && git remote -v && cat .fieldwork/expected-origin"

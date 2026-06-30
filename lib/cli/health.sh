@@ -181,7 +181,9 @@ _health_render_remote() {
   gh_cli="$(_health_kv gh_cli "$snap")"
   gh_live="$(_health_kv gh_live "$snap")"
   gh_hosts="$(_health_kv gh_hosts "$snap")"
-  if [ "$gh_cli" != ok ]; then
+  if [ "$gh_cli" = skipped ] || [ "$gh_live" = skipped ]; then
+    _health_row info "GitHub auth" "skipped for GitLab forge"
+  elif [ "$gh_cli" != ok ]; then
     _health_row needs "GitHub auth" "gh CLI missing. Run fieldwork setup."
   elif [ "$gh_live" = ok ]; then
     _health_row ok "GitHub auth"

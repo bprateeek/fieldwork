@@ -15,7 +15,7 @@
 
 set -euo pipefail
 
-# Validate a PAT against the GitHub API before we ever store it, so a typo'd,
+# Validate a PAT against the forge API before we ever store it, so a typo'd,
 # expired, revoked, or wrong-repo token cannot replace a working one and restart
 # the broker with a dead credential. Side-effect-free; the caller decides what to
 # do with the exit code:
@@ -26,21 +26,70 @@ set -euo pipefail
 # Fine-grained PATs do not expose their granted permissions via any API, so this
 # checks liveness always and, when FIELDWORK_PAT_PROBE_REPO is set, repo
 # reachability plus the `permissions.push` write proxy. GitHub.com only.
+fieldwork_token_http() {
+  local token="$1"
+  local url="$2"
+  local forge="$3"
+  local ca="${4:-}"
+  printf '%s' "$token" | FIELDWORK_HTTP_FORGE="$forge" FIELDWORK_HTTP_CA="$ca" python3 -c '
+import json, os, ssl, sys, urllib.error, urllib.request
+
+token = sys.stdin.read().rstrip("\n")
+url = sys.argv[1]
+forge = os.environ.get("FIELDWORK_HTTP_FORGE", "github")
+headers = {"Accept": "application/json"}
+if forge == "gitlab":
+    headers["PRIVATE-TOKEN"] = token
+else:
+    headers["Authorization"] = f"Bearer {token}"
+    headers["Accept"] = "application/vnd.github+json"
+    headers["X-GitHub-Api-Version"] = "2022-11-28"
+context = ssl.create_default_context(cafile=os.environ.get("FIELDWORK_HTTP_CA") or None)
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=context))
+req = urllib.request.Request(url, headers=headers)
+try:
+    with opener.open(req, timeout=10) as resp:
+        body = resp.read().decode("utf-8", "replace")
+        print(body)
+        print(resp.getcode())
+except urllib.error.HTTPError as exc:
+    body = exc.read().decode("utf-8", "replace")
+    print(body)
+    print(exc.code)
+except Exception:
+    print("")
+    print("000")
+' "$url"
+}
+
 fieldwork_validate_pat() {
   local token="$1"
   local forge="${FIELDWORK_FORGE:-github}"
   case "$forge" in
-    github|"") ;;
-    *) return 0 ;;
+    github|"") forge="github" ;;
+    gitlab) ;;
+    *) echo "[rotate-pat] unsupported FIELDWORK_FORGE: $forge" >&2; return 1 ;;
   esac
-  local api="${FIELDWORK_GITHUB_API:-https://api.github.com}"
-  local hdr_accept="Accept: application/vnd.github+json"
-  local hdr_ver="X-GitHub-Api-Version: 2022-11-28"
 
-  local code
-  code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 \
-    -H "Authorization: Bearer $token" -H "$hdr_accept" -H "$hdr_ver" \
-    "$api/rate_limit" 2>/dev/null)" || code="000"
+  if [ "$forge" = "gitlab" ]; then
+    local api="${FIELDWORK_GITLAB_API:-https://gitlab.com/api/v4}"
+    local ca="${FIELDWORK_GITLAB_CA_BUNDLE:-}"
+    local resp code
+    resp="$(fieldwork_token_http "$token" "$api/user" gitlab "$ca")" || resp=$'\n000'
+    code="${resp##*$'\n'}"
+    case "$code" in
+      200) return 0 ;;
+      401|403) echo "[rotate-pat] GitLab rejected the token (HTTP $code): expired, revoked, missing api/write_repository, or insufficient role." >&2; return 1 ;;
+      000) echo "[rotate-pat] could not reach $api (network or TLS)." >&2; return 2 ;;
+      *) echo "[rotate-pat] unexpected response from $api/user (HTTP $code); could not validate." >&2; return 2 ;;
+    esac
+  fi
+
+  local api="${FIELDWORK_GITHUB_API:-https://api.github.com}"
+
+  local resp code
+  resp="$(fieldwork_token_http "$token" "$api/rate_limit" github)" || resp=$'\n000'
+  code="${resp##*$'\n'}"
   case "$code" in
     200) ;;
     401|403) echo "[rotate-pat] GitHub rejected the token (HTTP $code): expired, revoked, or mistyped." >&2; return 1 ;;
@@ -51,10 +100,8 @@ fieldwork_validate_pat() {
   local repo="${FIELDWORK_PAT_PROBE_REPO:-}"
   [ -n "$repo" ] || return 0
 
-  local resp rcode body
-  resp="$(curl -sS -w $'\n%{http_code}' --max-time 10 \
-    -H "Authorization: Bearer $token" -H "$hdr_accept" -H "$hdr_ver" \
-    "$api/repos/$repo" 2>/dev/null)" || { echo "[rotate-pat] could not reach $api for the $repo check." >&2; return 2; }
+  local rcode body
+  resp="$(fieldwork_token_http "$token" "$api/repos/$repo" github)" || { echo "[rotate-pat] could not reach $api for the $repo check." >&2; return 2; }
   rcode="${resp##*$'\n'}"
   body="${resp%$'\n'*}"
   case "$rcode" in
@@ -90,12 +137,19 @@ fi
 BROKER_USER="${FIELDWORK_BROKER_USER:-fieldwork-pr-broker}"
 BROKER_SERVICE="${FIELDWORK_BROKER_SERVICE:-fieldwork-pr-broker}"
 AGENT_USER="${FIELDWORK_REMOTE_USER:-fieldwork}"
+FORGE="${FIELDWORK_FORGE:-github}"
 CREDENTIAL_MODE="${FIELDWORK_GITHUB_CREDENTIAL_MODE:-pat}"
 TOKEN_PATH="${FIELDWORK_BROKER_TOKEN_PATH:-/etc/fieldwork-pr-broker/gh-token}"
 TOKEN_DIR="$(dirname "$TOKEN_PATH")"
 CONFIG_DIR="${FIELDWORK_BROKER_CONFIG_DIR:-/etc/fieldwork-pr-broker}"
 APP_PRIVATE_KEY_PATH="${FIELDWORK_GITHUB_APP_PRIVATE_KEY_PATH:-$CONFIG_DIR/github-app-private-key.pem}"
 APP_ENV_PATH="${FIELDWORK_GITHUB_APP_ENV_PATH:-$CONFIG_DIR/credential.env}"
+
+case "$FORGE" in
+  github|"") FORGE="github" ;;
+  gitlab) CREDENTIAL_MODE="pat" ;;
+  *) echo "unsupported FIELDWORK_FORGE: $FORGE" >&2; exit 1 ;;
+esac
 
 case "$CREDENTIAL_MODE" in
   pat|"") CREDENTIAL_MODE="pat" ;;
@@ -132,7 +186,14 @@ write_credential_env() {
   local tmp
   tmp="$(mktemp "$CONFIG_DIR/.credential.env.XXXXXX")"
   {
+    printf 'FIELDWORK_FORGE=%s\n' "$FORGE"
     printf 'FIELDWORK_GITHUB_CREDENTIAL_MODE=%s\n' "$mode"
+    if [ "$FORGE" = "gitlab" ]; then
+      printf 'FIELDWORK_GITLAB_API=%s\n' "${FIELDWORK_GITLAB_API:-https://gitlab.com/api/v4}"
+      if [ -n "${FIELDWORK_GITLAB_CA_BUNDLE:-}" ]; then
+        printf 'FIELDWORK_GITLAB_CA_BUNDLE=%s\n' "$FIELDWORK_GITLAB_CA_BUNDLE"
+      fi
+    fi
     if [ "$mode" = "app" ]; then
       printf 'FIELDWORK_GITHUB_APP_ID=%s\n' "$FIELDWORK_GITHUB_APP_ID"
       printf 'FIELDWORK_GITHUB_APP_INSTALLATION_ID=%s\n' "$FIELDWORK_GITHUB_APP_INSTALLATION_ID"
@@ -203,14 +264,22 @@ fi
 
 if [ -t 0 ]; then
   TTY_STATE="$(stty -g)"
-  printf 'Paste GitHub PAT (input hidden), then press Enter: ' >&2
+  if [ "$FORGE" = "gitlab" ]; then
+    printf 'Paste GitLab token (input hidden), then press Enter: ' >&2
+  else
+    printf 'Paste GitHub PAT (input hidden), then press Enter: ' >&2
+  fi
   stty -echo
   IFS= read -r TOKEN || true
   restore_tty
   printf '\n' >&2
 elif [ "${FIELDWORK_ROTATE_PAT_TTY:-0}" = "1" ] && [ -r /dev/tty ] && [ -w /dev/tty ]; then
   TTY_STATE="$(stty -g </dev/tty)"
-  printf 'Paste GitHub PAT (input hidden), then press Enter: ' >/dev/tty
+  if [ "$FORGE" = "gitlab" ]; then
+    printf 'Paste GitLab token (input hidden), then press Enter: ' >/dev/tty
+  else
+    printf 'Paste GitHub PAT (input hidden), then press Enter: ' >/dev/tty
+  fi
   stty -echo </dev/tty
   IFS= read -r TOKEN </dev/tty || true
   restore_tty
@@ -222,11 +291,13 @@ fi
 
 [ -n "$TOKEN" ] || { echo "empty token on stdin" >&2; exit 1; }
 
-# Sanity-check shape (fine-grained PATs start with github_pat_).
-case "$TOKEN" in
-  github_pat_*|ghp_*) ;;
-  *) echo "token doesn't look like a GitHub PAT (expected github_pat_… or ghp_…)" >&2; exit 1;;
-esac
+if [ "$FORGE" = "github" ]; then
+  # Sanity-check shape (fine-grained PATs start with github_pat_).
+  case "$TOKEN" in
+    github_pat_*|ghp_*) ;;
+    *) echo "token doesn't look like a GitHub PAT (expected github_pat_… or ghp_…)" >&2; exit 1;;
+  esac
+fi
 
 set +e
 fieldwork_validate_pat "$TOKEN"

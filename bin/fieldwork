@@ -157,7 +157,7 @@ source "$FIELDWORK_ROOT/lib/cli/task.sh"
 # Resolve the control-plane config object (host, user, projects root, default
 # branch, notify provider, forge, identity). Owns the defaults; see lib/cli/config.sh.
 fieldwork_load_config
-FIELDWORK_FINGERPRINT_FILES="bin/fieldwork install.sh AGENTS.md lib/cli/config.sh lib/cli/messaging.sh lib/cli/health.sh lib/cli/ssh-config.sh lib/cli/setup.sh lib/cli/onboard.sh lib/cli/quickstart.sh lib/cli/provision.sh lib/cli/verify-security.sh lib/cli/uninstall.sh lib/cli/developer-preview.sh lib/cli/task.sh lib/systemd/bootstrap-vps.sh lib/apparmor/fieldwork-bwrap lib/broker/install.sh lib/broker/standalone-install.sh lib/broker/fieldwork-pr-broker.service lib/broker/fieldwork-pr-broker.socket lib/broker/fieldwork-pr-approve.socket lib/broker/server.py schema/pr-request.schema.json schema/pr-prepare-request.schema.json lib/scripts/fieldwork-status lib/scripts/fieldwork-status-snapshot lib/scripts/fieldwork-dashboard-server lib/scripts/fieldwork-pr-submit lib/scripts/fieldwork-clone lib/scripts/fieldwork-init lib/scripts/fieldwork-launch lib/scripts/fieldwork-agent-session lib/scripts/fieldwork-task-enqueue lib/scripts/fieldwork-task-run lib/scripts/fieldwork-task-dispatcher lib/scripts/fieldwork-event-poll lib/scripts/fieldwork-setup-probe lib/scripts/fieldwork-session-probe lib/scripts/fieldwork-codex-sandbox lib/scripts/fieldwork-bot lib/scripts/fieldwork-pr-prepare lib/scripts/fieldwork-pr-prepare-runner lib/scripts/fieldwork-pr-prepare-impl lib/agents/claude-remote-control lib/agents/aider lib/templates/repo/AGENTS.md lib/templates/repo/CLAUDE.md lib/templates/repo/.gitignore lib/templates/repo/.fieldwork/expected-origin lib/systemd/fieldwork-agent@.service lib/systemd/fieldwork-dashboard.service lib/systemd/fieldwork-event-poll.service lib/systemd/fieldwork-event-poll.timer lib/systemd/fieldwork-task-dispatcher.service lib/systemd/fieldwork-bot.service lib/systemd/fieldwork-pr-prepare-runner.socket lib/systemd/fieldwork-pr-prepare-runner@.service lib/systemd/fieldwork-verify-runner.socket lib/systemd/fieldwork-verify-runner@.service examples/eval/docker-compose.yml examples/eval/Dockerfile examples/eval/eval-smoke.sh examples/eval/fake-gh examples/eval/fake-gitleaks examples/eval/gh examples/eval/gitleaks examples/eval/README.md"
+FIELDWORK_FINGERPRINT_FILES="bin/fieldwork install.sh AGENTS.md lib/cli/config.sh lib/cli/messaging.sh lib/cli/health.sh lib/cli/ssh-config.sh lib/cli/setup.sh lib/cli/onboard.sh lib/cli/quickstart.sh lib/cli/provision.sh lib/cli/verify-security.sh lib/cli/uninstall.sh lib/cli/developer-preview.sh lib/cli/task.sh lib/systemd/bootstrap-vps.sh lib/apparmor/fieldwork-bwrap lib/broker/install.sh lib/broker/standalone-install.sh lib/broker/fieldwork-pr-broker.service lib/broker/fieldwork-pr-broker.socket lib/broker/fieldwork-pr-approve.socket lib/broker/server.py schema/pr-request.schema.json schema/pr-prepare-request.schema.json lib/scripts/fieldwork-project.sh lib/scripts/fieldwork-status lib/scripts/fieldwork-status-snapshot lib/scripts/fieldwork-dashboard-server lib/scripts/fieldwork-pr-submit lib/scripts/fieldwork-clone lib/scripts/fieldwork-init lib/scripts/fieldwork-launch lib/scripts/fieldwork-agent-session lib/scripts/fieldwork-task-enqueue lib/scripts/fieldwork-task-run lib/scripts/fieldwork-task-dispatcher lib/scripts/fieldwork-event-poll lib/scripts/fieldwork-setup-probe lib/scripts/fieldwork-session-probe lib/scripts/fieldwork-codex-sandbox lib/scripts/fieldwork-bot lib/scripts/fieldwork-pr-prepare lib/scripts/fieldwork-pr-prepare-runner lib/scripts/fieldwork-pr-prepare-impl lib/agents/claude-remote-control lib/agents/aider lib/templates/repo/AGENTS.md lib/templates/repo/CLAUDE.md lib/templates/repo/.gitignore lib/templates/repo/.fieldwork/expected-origin lib/systemd/fieldwork-agent@.service lib/systemd/fieldwork-dashboard.service lib/systemd/fieldwork-event-poll.service lib/systemd/fieldwork-event-poll.timer lib/systemd/fieldwork-task-dispatcher.service lib/systemd/fieldwork-bot.service lib/systemd/fieldwork-pr-prepare-runner.socket lib/systemd/fieldwork-pr-prepare-runner@.service lib/systemd/fieldwork-verify-runner.socket lib/systemd/fieldwork-verify-runner@.service examples/eval/docker-compose.yml examples/eval/Dockerfile examples/eval/eval-smoke.sh examples/eval/fake-gh examples/eval/fake-gitleaks examples/eval/gh examples/eval/gitleaks examples/eval/README.md"
 FIELDWORK_UI_COLOR=0
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
   FIELDWORK_UI_COLOR=1
@@ -450,6 +450,10 @@ valid_slug() {
 
 valid_owner_repo() {
   local owner_repo="${1:-}"
+  if [ "${FIELDWORK_FORGE:-github}" = "gitlab" ]; then
+    fieldwork_project_valid "$owner_repo"
+    return $?
+  fi
   case "$owner_repo" in
     */*) ;;
     *) return 1 ;;
@@ -1572,9 +1576,6 @@ fieldwork_setup_snapshot_validate() {
     path_configured \
     bootstrap_ready \
     claude_login \
-    gh_cli \
-    gh_hosts \
-    gh_live \
     verify_runner \
     prepare_runner \
     claude_service \
@@ -1588,6 +1589,11 @@ fieldwork_setup_snapshot_validate() {
     projects_dir; do
     printf '%s\n' "$snapshot" | grep -Eq "^$key=" || return 1
   done
+  if [ "$FIELDWORK_FORGE" != "gitlab" ]; then
+    for key in gh_cli gh_hosts gh_live; do
+      printf '%s\n' "$snapshot" | grep -Eq "^$key=" || return 1
+    done
+  fi
 }
 
 fieldwork_setup_snapshot_set_probe_result() {
@@ -1635,9 +1641,6 @@ fieldwork_setup_snapshot_untrusted_reason() {
     path_configured \
     bootstrap_ready \
     claude_login \
-    gh_cli \
-    gh_hosts \
-    gh_live \
     verify_runner \
     prepare_runner \
     claude_service \
@@ -1654,6 +1657,14 @@ fieldwork_setup_snapshot_untrusted_reason() {
       return 0
     }
   done
+  if [ "$FIELDWORK_FORGE" != "gitlab" ]; then
+    for key in gh_cli gh_hosts gh_live; do
+      printf '%s\n' "$snapshot" | grep -Eq "^$key=" || {
+        printf 'partial\n'
+        return 0
+      }
+    done
+  fi
   printf 'malformed\n'
 }
 
@@ -1677,7 +1688,7 @@ fieldwork_setup_remote_probe() {
   fieldwork_timing_since "probe temp files" "$timing_start"
 
   probe_mode="${FIELDWORK_SETUP_PROBE_MODE:-normal}"
-  remote_command="FIELDWORK_SETUP_TIMING=$(shell_quote "${FIELDWORK_SETUP_TIMING:-0}") FIELDWORK_SETUP_AGENTS=$(shell_quote "${FIELDWORK_SETUP_AGENTS:-claude}") FIELDWORK_EXPECTED_FINGERPRINT_HASH=$(shell_quote "$expected_hash") FIELDWORK_FINGERPRINT_FILES=$(shell_quote "$FIELDWORK_FINGERPRINT_FILES") FIELDWORK_PROJECTS_DIR=$(shell_quote "$FIELDWORK_PROJECTS_DIR") FIELDWORK_REMOTE_USER=$(shell_quote "$FIELDWORK_REMOTE_USER") \"\$HOME/.local/bin/fieldwork-setup-probe\""
+  remote_command="FIELDWORK_SETUP_TIMING=$(shell_quote "${FIELDWORK_SETUP_TIMING:-0}") FIELDWORK_SETUP_AGENTS=$(shell_quote "${FIELDWORK_SETUP_AGENTS:-claude}") FIELDWORK_EXPECTED_FINGERPRINT_HASH=$(shell_quote "$expected_hash") FIELDWORK_FINGERPRINT_FILES=$(shell_quote "$FIELDWORK_FINGERPRINT_FILES") FIELDWORK_PROJECTS_DIR=$(shell_quote "$FIELDWORK_PROJECTS_DIR") FIELDWORK_REMOTE_USER=$(shell_quote "$FIELDWORK_REMOTE_USER") FIELDWORK_FORGE=$(shell_quote "$FIELDWORK_FORGE") \"\$HOME/.local/bin/fieldwork-setup-probe\""
   timing_start="$(fieldwork_timing_start)"
   case "$probe_mode" in
     mux)
@@ -1821,7 +1832,7 @@ fingerprint_current() {
 
 bootstrap_ready() {
   export PATH="$HOME/.local/bin:$PATH"
-  command -v gh >/dev/null 2>&1 &&
+  { [ "${FIELDWORK_FORGE:-github}" = "gitlab" ] || command -v gh >/dev/null 2>&1; } &&
     test -d "$FIELDWORK_PROJECTS_DIR" &&
     test -f "$HOME/.config/systemd/user/fieldwork-verify-runner.socket" &&
     test -f "$HOME/.config/systemd/user/fieldwork-pr-prepare-runner.socket" || return 1
@@ -1952,11 +1963,17 @@ status_for claude_cli command -v claude
 status_for codex_cli codex_cli_ready
 status_for codex_login test -f "$HOME/.fieldwork/state/codex-login-confirmed"
 agents_probe
-status_for gh_cli command -v gh
-status_for gh_hosts test -s "$HOME/.config/gh/hosts.yml"
-gh_live_start="$(timing_now)"
-gh_live_status
-timing_emit timing_remote_gh_auth_status "$gh_live_start"
+if [ "${FIELDWORK_FORGE:-github}" = "gitlab" ]; then
+  emit gh_cli skipped
+  emit gh_hosts skipped
+  emit gh_live skipped
+else
+  status_for gh_cli command -v gh
+  status_for gh_hosts test -s "$HOME/.config/gh/hosts.yml"
+  gh_live_start="$(timing_now)"
+  gh_live_status
+  timing_emit timing_remote_gh_auth_status "$gh_live_start"
+fi
 status_for verify_runner verify_runner_ready
 status_for prepare_runner test -f "$HOME/.config/systemd/user/fieldwork-pr-prepare-runner.socket"
 status_for claude_service test -f "$HOME/.config/systemd/user/fieldwork-agent@.service"
@@ -1978,7 +1995,7 @@ REMOTE_EOF
   fieldwork_timing_since "probe script materialization" "$timing_start"
   timing_start="$(fieldwork_timing_start)"
   ssh "$FIELDWORK_SSH_HOST" \
-    "FIELDWORK_SETUP_TIMING=$(shell_quote "${FIELDWORK_SETUP_TIMING:-0}") FIELDWORK_SETUP_AGENTS=$(shell_quote "${FIELDWORK_SETUP_AGENTS:-claude}") FIELDWORK_EXPECTED_FINGERPRINT_HASH=$(shell_quote "$expected_hash") FIELDWORK_FINGERPRINT_FILES=$(shell_quote "$FIELDWORK_FINGERPRINT_FILES") FIELDWORK_PROJECTS_DIR=$(shell_quote "$FIELDWORK_PROJECTS_DIR") FIELDWORK_REMOTE_USER=$(shell_quote "$FIELDWORK_REMOTE_USER") bash -s" \
+    "FIELDWORK_SETUP_TIMING=$(shell_quote "${FIELDWORK_SETUP_TIMING:-0}") FIELDWORK_SETUP_AGENTS=$(shell_quote "${FIELDWORK_SETUP_AGENTS:-claude}") FIELDWORK_EXPECTED_FINGERPRINT_HASH=$(shell_quote "$expected_hash") FIELDWORK_FINGERPRINT_FILES=$(shell_quote "$FIELDWORK_FINGERPRINT_FILES") FIELDWORK_PROJECTS_DIR=$(shell_quote "$FIELDWORK_PROJECTS_DIR") FIELDWORK_REMOTE_USER=$(shell_quote "$FIELDWORK_REMOTE_USER") FIELDWORK_FORGE=$(shell_quote "$FIELDWORK_FORGE") bash -s" \
     <"$script_file" >"$out_file" 2>"$err_file" &
   probe_pid=$!
   ( sleep "$timeout"; touch "$timeout_file"; kill "$probe_pid" 2>/dev/null || true ) &
@@ -2794,7 +2811,9 @@ EOF
             ;;
         esac
       fi
-      if [ "$remote_gh" = "1" ]; then
+      if [ "$FIELDWORK_FORGE" = "gitlab" ]; then
+        doctor_row skipped "GitHub CLI login" "GitLab forge configured"
+      elif [ "$remote_gh" = "1" ]; then
         ssh "$FIELDWORK_SSH_HOST" "export PATH=\"\$HOME/.local/bin:\$PATH\"; gh auth status >/dev/null 2>&1" \
           && doctor_ok "GitHub CLI authenticated" \
           || doctor_manual "GitHub CLI login needed" "ssh -t $FIELDWORK_SSH_HOST 'gh auth login --hostname github.com --git-protocol ssh --web --skip-ssh-key'" "gh is installed but not logged in on the VPS" "onboarding needs gh auth for repo-resolution preflights before the broker opens PRs" "run ssh -t $FIELDWORK_SSH_HOST 'gh auth login --hostname github.com --git-protocol ssh --web --skip-ssh-key'" "yes"
@@ -4749,8 +4768,13 @@ EOF
     local projects_dir_q
     projects_dir_q="$(shell_quote "$FIELDWORK_PROJECTS_DIR")"
     remote_check "remote Claude Code CLI installed" "export PATH=\"\$HOME/.local/bin:\$PATH\"; command -v claude >/dev/null 2>&1" || true
-    remote_check "remote GitHub CLI installed" "export PATH=\"\$HOME/.local/bin:\$PATH\"; command -v gh >/dev/null 2>&1" || true
-    remote_check "remote GitHub CLI authenticated" "export PATH=\"\$HOME/.local/bin:\$PATH\"; gh auth status >/dev/null 2>&1" || true
+    if [ "$FIELDWORK_FORGE" = "gitlab" ]; then
+      report_row "skipped" "remote GitHub CLI installed"
+      report_row "skipped" "remote GitHub CLI authenticated"
+    else
+      remote_check "remote GitHub CLI installed" "export PATH=\"\$HOME/.local/bin:\$PATH\"; command -v gh >/dev/null 2>&1" || true
+      remote_check "remote GitHub CLI authenticated" "export PATH=\"\$HOME/.local/bin:\$PATH\"; gh auth status >/dev/null 2>&1" || true
+    fi
     remote_check "remote projects dir exists" "test -d $projects_dir_q" || true
     remote_check "remote notification config present" "test -s ~/.fieldwork/notify.env" || true
     remote_check "remote Claude session systemd unit installed" "test -f ~/.config/systemd/user/fieldwork-agent@.service" || true
@@ -4816,7 +4840,8 @@ usage: fieldwork smoke <owner/repo> [--yes]
 
 Creates a tiny smoke-test branch and PR through the Fieldwork broker from an
 already-onboarded VPS checkout. This does not use Claude; it proves the broker
-socket, PAT, push, and GitHub PR path.
+socket, PAT, push, and GitHub PR path. GitLab uses the documented live E2E
+checklist instead of fieldwork smoke.
 EOF
         return 0
         ;;
@@ -4828,6 +4853,11 @@ EOF
         ;;
     esac
   done
+
+  if [ "$FIELDWORK_FORGE" = "gitlab" ]; then
+    echo "fieldwork smoke is GitHub-only. For GitLab, use the documented throwaway-project E2E checklist." >&2
+    return 2
+  fi
 
   [ -n "$owner_repo" ] || { echo "usage: fieldwork smoke <owner/repo> [--yes]" >&2; return 2; }
   valid_owner_repo "$owner_repo" || { echo "invalid GitHub owner/repo: $owner_repo" >&2; return 2; }

@@ -27,6 +27,9 @@ fake GitHub behavior, and prints a human-readable broker-flow summary. Use
 `fieldwork eval smoke --json` for the structured smoke result or
 `fieldwork eval smoke --verbose` for the event timeline.
 
+The Docker evaluation path remains GitHub-shaped. It does not exercise GitLab
+host pinning, GitLab token liveness, or GitLab MR creation.
+
 For production use, follow the VPS setup path. Production Fieldwork relies on
-separate Unix users, systemd sockets, the broker-owned GitHub token, and real
+separate Unix users, systemd sockets, the broker-owned forge token, and real
 repository checkouts.

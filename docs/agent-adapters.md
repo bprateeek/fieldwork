@@ -12,6 +12,11 @@ adapter. If you just want to use the broker from your own agent code without
 integrating with the rest of Fieldwork, see the advanced broker-only operator guide:
 [`broker-standalone.md`](broker-standalone.md).
 
+Fieldwork uses "PR" as the product-level term across forges in this milestone.
+On GitLab, the broker opens a merge request, but internal events and
+notifications may still say `pr_opened` or "PR". Forge-specific "MR" wording is
+future polish.
+
 ## Codex Is Not An Adapter In This Milestone
 
 Codex support uses the official Codex Desktop + SSH model. The Desktop app
@@ -65,7 +70,7 @@ Your adapter must:
    The branch prefix is exported by `fieldwork-agent-session` and the broker
    enforces the same prefix on every PR request. Anything else is rejected.
 
-3. **Never receive the GitHub write token.** PRs go through the broker
+3. **Never receive the forge write token.** PRs/MRs go through the broker
    (`lib/scripts/fieldwork-pr-submit`, or your agent's own equivalent that
    POSTs to the broker socket). In the default install, the broker submit
    socket is writable by the agent user's primary group so it survives sandbox
@@ -85,7 +90,9 @@ Your adapter must:
 
 The adapter receives exactly two positional arguments (`<slug>`, `<repo-dir>`)
 and inherits the agent user's environment plus `FIELDWORK_*` variables set by
-the session wrapper. There is no other implicit input.
+the session wrapper. `fieldwork-agent-session` reads
+`~/projects/<slug>/.fieldwork/profile` and exports `FIELDWORK_PROFILE`
+(default `default`) for lifecycle attribution. There is no other implicit input.
 
 `fieldwork-agent-session` also reads non-secret capacity config from
 `~/.fieldwork/agent.conf`:
@@ -97,6 +104,15 @@ capacity=3
 The value is parsed as plain `key=value`, never sourced as shell, defaults to
 `2`, and is clamped to `1..4`. The validated value is exported to adapters as
 `FIELDWORK_AGENT_CAPACITY`.
+
+## Managed/Teams Seams
+
+The current teams-related fields are advisory only. Task and lifecycle
+notifications can carry `profile`, and CLI/bot tasks can carry `actor`, but
+these values do not gate privilege. Not implemented: broker per-user
+authenticated audit, isolation between users, RBAC, quotas, billing, or a
+managed control plane. Daemon agent lifecycle events carry `profile` but omit
+`actor` because the daemon hook has no authenticated per-action actor.
 
 ## Process models
 
@@ -229,6 +245,6 @@ binary, not the adapter shim.
   adapter setting.
 - **Headless adapter.** Implemented as the `one_shot_job` process model (Aider);
   see the Aider section above.
-- **Forge adapters beyond GitHub.** The broker speaks `gh` today; a GitLab or
-  Gitea broker would be a fork of `lib/broker/server.py` with the same trust
-  model, not an agent adapter.
+- **Additional forge adapters.** GitHub and core GitLab are broker backends,
+  not agent adapters. Gitea and deeper GitLab parity are future broker work
+  with the same agent trust model.

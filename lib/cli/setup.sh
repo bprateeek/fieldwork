@@ -1295,7 +1295,7 @@ EOF
     fi
     projects_dir_q="$(shell_quote "$FIELDWORK_PROJECTS_DIR")"
     agents_q="$(shell_quote "$setup_agents")"
-    ssh "$FIELDWORK_SSH_HOST" "agents=$agents_q; export PATH=\"\$HOME/.local/bin:\$PATH\"; command -v gh >/dev/null 2>&1 && test -d $projects_dir_q && test -f ~/.config/systemd/user/fieldwork-verify-runner.socket && test -f ~/.config/systemd/user/fieldwork-pr-prepare-runner.socket && case \"\$agents\" in claude|both) command -v claude >/dev/null 2>&1 && test -f ~/.config/systemd/user/fieldwork-agent@.service ;; *) true ;; esac" >/dev/null 2>&1
+    ssh "$FIELDWORK_SSH_HOST" "agents=$agents_q; forge=$(shell_quote "$FIELDWORK_FORGE"); export PATH=\"\$HOME/.local/bin:\$PATH\"; { [ \"\$forge\" = gitlab ] || command -v gh >/dev/null 2>&1; } && test -d $projects_dir_q && test -f ~/.config/systemd/user/fieldwork-verify-runner.socket && test -f ~/.config/systemd/user/fieldwork-pr-prepare-runner.socket && case \"\$agents\" in claude|both) command -v claude >/dev/null 2>&1 && test -f ~/.config/systemd/user/fieldwork-agent@.service ;; *) true ;; esac" >/dev/null 2>&1
   }
   run_remote_bootstrap() {
     local agents_q
@@ -1443,14 +1443,35 @@ EOF
   }
   store_broker_pat() {
     local probe_repo="${1:-}"
-    local password_line token_line remote_cmd sudo_prefix
+    local password_line token_line remote_cmd sudo_prefix remote_ca_env
     sudo_prefix="$(remote_sudo_prefix)"
+    upload_gitlab_ca_bundle || return 1
+    remote_ca_env=""
+    if [ "$FIELDWORK_FORGE" = "gitlab" ] && [ -n "${FIELDWORK_GITLAB_CA_BUNDLE_LOCAL:-}" ]; then
+      remote_ca_env="FIELDWORK_GITLAB_CA_BUNDLE=/etc/fieldwork/gitlab-ca.pem "
+    fi
     password_line="  If sudo asks for a password, enter the VPS Linux password for '$FIELDWORK_REMOTE_USER'."
-    token_line="  After sudo succeeds, rotate-pat will ask for the GitHub PAT with hidden input."
-    remote_cmd="printf '%s\n' '' 'VPS sudo authentication' $(shell_quote "$password_line") '  This is not your Claude account password and not the GitHub PAT.' '' 'Broker token paste' $(shell_quote "$token_line") ''; $sudo_prefix env FIELDWORK_ROTATE_PAT_TTY=1 FIELDWORK_PAT_PROBE_REPO=$(shell_quote "$probe_repo") FIELDWORK_FORGE=$(shell_quote "$FIELDWORK_FORGE") /usr/local/sbin/rotate-pat"
+    if [ "$FIELDWORK_FORGE" = "gitlab" ]; then
+      token_line="  After sudo succeeds, rotate-pat will ask for the GitLab token with hidden input."
+    else
+      token_line="  After sudo succeeds, rotate-pat will ask for the GitHub PAT with hidden input."
+    fi
+    remote_cmd="printf '%s\n' '' 'VPS sudo authentication' $(shell_quote "$password_line") '  This is not your Claude account password and not the forge token.' '' 'Broker token paste' $(shell_quote "$token_line") ''; $sudo_prefix env FIELDWORK_ROTATE_PAT_TTY=1 FIELDWORK_PAT_PROBE_REPO=$(shell_quote "$probe_repo") FIELDWORK_FORGE=$(shell_quote "$FIELDWORK_FORGE") FIELDWORK_GITLAB_API=$(shell_quote "$FIELDWORK_GITLAB_API") ${remote_ca_env}/usr/local/sbin/rotate-pat"
     ssh -t "$FIELDWORK_SSH_HOST" "$remote_cmd" || return 1
     fieldwork_setup_snapshot_mark_dirty
     mark_broker_pat_confirmed
+  }
+
+  upload_gitlab_ca_bundle() {
+    [ "$FIELDWORK_FORGE" = "gitlab" ] || return 0
+    [ -n "${FIELDWORK_GITLAB_CA_BUNDLE_LOCAL:-}" ] || return 0
+    [ -r "$FIELDWORK_GITLAB_CA_BUNDLE_LOCAL" ] || {
+      echo "[fieldwork setup] GitLab CA bundle is not readable: $FIELDWORK_GITLAB_CA_BUNDLE_LOCAL" >&2
+      return 1
+    }
+    local remote_tmp="/tmp/fieldwork-gitlab-ca-$$.pem"
+    scp -q "$FIELDWORK_GITLAB_CA_BUNDLE_LOCAL" "$FIELDWORK_SSH_HOST:$remote_tmp" || return 1
+    ssh "$FIELDWORK_SSH_HOST" "$(remote_sudo_command "install -d -o root -g root -m 755 /etc/fieldwork && install -o root -g root -m 644 $remote_tmp /etc/fieldwork/gitlab-ca.pem && rm -f $remote_tmp")"
   }
   prompt_yes_no_help() {
     local prompt="$1"
@@ -1551,14 +1572,20 @@ EOF
   }
   wait_for_broker_pat_ready() {
     if [ "$yes" = "1" ]; then
-      echo "  Skipping broker PAT handoff because --yes was supplied."
+      echo "  Skipping broker token handoff because --yes was supplied."
       return 1
     fi
     label_line "Before continuing, confirm the token has"
-    info_bullet "Selected repositories Fieldwork should manage"
-    info_bullet "Contents: Read and write"
-    info_bullet "Pull requests: Read and write"
-    info_bullet "Workflows: Read and write, unless using 'fieldwork onboard --no-workflows'"
+    if [ "$FIELDWORK_FORGE" = "gitlab" ]; then
+      info_bullet "Project access to the GitLab project Fieldwork should manage"
+      info_bullet "Role: Developer"
+      info_bullet "Scopes: api and write_repository"
+    else
+      info_bullet "Selected repositories Fieldwork should manage"
+      info_bullet "Contents: Read and write"
+      info_bullet "Pull requests: Read and write"
+      info_bullet "Workflows: Read and write, unless using 'fieldwork onboard --no-workflows'"
+    fi
     info_bullet "Token string created and copied"
     echo
     printf "[fieldwork setup] Type 'ready' to continue, or 'skip' to do this later: "
@@ -1623,6 +1650,27 @@ EOF
   }
   broker_pat_guided_flow() {
     local socket_state="$1"
+    if [ "$FIELDWORK_FORGE" = "gitlab" ]; then
+      info_heading "Broker GitLab token"
+      label_line "The broker needs a GitLab token to"
+      info_bullet "push setup branches"
+      info_bullet "open merge requests through the Fieldwork PR path"
+      echo
+      label_line "Required token"
+      info_bullet "Project Access Token recommended"
+      info_bullet "Role: Developer"
+      info_bullet "Scopes: api and write_repository"
+      info_bullet "For self-managed GitLab, set gitlab_api / FIELDWORK_GITLAB_API"
+      [ -z "${FIELDWORK_GITLAB_CA_BUNDLE_LOCAL:-}" ] || info_bullet "CA bundle will be uploaded to /etc/fieldwork/gitlab-ca.pem"
+      print_broker_token_progress "$socket_state"
+      wait_for_broker_pat_ready || return 1
+      print_broker_secure_handoff
+      prompt_yes_no_help "[fieldwork setup] Start broker token handoff?" || return 1
+      [ "$BROKER_PROMPT_REPLY" = "y" ] || return 1
+      print_handoff_block
+      store_broker_pat ""
+      return $?
+    fi
     info_heading "Broker GitHub token"
     label_line "The broker needs a GitHub token to"
     info_bullet "push setup branches"
@@ -2070,13 +2118,24 @@ EOF
 
   fieldwork_timing_since "prepare server" "$prepare_stage_start"
   finish_setup_phase continue
-  stage_banner 3 "Connect GitHub"
+  if [ "$FIELDWORK_FORGE" = "gitlab" ]; then
+    stage_banner 3 "Connect GitLab"
+  else
+    stage_banner 3 "Connect GitHub"
+  fi
   github_stage_start="$(fieldwork_timing_start)"
-  current_phase="Connect GitHub"
+  current_phase="Connect $FIELDWORK_FORGE"
   current_phase_pending_count=0
   current_phase_pending_labels=()
 
-  if progress_wait "checking GitHub CLI authentication" github_authenticated; then
+  if [ "$FIELDWORK_FORGE" = "gitlab" ]; then
+    setup_row ok "GitHub CLI authentication skipped for GitLab"
+    if [ "$FIELDWORK_GITLAB_API" = "https://gitlab.com/api/v4" ]; then
+      setup_status_line info "GitLab API: gitlab.com"
+    else
+      setup_status_line info "GitLab API: $FIELDWORK_GITLAB_API"
+    fi
+  elif progress_wait "checking GitHub CLI authentication" github_authenticated; then
     setup_row ok "GitHub CLI authenticated"
     if [ "${FIELDWORK_SETUP_GH_AUTH_TIMEOUT_HINT:-0}" = "1" ]; then
       setup_status_line info "GitHub auth live check timed out; using saved gh config for setup"
@@ -2118,18 +2177,18 @@ EOF
 
   if [ "$setup_hard_blocked" = "1" ]; then
     setup_block_and_exit
-    fieldwork_timing_since "connect github" "$github_stage_start"
+    fieldwork_timing_since "connect $FIELDWORK_FORGE" "$github_stage_start"
     setup_timing_total
     return "$setup_status"
   fi
 
-  if progress_wait "checking broker GitHub PAT" broker_pat_stored; then
+  if progress_wait "checking broker ${FIELDWORK_FORGE} token" broker_pat_stored; then
     setup_status_line ok "Broker token stored"
   else
     setup_status_line manual "Broker token required in step 4"
   fi
 
-  fieldwork_timing_since "connect github" "$github_stage_start"
+  fieldwork_timing_since "connect $FIELDWORK_FORGE" "$github_stage_start"
   finish_setup_phase continue
   stage_banner 4 "Install PR services"
   services_stage_start="$(fieldwork_timing_start)"

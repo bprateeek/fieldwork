@@ -23,6 +23,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/scripts/fieldwork-status
 source "$SCRIPT_DIR/fieldwork-status"
+# shellcheck source=lib/scripts/fieldwork-project.sh
+source "$SCRIPT_DIR/fieldwork-project.sh"
 trap 'fieldwork_status_cleanup' EXIT
 
 # Ensure ~/.local/bin is on PATH for non-interactive ssh shells (matches fieldwork-init).
@@ -35,6 +37,7 @@ section() {
 }
 
 MODE="standalone"
+SLUG_OVERRIDE=""
 case "${1:-}" in
   --prepare-deploy-key)
     MODE="prepare"
@@ -50,32 +53,61 @@ case "${1:-}" in
     ;;
 esac
 
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --slug)
+      SLUG_OVERRIDE="${2:?--slug requires a repo slug}"
+      shift 2
+      ;;
+    --slug=*)
+      SLUG_OVERRIDE="${1#--slug=}"
+      shift
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
 OWNER_REPO="${1:-}"
-[ -n "$OWNER_REPO" ] || { echo "usage: $0 <owner>/<repo>" >&2; exit 2; }
-case "$OWNER_REPO" in
-  */*) ;;
-  *) echo "expected <owner>/<repo>, got: $OWNER_REPO" >&2; exit 2;;
-esac
+[ -n "$OWNER_REPO" ] || { echo "usage: $0 [--slug <slug>] <project>" >&2; exit 2; }
+FORGE="${FIELDWORK_FORGE:-github}"
+case "$FORGE" in github|"") FORGE="github" ;; gitlab) ;; *) echo "[fieldwork-clone] FAIL: unsupported forge '$FORGE'" >&2; exit 2 ;; esac
+if [ "$FORGE" = "github" ]; then
+  case "$OWNER_REPO" in */*) ;; *) echo "expected <owner>/<repo>, got: $OWNER_REPO" >&2; exit 2;; esac
+  OWNER="${OWNER_REPO%%/*}"
+  REPO_NAME="${OWNER_REPO#*/}"
+  [[ "$OWNER" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,37}[a-zA-Z0-9])?$ ]] || {
+    echo "[fieldwork-clone] FAIL: owner '$OWNER' is not a valid GitHub user/org name" >&2
+    exit 2
+  }
+  [[ "$OWNER" != *--* ]] || {
+    echo "[fieldwork-clone] FAIL: owner '$OWNER' contains consecutive hyphens" >&2
+    exit 2
+  }
+  [[ "$REPO_NAME" =~ ^[a-zA-Z0-9._-]{1,100}$ ]] || {
+    echo "[fieldwork-clone] FAIL: repo name '$REPO_NAME' contains characters outside [A-Za-z0-9._-] or is too long" >&2
+    exit 2
+  }
+else
+  fieldwork_project_valid "$OWNER_REPO" || {
+    echo "[fieldwork-clone] FAIL: project '$OWNER_REPO' must look like group/project and use [A-Za-z0-9._-] segments" >&2
+    exit 2
+  }
+  REPO_NAME="$(fieldwork_project_leaf "$OWNER_REPO")"
+fi
 
-OWNER="${OWNER_REPO%%/*}"
-REPO_NAME="${OWNER_REPO#*/}"
-[[ "$OWNER" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,37}[a-zA-Z0-9])?$ ]] || {
-  echo "[fieldwork-clone] FAIL: owner '$OWNER' is not a valid GitHub user/org name" >&2
-  exit 2
-}
-[[ "$OWNER" != *--* ]] || {
-  echo "[fieldwork-clone] FAIL: owner '$OWNER' contains consecutive hyphens" >&2
-  exit 2
-}
-[[ "$REPO_NAME" =~ ^[a-zA-Z0-9._-]{1,100}$ ]] || {
-  echo "[fieldwork-clone] FAIL: repo name '$REPO_NAME' contains characters outside [A-Za-z0-9._-] or is too long" >&2
-  exit 2
-}
-
-SLUG="$REPO_NAME"
+if [ -n "$SLUG_OVERRIDE" ]; then
+  SLUG="$SLUG_OVERRIDE"
+else
+  SLUG="$(fieldwork_slug_from_project "$OWNER_REPO")" || {
+    echo "[fieldwork-clone] FAIL: could not derive a valid Fieldwork slug from '$OWNER_REPO'; pass --slug" >&2
+    exit 2
+  }
+fi
 
 # slug must match broker server.py REPO_PATH_RE (^[a-z0-9][a-z0-9-]{0,30}$)
-[[ "$SLUG" =~ ^[a-z0-9][a-z0-9-]{0,30}$ ]] || {
+fieldwork_slug_valid "$SLUG" || {
   echo "slug '$SLUG' fails ^[a-z0-9][a-z0-9-]{0,30}\$ — broker will reject" >&2
   exit 2
 }
@@ -83,9 +115,16 @@ SLUG="$REPO_NAME"
 PROJECTS_DIR="$HOME/projects"
 DEST="$PROJECTS_DIR/$SLUG"
 KEY="$HOME/.ssh/id_ed25519_$SLUG"
-HOST_ALIAS="github-$SLUG"
+HOST_ALIAS="$FORGE-$SLUG"
 CONFIG="$HOME/.ssh/config"
 BROKER_USER="${FIELDWORK_BROKER_USER:-fieldwork-pr-broker}"
+if [ "$FORGE" = "gitlab" ]; then
+  FORGE_HOST="$(fieldwork_gitlab_api_bare_host)" || { echo "[fieldwork-clone] FAIL: FIELDWORK_GITLAB_API must be https://host/api/v4" >&2; exit 2; }
+  EXPECTED_ORIGIN="https://$(fieldwork_gitlab_api_host)/$OWNER_REPO.git"
+else
+  FORGE_HOST="github.com"
+  EXPECTED_ORIGIN="https://github.com/$OWNER_REPO.git"
+fi
 
 prepare_deploy_key() {
   local verbose="${1:-0}"
@@ -106,13 +145,13 @@ prepare_deploy_key() {
   if ! grep -q "^Host $HOST_ALIAS\b" "$CONFIG"; then
     cat >> "$CONFIG" <<EOC
 
-# BEGIN FIELDWORK GITHUB SSH CONFIG: $HOST_ALIAS
+# BEGIN FIELDWORK SSH CONFIG: $HOST_ALIAS
 Host $HOST_ALIAS
-  HostName github.com
+  HostName $FORGE_HOST
   User git
   IdentityFile $KEY
   IdentitiesOnly yes
-# END FIELDWORK GITHUB SSH CONFIG: $HOST_ALIAS
+# END FIELDWORK SSH CONFIG: $HOST_ALIAS
 EOC
     [ "$verbose" = "1" ] && say "added SSH host alias $HOST_ALIAS"
   else
@@ -136,10 +175,20 @@ grant_broker_read_access() {
 
 clone_after_deploy_key() {
   local verbose="${1:-0}" log
-  [ ! -e "$DEST" ] || { echo "[fieldwork-clone] $DEST already exists — refusing to overwrite" >&2; exit 1; }
+  if [ -e "$DEST" ]; then
+    local existing_origin=""
+    existing_origin="$(cat "$DEST/.fieldwork/expected-origin" 2>/dev/null || true)"
+    if [ -z "$existing_origin" ] || printf '%s' "$existing_origin" | grep -q 'OWNER/REPO' || [ "$existing_origin" != "$EXPECTED_ORIGIN" ]; then
+      echo "[fieldwork-clone] $DEST already exists and is not clearly this project." >&2
+      echo "Remove $DEST and re-onboard, or pass --slug to use a different checkout slug." >&2
+      exit 1
+    fi
+    echo "[fieldwork-clone] $DEST already exists — refusing to overwrite" >&2
+    exit 1
+  fi
 
   prepare_deploy_key 0
-  ssh-keygen -F github.com >/dev/null 2>&1 || ssh-keyscan -t ed25519 github.com >> "$HOME/.ssh/known_hosts" 2>/dev/null
+  ssh-keygen -F "$FORGE_HOST" >/dev/null 2>&1 || ssh-keyscan -t ed25519 "$FORGE_HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null
 
   log="$(mktemp)"
   fieldwork_status_start "checking deploy-key access"
@@ -172,7 +221,7 @@ clone_after_deploy_key() {
 
   # Tell gh which repo this clone represents — the deploy-key alias URL hides the
   # real github.com host so gh's auto-detection fails without this hint.
-  (cd "$DEST" && gh repo set-default "$OWNER_REPO" >/dev/null 2>&1) || {
+  [ "$FORGE" != "github" ] || (cd "$DEST" && gh repo set-default "$OWNER_REPO" >/dev/null 2>&1) || {
     [ "$verbose" = "1" ] && say "note: 'gh repo set-default $OWNER_REPO' failed; pass '--repo $OWNER_REPO' to fieldwork-init"
   }
   return 0
@@ -191,9 +240,17 @@ case "$MODE" in
     section "Deploy key"
     prepare_deploy_key 1
 
-    section "GitHub deploy key"
+    if [ "$FORGE" = "gitlab" ]; then
+      section "GitLab deploy key"
+    else
+      section "GitHub deploy key"
+    fi
     echo "  Purpose: give the VPS read-only clone access without giving the agent a write token."
-    echo "  GitHub path: $OWNER_REPO -> Settings -> Deploy keys -> Add deploy key"
+    if [ "$FORGE" = "gitlab" ]; then
+      echo "  GitLab path: https://$(fieldwork_gitlab_api_host)/$OWNER_REPO -> Settings -> Repository -> Deploy keys"
+    else
+      echo "  GitHub path: $OWNER_REPO -> Settings -> Deploy keys -> Add deploy key"
+    fi
     echo "  Important: leave Allow write access unchecked."
     echo
     echo "Public key:"

@@ -9,7 +9,18 @@ remote_user = "fieldwork"
 projects_dir = "/home/fieldwork/projects"
 default_branch = "main"
 notify_provider = "ntfy"
-# forge = "github"   # only GitHub is supported today
+forge = "github"   # github (default) or gitlab
+
+# GitLab profile example. Self-managed GitLab must set gitlab_api; the host is
+# the broker's security pin and must be exactly https://host/api/v4.
+# GitLab commit identity is explicit because the agent has no GitLab API token.
+#
+# [profile.gitlab]
+# forge = "gitlab"
+# gitlab_api = "https://gitlab.com/api/v4"
+# gitlab_ca_bundle = "/path/on/this/workstation/gitlab-ca.pem"
+# commit_name = "Fieldwork Bot"
+# commit_email = "fieldwork-bot@example.com"
 
 # Optional: define additional named profiles and select one. A profile's keys
 # override the top-level defaults above. Select with `default_profile` here or

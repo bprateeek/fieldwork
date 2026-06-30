@@ -29,6 +29,13 @@ repo_dir="$HOME/projects/$slug"
   exit 1
 }
 
+profile="default"
+if [ -f "$repo_dir/.fieldwork/profile" ]; then
+  profile="$(head -1 "$repo_dir/.fieldwork/profile" 2>/dev/null | tr -d '[:space:]' || true)"
+  [ -n "$profile" ] || profile="default"
+fi
+export FIELDWORK_PROFILE="$profile"
+
 # Branch prefix the agent commits under; the broker enforces the same prefix.
 export FIELDWORK_BRANCH_PREFIX="${FIELDWORK_BRANCH_PREFIX:-fieldwork}"
 

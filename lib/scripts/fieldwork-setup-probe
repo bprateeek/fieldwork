@@ -8,6 +8,7 @@ FIELDWORK_EXPECTED_FINGERPRINT_HASH="${FIELDWORK_EXPECTED_FINGERPRINT_HASH:-}"
 FIELDWORK_FINGERPRINT_FILES="${FIELDWORK_FINGERPRINT_FILES:-}"
 FIELDWORK_PROJECTS_DIR="${FIELDWORK_PROJECTS_DIR:-$HOME/projects}"
 FIELDWORK_REMOTE_USER="${FIELDWORK_REMOTE_USER:-fieldwork}"
+FIELDWORK_FORGE="${FIELDWORK_FORGE:-github}"
 
 emit() {
   local key="$1"
@@ -83,7 +84,7 @@ fingerprint_current() {
 
 bootstrap_ready() {
   export PATH="$HOME/.local/bin:$PATH"
-  command -v gh >/dev/null 2>&1 &&
+  { [ "$FIELDWORK_FORGE" = "gitlab" ] || command -v gh >/dev/null 2>&1; } &&
     test -d "$FIELDWORK_PROJECTS_DIR" &&
     test -f "$HOME/.config/systemd/user/fieldwork-verify-runner.socket" &&
     test -f "$HOME/.config/systemd/user/fieldwork-pr-prepare-runner.socket" || return 1
@@ -214,11 +215,17 @@ status_for claude_cli command -v claude
 status_for codex_cli codex_cli_ready
 status_for codex_login test -f "$HOME/.fieldwork/state/codex-login-confirmed"
 agents_probe
-status_for gh_cli command -v gh
-status_for gh_hosts test -s "$HOME/.config/gh/hosts.yml"
-gh_live_start="$(timing_now)"
-gh_live_status
-timing_emit timing_remote_gh_auth_status "$gh_live_start"
+if [ "$FIELDWORK_FORGE" = "gitlab" ]; then
+  emit gh_cli skipped
+  emit gh_hosts skipped
+  emit gh_live skipped
+else
+  status_for gh_cli command -v gh
+  status_for gh_hosts test -s "$HOME/.config/gh/hosts.yml"
+  gh_live_start="$(timing_now)"
+  gh_live_status
+  timing_emit timing_remote_gh_auth_status "$gh_live_start"
+fi
 status_for verify_runner verify_runner_ready
 status_for prepare_runner test -f "$HOME/.config/systemd/user/fieldwork-pr-prepare-runner.socket"
 status_for claude_service test -f "$HOME/.config/systemd/user/fieldwork-agent@.service"

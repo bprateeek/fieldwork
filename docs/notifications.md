@@ -123,12 +123,12 @@ Install the bot once per VPS:
 fieldwork setup-notify --telegram-bot
 ```
 
-You need a Telegram bot token from BotFather and at least one allowlisted chat ID. The bot runs as the `fieldwork-bot` user, holds the Telegram token and HMAC secret, and can only reach the broker approve socket. It never holds the GitHub PAT.
+You need a Telegram bot token from BotFather and at least one allowlisted chat ID. The bot runs as the `fieldwork-bot` user, holds the Telegram token and HMAC secret, and can only reach the broker approve socket. It never holds the forge write token.
 
 Enable the gate per repo at onboarding time:
 
 ```sh
-fieldwork onboard <owner>/<repo> --with-approval-gate
+fieldwork onboard <project> --with-approval-gate
 ```
 
 For the full approval flow, trust model, HMAC callbacks, health checks, and recovery, see [approval-gate.md](approval-gate.md).
