@@ -9,8 +9,15 @@
 - Backup, restore, and upgrade guidance.
 - Adapter diagnostics for the Claude reference adapter.
 - Codex App + SSH developer-preview support.
+
+## Delivered For v0.2.0
+
 - Core GitLab forge support: broker preflight, host-pinned push/MR creation,
   nested project paths, onboarding, token rotation, and setup wiring.
+- Aider agent via a one-shot `fieldwork task` pipeline (dispatcher, Telegram
+  `/task`, bring-your-own model).
+- Advisory teams/managed attribution seams: `profile`/`actor` carried through
+  task and agent-lifecycle notification envelopes.
 
 ## Next
 

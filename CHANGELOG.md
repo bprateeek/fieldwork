@@ -4,6 +4,22 @@
 
 - No unreleased changes yet.
 
+## v0.2.0 - 2026-06-30
+
+- Add core GitLab forge support: set `forge = "gitlab"` (or
+  `FIELDWORK_FORGE=gitlab`) to open merge requests through the GitLab REST API.
+  New config keys: `gitlab_api` (the operator-pinned API host, the broker's
+  security pin), `gitlab_ca_bundle` (private CA for self-managed instances), and
+  required `commit_name`/`commit_email` identity (the agent has no GitLab token).
+  Supports nested `group/subgroup/project` paths; `rotate-pat` validates a GitLab
+  token via `GET /user`. GitLab branch protection, secret scanning, CodeQL,
+  `.github/` templates, and event-poller MR merge detection are deferred.
+- Add Aider as a Fieldwork-launched agent through a one-shot task pipeline:
+  `fieldwork task add|list|discard`, the Telegram `/task` command, a VPS task
+  dispatcher, and bring-your-own model via `~/.fieldwork/aider.conf`.
+- Carry `profile` and `actor` attribution through task and agent-lifecycle
+  notification envelopes (advisory only; the broker request schema is unchanged).
+
 ## v0.1.0 - 2026-06-03
 
 - Reposition Fieldwork for developer preview.
