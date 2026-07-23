@@ -11,6 +11,7 @@ for path in \
   "$root/claude-pinned" "$root/claude.sha256" \
   "$root/fieldwork-session-probe" "$root/fieldwork-session-probe-cage" \
   "$root/empty-mcp.json" /etc/claude-code/managed-settings.json \
+  /usr/local/bin/fieldwork-bash-policy \
   /usr/local/bin/fieldwork-verify /usr/local/bin/fieldwork-pr-prepare \
   /usr/local/bin/fieldwork-pr-build /usr/local/bin/fieldwork-pr-upload \
   /usr/local/sbin/fieldwork-session-probe-record; do
@@ -36,6 +37,7 @@ while IFS= read -r path; do
   managed_seen=1
 done < <(find /usr/local/share/fieldwork-claude -type f -print)
 [ "$managed_seen" = 1 ] || { echo "root-owned delivery instructions are missing" >&2; exit 1; }
+echo "Running the pinned Claude hostile probe; this may be silent for up to 180 seconds."
 out="$(
   /usr/sbin/runuser -u "$agent_user" -- /usr/bin/env -i \
     HOME="$agent_home" PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 LC_ALL=C.UTF-8 \
@@ -45,6 +47,9 @@ out="$(
 )"
 printf '%s\n' "$out"
 [ "$(printf '%s\n' "$out" | sed -n 's/^probe=//p' | tail -1)" = pass ] || {
+  if printf '%s\n' "$out" | grep -Eq 'authentication_failed|OAuth access token has expired'; then
+    echo "Claude authentication is stale; run: ~/.local/bin/claude login" >&2
+  fi
   echo "hostile probe did not pass; hard-boundary sessions remain disabled" >&2
   exit 1
 }

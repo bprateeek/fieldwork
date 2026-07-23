@@ -29,6 +29,7 @@ for name in \
   fieldwork-session-probe fieldwork-session-probe-cage; do
   install -o root -g root -m 0755 "$ROOT/lib/scripts/$name" "$LIB/$name"
 done
+install -o root -g root -m 0755 "$ROOT/lib/scripts/fieldwork-bash-policy" /usr/local/bin/fieldwork-bash-policy
 install -o root -g root -m 0755 "$ROOT/lib/scripts/fieldwork-session-probe-record" /usr/local/sbin/fieldwork-session-probe-record
 if [ -x "$CLAUDE_SOURCE" ]; then
   install -o root -g root -m 0755 "$CLAUDE_SOURCE" "$LIB/claude-pinned"

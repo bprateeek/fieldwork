@@ -19,6 +19,7 @@ python3 -m py_compile \
   lib/broker/server.py lib/broker/originnorm.py lib/broker/policy_writer.py \
   lib/broker/maintenance-submit lib/broker/migrate-instructions \
   lib/scripts/fieldwork-pr-build lib/scripts/fieldwork-pr-upload \
+  lib/scripts/fieldwork-bash-policy tests/bash-policy-tests.py \
   lib/scripts/fieldwork-session-probe-cage \
   lib/scripts/fieldwork-pr-prepare lib/scripts/fieldwork-bot \
   lib/scripts/fieldwork-task-run lib/scripts/fieldwork-task-dispatcher \
@@ -55,6 +56,8 @@ assert vps_settings['sandbox']['excludedCommands'] == [
     '/usr/local/bin/fieldwork-pr-prepare *',
 ]
 assert 'fieldwork-pr-submit' not in json.dumps(vps_settings)
+assert settings['hooks']['PreToolUse'][0]['matcher'] == 'Bash'
+assert settings['hooks']['PreToolUse'][0]['hooks'][0]['command'] == '/usr/local/bin/fieldwork-bash-policy'
 PY
 
 check "fingerprint mirror and completeness"
@@ -73,6 +76,7 @@ for required in \
   lib/broker/policy_writer.py lib/broker/maintenance-submit \
   lib/broker/fieldwork-pr-broker-maintenance.socket \
   lib/scripts/fieldwork-pr-build lib/scripts/fieldwork-pr-upload \
+  lib/scripts/fieldwork-bash-policy \
   lib/systemd/install-boundary.sh lib/local/Dockerfile \
   lib/local/control/fieldwork-local \
   lib/local/managed/.claude/skills/pr-delivery/SKILL.md; do
@@ -131,6 +135,8 @@ grep -Fq -- '--add-dir /usr/local/share/fieldwork-claude' lib/agents/claude-remo
 grep -Fq -- '--setting-sources ""' lib/scripts/fieldwork-session-probe
 grep -Fq -- '--strict-mcp-config' lib/scripts/fieldwork-session-probe
 grep -Fq -- '--add-dir /usr/local/share/fieldwork-claude' lib/scripts/fieldwork-session-probe
+grep -Fq 'remote_claude_pin_current' lib/cli/setup.sh
+grep -Fq 'silent for up to 180 seconds' lib/scripts/fieldwork-session-probe-record
 grep -Fq 'dashboard remains disabled' lib/systemd/install-boundary.sh
 grep -Fq '"$AGENT_HOME/.claude/settings.json" "$AGENT_HOME/.claude/CLAUDE.md"' lib/systemd/install-boundary.sh
 grep -Fq 'disabled="$path.user-scope-disabled"' lib/systemd/install-boundary.sh
@@ -195,6 +201,8 @@ grep -Fq 'assert_root_asset' lib/local/control/fieldwork-local-claude
 grep -Fq 'inventory contains a symlink' lib/local/control/fieldwork-local-claude
 grep -Fq 'hard-boundary inventory contains a symlink' lib/local/control/fieldwork-local-probe
 grep -Fq 'fieldwork-pr-prepare" "$ROOT/lib/scripts/fieldwork-verify' lib/local/install.sh
+grep -Fq 'fieldwork-bash-policy' lib/local/install.sh lib/systemd/install-boundary.sh
+grep -Fq 'fieldwork-excluded-client-policy' lib/scripts/fieldwork-session-probe
 grep -Fq 'local broker did not become ready within 30 seconds' lib/local/control/fieldwork-local
 grep -Fq 'for fw_attempt in {1..30}' .github/workflows/test.yml
 grep -Fq '[[ "$token" =~ ^[0-9a-f]{64}$ ]]' lib/local/control/fieldwork-local .github/workflows/test.yml
@@ -235,6 +243,7 @@ check "protocol-v2 test suites"
 python3 tests/broker-validation-tests.py
 python3 tests/pr-prepare-validation-tests.py
 python3 tests/bot-tests.py
+python3 tests/bash-policy-tests.py
 bash tests/task-dispatcher-tests.sh
 
 check "legacy control-plane regressions"

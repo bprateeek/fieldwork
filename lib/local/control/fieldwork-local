@@ -178,7 +178,8 @@ case "$command_name" in
     /bin/rm -rf /usr/local/lib/fieldwork-local /usr/local/share/fieldwork-claude
     /bin/rm -f /usr/local/sbin/fieldwork-local /usr/local/bin/fieldwork-pr-build \
       /usr/local/bin/fieldwork-pr-upload /usr/local/bin/fieldwork-pr-prepare \
-      /usr/local/bin/fieldwork-verify /usr/local/etc/fieldwork-agent.uid \
+      /usr/local/bin/fieldwork-verify /usr/local/bin/fieldwork-bash-policy \
+      /usr/local/etc/fieldwork-agent.uid \
       /usr/local/etc/fieldwork-agent.keychain-secret
     if [ "$remove_projects" = 1 ]; then
       echo "Local mode removed, including the dedicated projects tree; repository recovery requires your backup or forge."

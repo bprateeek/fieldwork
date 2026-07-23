@@ -8,6 +8,21 @@
   "disableBypassPermissionsMode": "disable",
   "disableClaudeAiConnectors": true,
   "disableSideloadFlags": true,
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/local/bin/fieldwork-bash-policy",
+            "timeout": 5,
+            "statusMessage": "Validating Fieldwork boundary command"
+          }
+        ]
+      }
+    ]
+  },
   "strictKnownMarketplaces": [],
   "permissions": {
     "deny": [

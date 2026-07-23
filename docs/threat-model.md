@@ -34,8 +34,10 @@ Hard-boundary Claude sessions fail if sandboxing is unavailable and disallow
 unsandboxed commands. Root-owned managed policy has an empty Bash-child network
 domain set, denies outbound tools and unmanaged MCP, denies credential/Docker/
 user-bus reads, and excludes only absolute root-owned clients. Clients are
-invoked as separate top-level commands so shell composition does not inherit an
-exclusion.
+invoked as separate top-level commands. A root-owned managed `PreToolUse`
+validator permits only the exact documented client forms and denies compound,
+wrapped, redirected, substituted, backgrounded, or malformed variants before
+Claude evaluates sandbox exclusions.
 
 Boundary system units and adapters are root-owned. The systemd user manager is
 not trusted; agent units, dispatcher, poller, and escape runners do not execute

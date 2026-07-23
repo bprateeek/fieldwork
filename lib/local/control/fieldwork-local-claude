@@ -22,6 +22,7 @@ for asset in \
   "$ROOT/entrypoint.sh" "$ROOT/context/lib/local/Dockerfile" \
   "$ROOT/context/lib/broker/server.py" "$ROOT/context/lib/broker/originnorm.py" \
   "$ROOT/context/lib/broker/policy_writer.py" "$ROOT/context/schema/pr-request.schema.json" \
+  /usr/local/bin/fieldwork-bash-policy \
   /usr/local/bin/fieldwork-pr-build /usr/local/bin/fieldwork-pr-upload \
   /usr/local/bin/fieldwork-pr-prepare /usr/local/bin/fieldwork-verify; do
   assert_root_asset "$asset"

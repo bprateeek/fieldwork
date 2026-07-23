@@ -102,6 +102,7 @@ chown -R root:root /usr/local/share/fieldwork-claude
 find /usr/local/share/fieldwork-claude -type d -exec chmod 0755 {} +
 find /usr/local/share/fieldwork-claude -type f -exec chmod 0644 {} +
 install -o root -g root -m 0755 \
+  "$ROOT/lib/scripts/fieldwork-bash-policy" \
   "$ROOT/lib/scripts/fieldwork-pr-build" "$ROOT/lib/scripts/fieldwork-pr-upload" \
   "$ROOT/lib/scripts/fieldwork-pr-prepare" "$ROOT/lib/scripts/fieldwork-verify" \
   /usr/local/bin/

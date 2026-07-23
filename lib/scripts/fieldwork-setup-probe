@@ -229,7 +229,7 @@ status_for claude_service test -f /etc/systemd/system/fieldwork-agent@.service
 broker_checks_start="$(timing_now)"
 status_for broker_socket sh -c 'test -S /run/fieldwork-pr-broker/fieldwork-pr.sock && test -w /run/fieldwork-pr-broker/fieldwork-pr.sock'
 status_for broker_pat_tool test -f /usr/local/sbin/rotate-pat
-status_for broker_thin_client sh -c 'test -x /usr/local/bin/fieldwork-pr-build && test -x /usr/local/bin/fieldwork-pr-upload'
+status_for broker_thin_client sh -c 'test -x /usr/local/bin/fieldwork-pr-build && test -x /usr/local/bin/fieldwork-pr-upload && test -x /usr/local/bin/fieldwork-bash-policy'
 status_for broker_pat_marker test -f "$HOME/.fieldwork/state/broker-pat-confirmed"
 status_for broker_pat_sudo broker_pat_sudo
 broker_pat_sudo_probe

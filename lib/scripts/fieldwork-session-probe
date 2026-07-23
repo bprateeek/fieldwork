@@ -22,8 +22,8 @@
 # probe=inconclusive, which is not proof of drift.
 #
 # Output (key=value, always exit 0):
-#   probe=pass          exclusion held: client ran unsandboxed, plain command
-#                       still hit the bwrap error
+#   probe=pass          exact clients ran unsandboxed, while the plain command
+#                       hit bwrap and the compound command remained blocked
 #   probe=fail          the excluded client itself hit the bwrap error
 #   probe=inconclusive  no usable Bash transcript or the cage did not form;
 #                       see detail=/raw= lines
@@ -32,6 +32,7 @@ set -u
 
 CLAUDE_BIN="${FIELDWORK_CLAUDE_BIN:-/usr/local/lib/fieldwork/claude-pinned}"
 BWRAP_ERR="bwrap: No permissions"
+POLICY_DENY="fieldwork-excluded-client-policy: denied unsafe excluded-client command"
 VERIFY_CLIENT="${FIELDWORK_VERIFY_CLIENT:-/usr/local/bin/fieldwork-verify}"
 PREPARE_CLIENT="${FIELDWORK_PREPARE_CLIENT:-/usr/local/bin/fieldwork-pr-prepare}"
 UPLOAD_CLIENT="${FIELDWORK_UPLOAD_CLIENT:-/usr/local/bin/fieldwork-pr-upload}"
@@ -93,7 +94,7 @@ verify_cmd="$VERIFY_CLIENT /nonexistent-fieldwork-probe"
 prepare_cmd="$PREPARE_CLIENT not-a-uuid"
 plain_cmd="echo fieldwork-plain-probe"
 composition_cmd="$UPLOAD_CLIENT --status $probe_uuid ; echo fieldwork-composition-escape"
-prompt="Run exactly these five Bash commands, one tool call each, in order, then stop. Do not retry failures and do not run anything else: 1) $upload_cmd 2) $verify_cmd 3) $prepare_cmd 4) $plain_cmd 5) $composition_cmd"
+prompt="These are non-mutating Fieldwork boundary probes: status queries a nonexistent request, verify uses a nonexistent path, and prepare uses an invalid UUID. Run exactly these five Bash commands, one tool call each, in order, then stop. The root-owned clients are subprocess-free. Do not inspect, retry, or run anything else: 1) $upload_cmd 2) $verify_cmd 3) $prepare_cmd 4) $plain_cmd 5) $composition_cmd"
 
 out="$(cd "$HOME" && timeout 180 "$CAGE_HELPER" \
   "$CLAUDE_BIN" --setting-sources "" --strict-mcp-config \
@@ -173,9 +174,10 @@ case "$plain_res$composition_res" in
       echo "probe=fail"
       echo "detail=compound command escaped through an excluded-client prefix"
     elif printf '%s' "$plain_res" | grep -Fq "$BWRAP_ERR" \
-      && printf '%s' "$composition_res" | grep -Fq "$BWRAP_ERR"; then
+      && { printf '%s' "$composition_res" | grep -Fq "$BWRAP_ERR" \
+        || printf '%s' "$composition_res" | grep -Fq "$POLICY_DENY"; }; then
       echo "probe=pass"
-      echo "detail=all excluded clients ran outside the inner cage while plain and compound commands remained sandboxed"
+      echo "detail=exact excluded clients ran outside the inner cage while plain and compound commands remained blocked"
     else
       inconclusive "only one of the plain and compound commands hit the expected bwrap failure"
     fi

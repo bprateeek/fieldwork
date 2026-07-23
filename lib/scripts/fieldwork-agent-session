@@ -35,6 +35,7 @@ for boundary_asset in \
   /usr/local/lib/fieldwork/notify.sh \
   /etc/claude-code/managed-settings.json \
   /usr/local/lib/fieldwork/empty-mcp.json \
+  /usr/local/bin/fieldwork-bash-policy \
   /usr/local/bin/fieldwork-verify \
   /usr/local/bin/fieldwork-pr-prepare \
   /usr/local/bin/fieldwork-pr-build \

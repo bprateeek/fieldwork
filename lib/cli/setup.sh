@@ -526,7 +526,7 @@ EOF
     ssh "$FIELDWORK_SSH_HOST" 'uid="$(id -u)"; runtime="${XDG_RUNTIME_DIR:-/run/user/$uid}"; test "$runtime" = "/run/user/$uid" && test -d "$runtime"' >/dev/null 2>&1
   }
   remote_delivery_clients_ready() {
-    ssh "$FIELDWORK_SSH_HOST" 'test -x /usr/local/bin/fieldwork-verify && test -x /usr/local/bin/fieldwork-pr-prepare && test -x /usr/local/bin/fieldwork-pr-build && test -x /usr/local/bin/fieldwork-pr-upload' >/dev/null 2>&1
+    ssh "$FIELDWORK_SSH_HOST" 'test -x /usr/local/bin/fieldwork-verify && test -x /usr/local/bin/fieldwork-pr-prepare && test -x /usr/local/bin/fieldwork-pr-build && test -x /usr/local/bin/fieldwork-pr-upload && test -x /usr/local/bin/fieldwork-bash-policy' >/dev/null 2>&1
   }
   ensure_remote_runner_sockets() {
     ssh -t "$FIELDWORK_SSH_HOST" 'cd ~/fieldwork && sudo env FIELDWORK_REMOTE_USER="$(id -un)" bash lib/systemd/install-boundary.sh' >/dev/null 2>&1
@@ -1360,6 +1360,9 @@ EOF
   remote_claude_probe_ready() {
     ssh "$FIELDWORK_SSH_HOST" 'test -s /usr/local/lib/fieldwork/claude.sha256 && test "$(cat /usr/local/lib/fieldwork/claude.sha256)" = "$(cat /usr/local/lib/fieldwork/claude.probe.sha256 2>/dev/null)"' >/dev/null 2>&1
   }
+  remote_claude_pin_current() {
+    ssh "$FIELDWORK_SSH_HOST" 'test -x "$HOME/.local/bin/claude" && test -s /usr/local/lib/fieldwork/claude.sha256 && test "$(sha256sum "$HOME/.local/bin/claude" | awk '"'"'{print $1}'"'"')" = "$(cat /usr/local/lib/fieldwork/claude.sha256)"' >/dev/null 2>&1
+  }
   record_remote_claude_probe() {
     ssh -t "$FIELDWORK_SSH_HOST" "sudo env FIELDWORK_REMOTE_USER=$(shell_quote "$FIELDWORK_REMOTE_USER") /usr/local/sbin/fieldwork-session-probe-record"
   }
@@ -1386,7 +1389,7 @@ EOF
     elif [ "$FIELDWORK_SETUP_SNAPSHOT_READY" = "1" ] && [ "$FIELDWORK_SETUP_SNAPSHOT_DIRTY" != "1" ]; then
       return 1
     fi
-    ssh "$FIELDWORK_SSH_HOST" "test -x /usr/local/bin/fieldwork-pr-build && test -x /usr/local/bin/fieldwork-pr-upload" >/dev/null 2>&1
+    ssh "$FIELDWORK_SSH_HOST" "test -x /usr/local/bin/fieldwork-pr-build && test -x /usr/local/bin/fieldwork-pr-upload && test -x /usr/local/bin/fieldwork-bash-policy" >/dev/null 2>&1
   }
   broker_install_complete() {
     broker_pat_tool_installed && broker_thin_client_installed
@@ -2186,6 +2189,11 @@ EOF
   current_phase_pending_count=0
   current_phase_pending_labels=()
 
+  if [ "$force_install" = "1" ] || ! remote_verify_runner_ready >/dev/null 2>&1 || ! remote_prepare_runner_ready >/dev/null 2>&1; then
+    progress_wait "installing root-owned boundary" ensure_remote_runner_sockets || true
+    fieldwork_setup_snapshot_mark_dirty
+  fi
+
   info_heading "Remote services"
   if setup_agent_enabled claude; then
     info_row "Purpose" "Verify the VPS service template that runs Claude sessions and the delivery runner sockets."
@@ -2194,7 +2202,9 @@ EOF
     else
       setup_row needs "remote Claude session systemd unit missing" "ssh -t $FIELDWORK_SSH_HOST 'cd ~/fieldwork && ./bin/fieldwork bootstrap-vps'"
     fi
-    if progress_wait "checking pinned Claude hostile-probe digest" remote_claude_probe_ready; then
+    if ! progress_wait "checking pinned Claude executable" remote_claude_pin_current; then
+      setup_row needs "Claude changed since the root boundary was installed" "fieldwork setup --force-install"
+    elif progress_wait "checking pinned Claude hostile-probe digest" remote_claude_probe_ready; then
       setup_row ok "pinned Claude digest has a passing hostile probe"
     else
       print_manual_step \
@@ -2214,9 +2224,6 @@ EOF
   else
     info_row "Purpose" "Verify the delivery runner sockets used from Codex SSH sessions."
     setup_row ok "Claude session systemd unit skipped for Codex-only setup"
-  fi
-  if [ "$force_install" = "1" ] || ! remote_verify_runner_ready >/dev/null 2>&1 || ! remote_prepare_runner_ready >/dev/null 2>&1; then
-    progress_wait "enabling runner sockets" ensure_remote_runner_sockets || true
   fi
   if progress_wait "checking verify runner sandbox" remote_verify_runner_ready; then
     setup_row ok "verify runner sandbox ready"

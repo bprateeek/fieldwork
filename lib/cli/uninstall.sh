@@ -1330,7 +1330,7 @@ for unit in fieldwork-agent@.service fieldwork-event-poll.service fieldwork-even
 done
 remove_tree \"root-owned Fieldwork boundary library\" /usr/local/lib/fieldwork /usr/local/lib
 remove_tree \"root-owned Fieldwork delivery instructions\" /usr/local/share/fieldwork-claude /usr/local/share
-for path in /usr/local/bin/fieldwork-verify /usr/local/bin/fieldwork-pr-prepare /usr/local/bin/fieldwork-pr-build /usr/local/bin/fieldwork-pr-upload /usr/local/sbin/fieldwork-session-probe-record; do
+for path in /usr/local/bin/fieldwork-verify /usr/local/bin/fieldwork-pr-prepare /usr/local/bin/fieldwork-pr-build /usr/local/bin/fieldwork-pr-upload /usr/local/bin/fieldwork-bash-policy /usr/local/sbin/fieldwork-session-probe-record; do
   remove_file \"root-owned boundary client \$path\" \"\$path\"
 done
 managed=/etc/claude-code/managed-settings.json

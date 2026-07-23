@@ -1,0 +1,66 @@
+#!/usr/bin/python3 -I
+"""Fail-closed PreToolUse guard for Fieldwork sandbox exclusions.
+
+Claude Code's sandbox exclusions are command patterns, so an incompatible CLI
+may treat a compound shell expression beginning with an excluded client as one
+unsandboxed command. This managed hook permits only the exact single-client
+forms Fieldwork documents. Every other Bash input containing an excluded
+client path is denied before permission and sandbox evaluation.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import sys
+
+
+MAX_INPUT = 1024 * 1024
+DENIAL = "fieldwork-excluded-client-policy: denied unsafe excluded-client command"
+UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"
+CLIENTS = (
+    "/usr/local/bin/fieldwork-pr-upload",
+    "/usr/local/bin/fieldwork-pr-prepare",
+    "/usr/local/bin/fieldwork-verify",
+)
+ALLOWED = (
+    re.compile(rf"^/usr/local/bin/fieldwork-pr-upload (?:--status )?{UUID}$"),
+    re.compile(rf"^/usr/local/bin/fieldwork-pr-prepare {UUID}$"),
+    re.compile(r"^/usr/local/bin/fieldwork-pr-prepare not-a-uuid$"),
+    re.compile(r'^/usr/local/bin/fieldwork-verify "\$PWD"$'),
+    re.compile(r"^/usr/local/bin/fieldwork-verify /nonexistent-fieldwork-probe$"),
+)
+
+
+def deny() -> int:
+    print(DENIAL, file=sys.stderr)
+    return 2
+
+
+def main() -> int:
+    raw = sys.stdin.buffer.read(MAX_INPUT + 1)
+    if not raw or len(raw) > MAX_INPUT:
+        return deny()
+    try:
+        event = json.loads(raw)
+    except (UnicodeError, json.JSONDecodeError):
+        return deny()
+    if not isinstance(event, dict) or event.get("tool_name") != "Bash":
+        return deny()
+    tool_input = event.get("tool_input")
+    if not isinstance(tool_input, dict):
+        return deny()
+    command = tool_input.get("command")
+    if not isinstance(command, str):
+        return deny()
+    if not any(client in command for client in CLIENTS):
+        return 0
+    if tool_input.get("run_in_background") is True:
+        return deny()
+    if any(pattern.fullmatch(command) for pattern in ALLOWED):
+        return 0
+    return deny()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -38,7 +38,8 @@ Codex must use the broker path for every PR. The branch must be `fieldwork/<shor
 
 The escape-side clients below are root-owned. Invoke each excluded command as a
 separate top-level tool call with its absolute path and one argument; shell
-composition intentionally does not inherit the exclusion.
+composition is denied by the root-owned managed Bash policy before sandbox
+exclusions are evaluated.
 
 1. Run verification:
 

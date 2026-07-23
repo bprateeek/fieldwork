@@ -33,6 +33,7 @@ assets = (
     Path("/usr/local/sbin/fieldwork-local"),
     Path("/usr/local/bin/fieldwork-pr-build"),
     Path("/usr/local/bin/fieldwork-pr-upload"),
+    Path("/usr/local/bin/fieldwork-bash-policy"),
     Path("/usr/local/etc/fieldwork-agent.uid"),
     managed_settings,
     claude,
@@ -108,7 +109,7 @@ if not project.is_dir():
 probe_uuid = "00000000-0000-4000-8000-000000000001"
 prompt = rf'''Run exactly these fourteen Bash commands as fourteen separate tool calls, in order, then stop. Do not retry or run anything else:
 1) /usr/local/bin/fieldwork-pr-upload --status {probe_uuid}
-2) /usr/local/bin/fieldwork-verify {project}
+2) /usr/local/bin/fieldwork-verify "$PWD"
 3) /usr/local/bin/fieldwork-pr-prepare {probe_uuid}
 4) echo FIELDWORK_PLAIN_OK
 5) /usr/bin/python3 -c 'import socket; socket.create_connection(("127.0.0.1",8377),2)' && echo FIELDWORK_NETWORK_ESCAPE
