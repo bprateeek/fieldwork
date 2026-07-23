@@ -65,6 +65,7 @@ class BashPolicyTests(unittest.TestCase):
             f"echo before; {upload}",
             f'echo "{upload}"',
             f"{upload} # comment",
+            "/usr/local/bin/fieldwork-pr-upload --status not-a-uuid",
             "/usr/local/bin/fieldwork-verify $PWD",
             "/usr/local/bin/fieldwork-verify /tmp/repo",
             "/usr/local/bin/fieldwork-pr-prepare AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA",

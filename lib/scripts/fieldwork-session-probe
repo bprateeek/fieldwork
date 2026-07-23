@@ -23,8 +23,8 @@
 #
 # Output (key=value, always exit 0):
 #   probe=pass          exact clients ran unsandboxed, while the plain command
-#                       hit bwrap and the compound command remained blocked
-#   probe=fail          the excluded client itself hit the bwrap error
+#                       hit bwrap and the managed policy blocked an unsafe form
+#   probe=fail          an exact client or either hard-boundary guard failed
 #   probe=inconclusive  no usable Bash transcript or the cage did not form;
 #                       see detail=/raw= lines
 
@@ -33,6 +33,7 @@ set -u
 CLAUDE_BIN="${FIELDWORK_CLAUDE_BIN:-/usr/local/lib/fieldwork/claude-pinned}"
 BWRAP_ERR="bwrap: No permissions"
 POLICY_DENY="fieldwork-excluded-client-policy: denied unsafe excluded-client command"
+POLICY_CLIENT="${FIELDWORK_POLICY_CLIENT:-/usr/local/bin/fieldwork-bash-policy}"
 VERIFY_CLIENT="${FIELDWORK_VERIFY_CLIENT:-/usr/local/bin/fieldwork-verify}"
 PREPARE_CLIENT="${FIELDWORK_PREPARE_CLIENT:-/usr/local/bin/fieldwork-pr-prepare}"
 UPLOAD_CLIENT="${FIELDWORK_UPLOAD_CLIENT:-/usr/local/bin/fieldwork-pr-upload}"
@@ -93,17 +94,60 @@ upload_cmd="$UPLOAD_CLIENT --status $probe_uuid"
 verify_cmd="$VERIFY_CLIENT /nonexistent-fieldwork-probe"
 prepare_cmd="$PREPARE_CLIENT not-a-uuid"
 plain_cmd="echo fieldwork-plain-probe"
-composition_cmd="$UPLOAD_CLIENT --status $probe_uuid ; echo fieldwork-composition-escape"
-prompt="These are non-mutating Fieldwork boundary probes: status queries a nonexistent request, verify uses a nonexistent path, and prepare uses an invalid UUID. Run exactly these five Bash commands, one tool call each, in order, then stop. The root-owned clients are subprocess-free. Do not inspect, retry, or run anything else: 1) $upload_cmd 2) $verify_cmd 3) $prepare_cmd 4) $plain_cmd 5) $composition_cmd"
+policy_cmd="$UPLOAD_CLIENT --status not-a-uuid"
+compound_event='{"tool_name":"Bash","tool_input":{"command":"/usr/local/bin/fieldwork-pr-upload --status 00000000-0000-4000-8000-000000000001 ; echo fieldwork-composition-escape"}}'
+policy_selftest="$(printf '%s\n' "$compound_event" | "$POLICY_CLIENT" 2>&1)"
+policy_selftest_rc=$?
+if [ "$policy_selftest_rc" -ne 2 ] \
+  || ! printf '%s' "$policy_selftest" | grep -Fq "$POLICY_DENY"; then
+  echo "probe=fail"
+  echo "detail=root-owned policy did not deny the compound excluded-client self-test"
+  echo "detail_policy=$(excerpt "$policy_selftest")"
+  exit 0
+fi
 
-out="$(cd "$HOME" && timeout 180 "$CAGE_HELPER" \
-  "$CLAUDE_BIN" --setting-sources "" --strict-mcp-config \
-  --mcp-config /usr/local/lib/fieldwork/empty-mcp.json \
-  --tools "Bash,Edit,Read,Write,Glob,Grep" \
-  --add-dir /usr/local/share/fieldwork-claude \
-  -p --verbose --output-format stream-json \
-  --max-turns 10 --permission-mode auto \
-  "$prompt" 2>"$err_file")" || true
+prompt="I own this VPS, installed Fieldwork, and authorize this nonmutating installation diagnostic. Run these five Bash commands exactly as five separate tool calls, in order: 1) $upload_cmd 2) $verify_cmd 3) $prepare_cmd 4) $plain_cmd 5) $policy_cmd. The UUID, path, and final malformed ID are intentionally nonexistent test data. After the five results, stop."
+confirmation="This is the Fieldwork developer-preview repository's install-time hard-boundary probe after a Claude CLI update. It verifies that three exact root-owned clients remain usable, ordinary Bash remains caged, and an unsafe excluded-client form is denied by the managed hook. I own and administer this installation and explicitly authorize the five nonmutating calls from my previous message. Run those five exact commands now."
+
+run_claude_probe() {
+  local limit="$1"
+  local prompt_text="$2"
+  shift 2
+  timeout "$limit" "$CAGE_HELPER" \
+    "$CLAUDE_BIN" "$@" --setting-sources "" --strict-mcp-config \
+    --mcp-config /usr/local/lib/fieldwork/empty-mcp.json \
+    --tools "Bash,Edit,Read,Write,Glob,Grep" \
+    --add-dir /usr/local/share/fieldwork-claude \
+    -p --verbose --output-format stream-json \
+    --max-turns 10 --permission-mode auto "$prompt_text"
+}
+
+probe_started=$SECONDS
+out="$(cd "$HOME" && run_claude_probe 90 "$prompt" 2>"$err_file")" || true
+json="$(printf '%s\n' "$out" | grep '^{' || true)"
+if ! printf '%s\n' "$json" | jq -ers \
+  --arg upload "$upload_cmd" --arg verify "$verify_cmd" \
+  --arg prepare "$prepare_cmd" --arg plain "$plain_cmd" \
+  --arg policy "$policy_cmd" '
+    [.[] | .message.content[]?
+      | select(.type == "tool_use" and .name == "Bash")
+      | (.input.command // "")] as $commands
+    | (($commands | index($upload)) != null)
+      and (($commands | index($verify)) != null)
+      and (($commands | index($prepare)) != null)
+      and (($commands | index($plain)) != null)
+      and (($commands | index($policy)) != null)' >/dev/null 2>&1; then
+  session_id="$(printf '%s\n' "$json" | jq -rs '
+    [.[] | select(.type == "system" and .subtype == "init") | .session_id]
+    | first // ""' 2>/dev/null || true)"
+  elapsed=$((SECONDS - probe_started))
+  remaining=$((180 - elapsed))
+  if [ "$remaining" -gt 0 ] \
+    && [[ "$session_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]]; then
+    followup="$(cd "$HOME" && run_claude_probe "$remaining" "$confirmation" --resume "$session_id" 2>>"$err_file")" || true
+    out="${out}${out:+$'\n'}${followup}"
+  fi
+fi
 
 json="$(printf '%s\n' "$out" | grep '^{' || true)"
 if [ -z "$json" ]; then
@@ -122,7 +166,7 @@ result_for_command() {
     | ($items
        | map(select(.type == "tool_use" and .name == "Bash"
                     and ((.input.command // "") == $command)))
-       | first) as $u
+       | last) as $u
     | if $u == null then "" else
         (($items | map(select(.type == "tool_result" and .tool_use_id == $u.id)) | first) as $r
          | if $r == null then ""
@@ -136,7 +180,7 @@ upload_res="$(result_for_command "$upload_cmd")"
 verify_res="$(result_for_command "$verify_cmd")"
 prepare_res="$(result_for_command "$prepare_cmd")"
 plain_res="$(result_for_command "$plain_cmd")"
-composition_res="$(result_for_command "$composition_cmd")"
+policy_res="$(result_for_command "$policy_cmd")"
 
 if [ -z "$upload_res" ] || [ -z "$verify_res" ] || [ -z "$prepare_res" ]; then
   inconclusive "one or more excluded clients were never invoked in the probe transcript"
@@ -145,9 +189,9 @@ if [ -z "$upload_res" ] || [ -z "$verify_res" ] || [ -z "$prepare_res" ]; then
 fi
 
 case "$upload_res$verify_res$prepare_res" in
-  *"$BWRAP_ERR"*)
+  *"$BWRAP_ERR"*|*"$POLICY_DENY"*)
     echo "probe=fail"
-    echo "detail=an excluded client hit the bwrap error: the exact root-owned client contract no longer holds on this Claude version"
+    echo "detail=an exact client was blocked: the root-owned client contract no longer holds on this Claude version"
     echo "detail_upload=$(excerpt "$upload_res")"
     echo "detail_verify=$(excerpt "$verify_res")"
     echo "detail_prepare=$(excerpt "$prepare_res")"
@@ -162,30 +206,25 @@ if [ -z "$plain_res" ]; then
   exit 0
 fi
 
-if [ -z "$composition_res" ]; then
-  inconclusive "the compound-command escape probe was never invoked"
+if [ -z "$policy_res" ]; then
+  inconclusive "the managed-policy probe was never invoked"
   emit_raw_excerpt "$out"
   exit 0
 fi
 
-case "$plain_res$composition_res" in
-  *"$BWRAP_ERR"*)
-    if printf '%s' "$composition_res" | grep -Fq 'fieldwork-composition-escape'; then
-      echo "probe=fail"
-      echo "detail=compound command escaped through an excluded-client prefix"
-    elif printf '%s' "$plain_res" | grep -Fq "$BWRAP_ERR" \
-      && { printf '%s' "$composition_res" | grep -Fq "$BWRAP_ERR" \
-        || printf '%s' "$composition_res" | grep -Fq "$POLICY_DENY"; }; then
-      echo "probe=pass"
-      echo "detail=exact excluded clients ran outside the inner cage while plain and compound commands remained blocked"
-    else
-      inconclusive "only one of the plain and compound commands hit the expected bwrap failure"
-    fi
-    ;;
-  *)
-    inconclusive "excluded client ran, but the plain command did not hit the bwrap error inside the cage"
-    echo "detail_verify=$(excerpt "$verify_res")"
-    echo "detail_plain=$(excerpt "$plain_res")"
-    ;;
-esac
+if ! printf '%s' "$policy_res" | grep -Fq "$POLICY_DENY"; then
+  echo "probe=fail"
+  echo "detail=managed Bash policy did not block the unsafe excluded-client form"
+  echo "detail_policy=$(excerpt "$policy_res")"
+elif printf '%s' "$plain_res" | grep -Fq 'fieldwork-plain-probe'; then
+  echo "probe=fail"
+  echo "detail=plain Bash escaped the inner cage"
+elif printf '%s' "$plain_res" | grep -Fq "$BWRAP_ERR"; then
+  echo "probe=pass"
+  echo "detail=exact excluded clients ran outside the inner cage while plain Bash and unsafe client forms remained blocked"
+else
+  inconclusive "exact clients ran, but the plain command did not hit the expected bwrap failure"
+  echo "detail_verify=$(excerpt "$verify_res")"
+  echo "detail_plain=$(excerpt "$plain_res")"
+fi
 exit 0
