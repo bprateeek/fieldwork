@@ -137,6 +137,7 @@ grep -Fq -- '--strict-mcp-config' lib/scripts/fieldwork-session-probe
 grep -Fq -- '--add-dir /usr/local/share/fieldwork-claude' lib/scripts/fieldwork-session-probe
 grep -Fq 'remote_claude_pin_current' lib/cli/setup.sh
 grep -Fq 'silent for up to 180 seconds' lib/scripts/fieldwork-session-probe-record
+grep -Fq 'FIELDWORK_SESSION_PROBE=1 /usr/local/lib/fieldwork/fieldwork-session-probe' bin/fieldwork
 grep -Fq 'dashboard remains disabled' lib/systemd/install-boundary.sh
 grep -Fq '"$AGENT_HOME/.claude/settings.json" "$AGENT_HOME/.claude/CLAUDE.md"' lib/systemd/install-boundary.sh
 grep -Fq 'disabled="$path.user-scope-disabled"' lib/systemd/install-boundary.sh

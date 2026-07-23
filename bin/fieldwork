@@ -2828,14 +2828,14 @@ EOF
 
       if [ "$session_probe" = "1" ]; then
         doctor_section "Session probe"
-        [ "$explain" = "1" ] && doctor_info "purpose" "run the root-pinned Claude executable under the hostile agent runtime and confirm only the two root-owned delivery clients escape the per-call sandbox"
+        [ "$explain" = "1" ] && doctor_info "purpose" "run the root-pinned Claude executable under the hostile agent runtime and confirm only the three exact root-owned clients escape while the managed hook blocks unsafe forms"
         if ! agents_include "$remote_agents" claude; then
           doctor_row skipped "sandbox excludedCommands semantics" "Claude not configured"
         elif ! ssh "$FIELDWORK_SSH_HOST" "test -f ~/.fieldwork/state/claude-login-confirmed"; then
           doctor_manual "session probe needs Claude Code login" "ssh -t $FIELDWORK_SSH_HOST '~/.local/bin/claude login'" "the probe runs claude headless on the VPS, which requires a confirmed login" "without login the probe can only return inconclusive" "log in, then rerun fieldwork doctor --remote --session-probe" "yes"
         else
           local probe_out probe_state probe_detail
-          probe_out="$(ssh "$FIELDWORK_SSH_HOST" "/usr/local/lib/fieldwork/fieldwork-session-probe" 2>/dev/null || true)"
+          probe_out="$(ssh "$FIELDWORK_SSH_HOST" "FIELDWORK_SESSION_PROBE=1 /usr/local/lib/fieldwork/fieldwork-session-probe" 2>/dev/null || true)"
           probe_state="$(doctor_kv_value "$probe_out" probe)"
           probe_detail="$(doctor_kv_value "$probe_out" detail)"
           case "$probe_state" in

@@ -37,7 +37,10 @@ user-bus reads, and excludes only absolute root-owned clients. Clients are
 invoked as separate top-level commands. A root-owned managed `PreToolUse`
 validator permits only the exact documented client forms and denies compound,
 wrapped, redirected, substituted, backgrounded, or malformed variants before
-Claude evaluates sandbox exclusions.
+Claude evaluates sandbox exclusions. The operator-invoked hostile probe activates a
+fixed hook mode that rewrites harmless marker calls into those exact clients;
+normal agent sessions cannot activate the rewrites, and the probe separately
+feeds a compound client event directly to the root-owned validator.
 
 Boundary system units and adapters are root-owned. The systemd user manager is
 not trusted; agent units, dispatcher, poller, and escape runners do not execute

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import subprocess
 import unittest
@@ -15,13 +16,20 @@ REQUEST_ID = "00000000-0000-4000-8000-000000000001"
 DENIAL = b"fieldwork-excluded-client-policy: denied unsafe excluded-client command"
 
 
-def invoke(command: str, **tool_input: object) -> subprocess.CompletedProcess[bytes]:
+def invoke(
+    command: str, *, probe: bool = False, **tool_input: object
+) -> subprocess.CompletedProcess[bytes]:
     value = {"command": command, **tool_input}
+    environment = os.environ.copy()
+    environment.pop("FIELDWORK_SESSION_PROBE", None)
+    if probe:
+        environment["FIELDWORK_SESSION_PROBE"] = "1"
     return subprocess.run(
         [str(POLICY)],
         input=json.dumps({"tool_name": "Bash", "tool_input": value}).encode(),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        env=environment,
         check=False,
     )
 
@@ -44,9 +52,48 @@ class BashPolicyTests(unittest.TestCase):
                 self.assertEqual(result.stderr, b"")
 
     def test_ordinary_bash_is_unchanged(self) -> None:
-        for command in ("git status --short", "npm test && echo done", "echo hello > result.txt"):
+        for command in (
+            "git status --short",
+            "npm test && echo done",
+            "echo hello > result.txt",
+            "printf fieldwork-probe-upload",
+            "FIELDWORK_SESSION_PROBE=1 printf fieldwork-probe-upload",
+        ):
             with self.subTest(command=command):
-                self.assertEqual(invoke(command).returncode, 0)
+                result = invoke(command)
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, b"")
+
+    def test_root_probe_mode_rewrites_exact_markers_and_denies_policy_marker(self) -> None:
+        expected = {
+            "printf fieldwork-probe-upload": (
+                "/usr/local/bin/fieldwork-pr-upload --status "
+                f"{REQUEST_ID}"
+            ),
+            "printf fieldwork-probe-verify": (
+                "/usr/local/bin/fieldwork-verify /nonexistent-fieldwork-probe"
+            ),
+            "printf fieldwork-probe-prepare": (
+                "/usr/local/bin/fieldwork-pr-prepare not-a-uuid"
+            ),
+        }
+        for command, replacement in expected.items():
+            with self.subTest(command=command):
+                result = invoke(command, probe=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                output = json.loads(result.stdout)
+                decision = output["hookSpecificOutput"]
+                self.assertEqual(decision["hookEventName"], "PreToolUse")
+                self.assertEqual(decision["permissionDecision"], "allow")
+                self.assertEqual(
+                    decision["updatedInput"], {"command": replacement}
+                )
+        plain = invoke("printf fieldwork-probe-plain", probe=True)
+        self.assertEqual(plain.returncode, 0)
+        self.assertEqual(plain.stdout, b"")
+        denied = invoke("printf fieldwork-probe-policy", probe=True)
+        self.assertEqual(denied.returncode, 2)
+        self.assertIn(DENIAL, denied.stderr)
 
     def test_every_composed_or_wrapped_client_form_is_denied(self) -> None:
         upload = f"/usr/local/bin/fieldwork-pr-upload {REQUEST_ID}"

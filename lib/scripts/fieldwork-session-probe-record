@@ -41,8 +41,8 @@ echo "Running the pinned Claude hostile probe; this may be silent for up to 180 
 out="$(
   /usr/sbin/runuser -u "$agent_user" -- /usr/bin/env -i \
     HOME="$agent_home" PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+    FIELDWORK_SESSION_PROBE=1 \
     FIELDWORK_CLAUDE_BIN="$root/claude-pinned" \
-    FIELDWORK_VERIFY_CLIENT=/usr/local/bin/fieldwork-verify \
     "$root/fieldwork-session-probe"
 )"
 printf '%s\n' "$out"

@@ -6,11 +6,16 @@ may treat a compound shell expression beginning with an excluded client as one
 unsandboxed command. This managed hook permits only the exact single-client
 forms Fieldwork documents. Every other Bash input containing an excluded
 client path is denied before permission and sandbox evaluation.
+
+The operator-invoked hostile probe sets FIELDWORK_SESSION_PROBE=1. In that
+environment only, fixed harmless markers are rewritten to nonmutating client
+probes so model safety behavior never has to generate hostile shell text.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 
@@ -30,6 +35,20 @@ ALLOWED = (
     re.compile(r'^/usr/local/bin/fieldwork-verify "\$PWD"$'),
     re.compile(r"^/usr/local/bin/fieldwork-verify /nonexistent-fieldwork-probe$"),
 )
+PROBE_REWRITES = {
+    "printf fieldwork-probe-upload": (
+        "/usr/local/bin/fieldwork-pr-upload --status "
+        "00000000-0000-4000-8000-000000000001"
+    ),
+    "printf fieldwork-probe-verify": (
+        "/usr/local/bin/fieldwork-verify /nonexistent-fieldwork-probe"
+    ),
+    "printf fieldwork-probe-prepare": (
+        "/usr/local/bin/fieldwork-pr-prepare not-a-uuid"
+    ),
+}
+PROBE_PLAIN = "printf fieldwork-probe-plain"
+PROBE_DENY = "printf fieldwork-probe-policy"
 
 
 def deny() -> int:
@@ -53,6 +72,29 @@ def main() -> int:
     command = tool_input.get("command")
     if not isinstance(command, str):
         return deny()
+    if os.environ.get("FIELDWORK_SESSION_PROBE") == "1":
+        if command == PROBE_DENY:
+            return deny()
+        replacement = PROBE_REWRITES.get(command)
+        if replacement is not None:
+            print(
+                json.dumps(
+                    {
+                        "hookSpecificOutput": {
+                            "hookEventName": "PreToolUse",
+                            "permissionDecision": "allow",
+                            "permissionDecisionReason": (
+                                "Running an operator-authorized Fieldwork boundary probe"
+                            ),
+                            "updatedInput": {"command": replacement},
+                        }
+                    },
+                    separators=(",", ":"),
+                )
+            )
+            return 0
+        if command == PROBE_PLAIN:
+            return 0
     if not any(client in command for client in CLIENTS):
         return 0
     if tool_input.get("run_in_background") is True:

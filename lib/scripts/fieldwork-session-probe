@@ -16,9 +16,13 @@
 # bwrap is already attached to fieldwork-bwrap, a nested bwrap re-attaches
 # to the same profile (NNP-safe), and the userns grant follows it in.
 #
-# Limitations: consumes model tokens on the VPS Claude account; requires a
-# confirmed claude login; model nondeterminism is bounded by a fixed prompt
-# and --max-turns, but a refusal, login expiry, or startup abort yields
+# The recorder and doctor activate a managed-hook mode that rewrites harmless
+# model-facing printf markers into fixed client probes. This keeps the model out
+# of the hostile-input construction while still exercising the pinned CLI's
+# updated-input, exclusion, hook-denial, and sandbox paths.
+#
+# Limitations: consumes model tokens on the VPS Claude account and requires a
+# confirmed Claude login. A refusal, login expiry, or startup abort yields
 # probe=inconclusive, which is not proof of drift.
 #
 # Output (key=value, always exit 0):
@@ -34,9 +38,6 @@ CLAUDE_BIN="${FIELDWORK_CLAUDE_BIN:-/usr/local/lib/fieldwork/claude-pinned}"
 BWRAP_ERR="bwrap: No permissions"
 POLICY_DENY="fieldwork-excluded-client-policy: denied unsafe excluded-client command"
 POLICY_CLIENT="${FIELDWORK_POLICY_CLIENT:-/usr/local/bin/fieldwork-bash-policy}"
-VERIFY_CLIENT="${FIELDWORK_VERIFY_CLIENT:-/usr/local/bin/fieldwork-verify}"
-PREPARE_CLIENT="${FIELDWORK_PREPARE_CLIENT:-/usr/local/bin/fieldwork-pr-prepare}"
-UPLOAD_CLIENT="${FIELDWORK_UPLOAD_CLIENT:-/usr/local/bin/fieldwork-pr-upload}"
 
 emit_raw_excerpt() {
   printf '%s\n' "$1" | head -8 | while IFS= read -r line; do
@@ -89,12 +90,11 @@ if command -v bwrap >/dev/null 2>&1 \
   exit 0
 fi
 
-probe_uuid=00000000-0000-4000-8000-000000000001
-upload_cmd="$UPLOAD_CLIENT --status $probe_uuid"
-verify_cmd="$VERIFY_CLIENT /nonexistent-fieldwork-probe"
-prepare_cmd="$PREPARE_CLIENT not-a-uuid"
-plain_cmd="echo fieldwork-plain-probe"
-policy_cmd="$UPLOAD_CLIENT --status not-a-uuid"
+upload_cmd="printf fieldwork-probe-upload"
+verify_cmd="printf fieldwork-probe-verify"
+prepare_cmd="printf fieldwork-probe-prepare"
+plain_cmd="printf fieldwork-probe-plain"
+policy_cmd="printf fieldwork-probe-policy"
 compound_event='{"tool_name":"Bash","tool_input":{"command":"/usr/local/bin/fieldwork-pr-upload --status 00000000-0000-4000-8000-000000000001 ; echo fieldwork-composition-escape"}}'
 policy_selftest="$(printf '%s\n' "$compound_event" | "$POLICY_CLIENT" 2>&1)"
 policy_selftest_rc=$?
@@ -106,8 +106,8 @@ if [ "$policy_selftest_rc" -ne 2 ] \
   exit 0
 fi
 
-prompt="I own this VPS, installed Fieldwork, and authorize this nonmutating installation diagnostic. Run these five Bash commands exactly as five separate tool calls, in order: 1) $upload_cmd 2) $verify_cmd 3) $prepare_cmd 4) $plain_cmd 5) $policy_cmd. The UUID, path, and final malformed ID are intentionally nonexistent test data. After the five results, stop."
-confirmation="This is the Fieldwork developer-preview repository's install-time hard-boundary probe after a Claude CLI update. It verifies that three exact root-owned clients remain usable, ordinary Bash remains caged, and an unsafe excluded-client form is denied by the managed hook. I own and administer this installation and explicitly authorize the five nonmutating calls from my previous message. Run those five exact commands now."
+prompt="Run exactly these five harmless Bash output checks as five separate tool calls, in order: 1) $upload_cmd 2) $verify_cmd 3) $prepare_cmd 4) $plain_cmd 5) $policy_cmd. After the five results, stop."
+confirmation="These five literal printf calls are an authorized installation diagnostic. Run the five exact output checks from my previous message now as separate Bash tool calls."
 
 run_claude_probe() {
   local limit="$1"
@@ -199,6 +199,15 @@ case "$upload_res$verify_res$prepare_res" in
     ;;
 esac
 
+if printf '%s' "$upload_res$verify_res$prepare_res" | grep -Fq 'fieldwork-probe-'; then
+  echo "probe=fail"
+  echo "detail=managed hook did not rewrite one or more exact-client probe markers"
+  echo "detail_upload=$(excerpt "$upload_res")"
+  echo "detail_verify=$(excerpt "$verify_res")"
+  echo "detail_prepare=$(excerpt "$prepare_res")"
+  exit 0
+fi
+
 if [ -z "$plain_res" ]; then
   inconclusive "the plain command was never invoked in the probe transcript"
   echo "detail_verify=$(excerpt "$verify_res")"
@@ -216,7 +225,7 @@ if ! printf '%s' "$policy_res" | grep -Fq "$POLICY_DENY"; then
   echo "probe=fail"
   echo "detail=managed Bash policy did not block the unsafe excluded-client form"
   echo "detail_policy=$(excerpt "$policy_res")"
-elif printf '%s' "$plain_res" | grep -Fq 'fieldwork-plain-probe'; then
+elif printf '%s' "$plain_res" | grep -Fq 'fieldwork-probe-plain'; then
   echo "probe=fail"
   echo "detail=plain Bash escaped the inner cage"
 elif printf '%s' "$plain_res" | grep -Fq "$BWRAP_ERR"; then
