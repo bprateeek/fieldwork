@@ -198,6 +198,8 @@ grep -Fq 'fieldwork-pr-prepare" "$ROOT/lib/scripts/fieldwork-verify' lib/local/i
 grep -Fq 'local broker did not become ready within 30 seconds' lib/local/control/fieldwork-local
 grep -Fq 'for fw_attempt in {1..30}' .github/workflows/test.yml
 grep -Fq '[[ "$token" =~ ^[0-9a-f]{64}$ ]]' lib/local/control/fieldwork-local .github/workflows/test.yml
+grep -Fq -- "--write-out '%{http_code}'" lib/local/control/fieldwork-local .github/workflows/test.yml
+grep -Fq '[ "$http_status" = 401 ]' lib/local/control/fieldwork-local .github/workflows/test.yml
 test -f lib/local/managed/.claude/skills/pr-delivery/SKILL.md
 ! grep -Eq '(^|[[:space:]])local\)' bin/fieldwork
 python3 - <<'PY'
