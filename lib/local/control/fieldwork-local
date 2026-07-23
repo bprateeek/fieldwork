@@ -22,7 +22,7 @@ wait_http_auth() {
   fw_attempt=0
   while [ "$fw_attempt" -lt 30 ]; do
     token="$(docker_cmd exec -T broker /usr/local/bin/fieldwork-local-entrypoint read-http-auth 2>/dev/null || true)"
-    if [ -n "$token" ]; then
+    if [[ "$token" =~ ^[0-9a-f]{64}$ ]]; then
       printf '%s\n' "$token"
       return 0
     fi

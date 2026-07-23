@@ -132,10 +132,10 @@ jobs:
           for fw_attempt in {1..30}; do
             token="$(docker compose -p fieldwork-local-ci -f lib/local/docker-compose.yml \
               exec -T broker /usr/local/bin/fieldwork-local-entrypoint read-http-auth 2>/dev/null || true)"
-            test -z "$token" || break
+            [[ "$token" =~ ^[0-9a-f]{64}$ ]] && break
             sleep 1
           done
-          test -n "$token"
+          [[ "$token" =~ ^[0-9a-f]{64}$ ]]
           install -d -m 700 "$HOME/.fieldwork"
           umask 077
           printf '%s\n' "$token" >"$HOME/.fieldwork/http-auth"
