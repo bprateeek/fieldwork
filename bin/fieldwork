@@ -3047,12 +3047,28 @@ EOF
       remote_bwrap_probe_ok() {
         ssh "$FIELDWORK_SSH_HOST" "bwrap --unshare-user --unshare-net --unshare-pid --unshare-uts --unshare-ipc --ro-bind / / --tmpfs /tmp --dev /dev --proc /proc -- /bin/true >/dev/null 2>&1"
       }
+      remote_verify_runner_unit_bwrap_compatible() {
+        ssh "$FIELDWORK_SSH_HOST" \
+          "grep -Fxq 'RestrictAddressFamilies=AF_UNIX AF_NETLINK' /etc/systemd/system/fieldwork-verify-runner@.service \
+            && grep -Fxq 'CapabilityBoundingSet=' /etc/systemd/system/fieldwork-verify-runner@.service \
+            && ! grep -Fxq 'ProtectKernelTunables=true' /etc/systemd/system/fieldwork-verify-runner@.service"
+      }
       remote_systemd_run_user_probe_ok() {
         ssh "$FIELDWORK_SSH_HOST" "command -v systemd-run >/dev/null 2>&1 && systemd-run --user --scope --quiet -p PrivateNetwork=yes -p PrivateTmp=yes -- /bin/true >/dev/null 2>&1"
       }
 	      if remote_bwrap_installed; then
 	        if remote_bwrap_probe_ok; then
-	          doctor_ok "verify inner sandbox ready (bwrap with unprivileged user namespaces)"
+	          if remote_verify_runner_unit_bwrap_compatible; then
+	            doctor_ok "verify inner sandbox ready (bwrap with unprivileged user namespaces)"
+	          else
+	            doctor_manual \
+	              "verify runner unit is stale for bwrap namespace setup" \
+	              "$runner_install_cmd" \
+	              "the host bwrap probe passes, but the installed runner still blocks AF_NETLINK or bwrap's private /proc mount" \
+	              "fieldwork-verify runs inside the hardened system unit, so a host-only bwrap probe is insufficient" \
+	              "reinstall the root-owned boundary units, then rerun fieldwork doctor --remote and fieldwork-verify" \
+	              "yes"
+	          fi
 	        else
 	          systemd_run_note=""
 	          if remote_systemd_run_user_probe_ok; then

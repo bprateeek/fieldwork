@@ -162,6 +162,9 @@ for unit in lib/systemd/fieldwork-{verify-runner,pr-prepare-runner}@.service; do
   grep -Fxq 'PrivateNetwork=true' "$unit"
   grep -Fxq 'ProtectHome=tmpfs' "$unit"
 done
+grep -Fxq 'RestrictAddressFamilies=AF_UNIX AF_NETLINK' lib/systemd/fieldwork-verify-runner@.service
+grep -Fxq 'CapabilityBoundingSet=' lib/systemd/fieldwork-verify-runner@.service
+! grep -Fxq 'ProtectKernelTunables=true' lib/systemd/fieldwork-verify-runner@.service
 
 check "broker service hardening and maintenance socket"
 for directive in \

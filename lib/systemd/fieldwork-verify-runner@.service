@@ -24,10 +24,16 @@ ProtectHome=tmpfs
 BindPaths=/home/fieldwork/projects /home/fieldwork/worktrees
 ReadWritePaths=/home/fieldwork/projects /home/fieldwork/worktrees /var/lib/fieldwork-verify
 PrivateDevices=true
-ProtectKernelTunables=true
+# bwrap needs AF_NETLINK to bring up loopback inside its new network
+# namespace, and it must mount a fresh /proc for its new PID namespace.
+# ProtectKernelTunables=true blocks that proc mount before the inner sandbox
+# exists. The runner is an unprivileged user with an empty capability set;
+# bwrap's read-only root and isolated namespaces are the tunable boundary.
+CapabilityBoundingSet=
+AmbientCapabilities=
 ProtectKernelModules=true
 ProtectControlGroups=true
 LockPersonality=true
 RestrictSUIDSGID=true
-RestrictAddressFamilies=AF_UNIX
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
 UMask=0077
