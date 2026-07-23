@@ -332,8 +332,8 @@ init_repo() {
     for f in "${skipped_files[@]}"; do echo "  - $f"; done
   fi
 
-  # Ensure .fieldwork/local/ is gitignored — required so per-repo broker pr-request.json
-  # doesn't dirty the tree. rsync --ignore-existing preserves the user's .gitignore as-is,
+  # Ensure .fieldwork/local/ is gitignored — required so per-repo broker build
+  # requests do not dirty the tree. rsync --ignore-existing preserves the user's .gitignore as-is,
   # so we append idempotently here.
   if [ -f "$REPO/.gitignore" ]; then
     if ! grep -qx '\.fieldwork/local/' "$REPO/.gitignore"; then

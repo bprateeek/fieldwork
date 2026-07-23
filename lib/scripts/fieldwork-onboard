@@ -1347,6 +1347,18 @@ else
 fi
 existing_pr="$(printf '%s' "$existing_pr" | tr -d '[:space:]')"
 
+# An existing PR is only a no-op when its remote branch already matches the
+# checkout. Reseeding can create a new local commit after the PR opened; that
+# commit must still pass through a fresh broker request and approval.
+if [ -n "$existing_pr" ]; then
+  local_init_head="$(ssh "$SSH_HOST" "git -C $REMOTE_REPO_DIR rev-parse HEAD" 2>/dev/null || true)"
+  remote_init_head="$(ssh "$SSH_HOST" "git -C $REMOTE_REPO_DIR ls-remote --heads origin 'refs/heads/$BRANCH' | awk 'NR == 1 { print \$1 }'" 2>/dev/null || true)"
+  if [ -z "$local_init_head" ] || [ "$local_init_head" != "$remote_init_head" ]; then
+    status_info_line "init PR #$existing_pr has new local commits; submitting its update through the broker"
+    existing_pr=""
+  fi
+fi
+
 # 6a. When no PR is open yet, detect the already-onboarded case: if the init
 # branch has no commits ahead of the default branch, the init PR was already
 # merged and there is nothing left to open — the broker would reject this as
@@ -1416,8 +1428,8 @@ EOF
     scp -q "$local_script" "$SSH_HOST:$remote_script"
   broker_status=0
   run_capture broker_response \
-    "opening init PR through broker" \
-    "init PR opened through broker" \
+    "submitting init branch through broker" \
+    "init branch accepted by broker" \
     ssh "$SSH_HOST" "bash $remote_script; status=\$?; rm -f $remote_script; exit \$status" || broker_status=$?
   # The uploader prints the broker's structured JSON response on stdout.
   broker_json="$(printf '%s\n' "$broker_response" | awk '/^\{.*\}$/ { print; exit }')"

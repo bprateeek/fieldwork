@@ -12,10 +12,12 @@ Runs the local gates that mirror PR-time CI checks so the PR opens green instead
 Execute the verify wrapper against the current project directory:
 
 ```bash
-/home/fieldwork/.local/bin/fieldwork-verify "$CLAUDE_PROJECT_DIR"
+/usr/local/bin/fieldwork-verify "$PWD"
 ```
 
-The wrapper is excluded from the agent sandbox (see `~/.claude/settings.json` → `sandbox.excludedCommands`) and runs the fixed pipeline of lint → typecheck → tests → gitleaks → semgrep, with each inner step confined inside its own network-off sandbox (bwrap or `systemd-run --user`).
+The root-owned wrapper is excluded from the agent sandbox and runs the fixed
+pipeline of lint → typecheck → tests → gitleaks → semgrep, with each inner step
+confined inside its own network-off bwrap sandbox.
 
 Invoke the command exactly as shown: absolute path, single directory argument, nothing before it. The sandbox exclusion is a literal prefix match on the command string; any prefix (`cd ... &&`, `env ...`, quoting the binary path, `;` chains) re-enables the per-call sandbox and the call fails with a bwrap error.
 
@@ -49,4 +51,5 @@ The user reads the failure and decides what to fix; the next session continues f
 
 ## On success
 
-Skill returns clean. The `pr-delivery` skill stages the intended paths, commits, writes the broker request file, and invokes `fieldwork-pr-submit`.
+Skill returns clean. The `pr-delivery` skill commits the intended paths, builds
+the protocol-v2 pack request, and uploads it through the broker.

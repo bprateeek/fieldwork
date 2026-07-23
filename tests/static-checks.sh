@@ -85,6 +85,10 @@ done
 
 check "protocol-v1 removal and checkout blindness"
 [ ! -e lib/scripts/fieldwork-pr-submit ] || die "protocol-v1 submitter still exists"
+! grep -R -Fq 'fieldwork-pr-submit' lib/templates/repo
+grep -Fq '/usr/local/bin/fieldwork-pr-build .fieldwork/local/pr-build-request.json' \
+  lib/templates/repo/.claude/skills/pr-delivery/SKILL.md
+grep -Fq "init PR #\$existing_pr has new local commits" lib/scripts/fieldwork-onboard
 ! grep -Eq 'FIELDWORK_BROKER_PROJECTS_ROOT|--projects-root' lib/broker/server.py lib/broker/standalone-install.sh
 ! grep -Eq 'repo_path|expected-origin|default-branch|approval-gate' lib/broker/server.py
 ! grep -Eq '\bgh\b|gh pr create' lib/broker/server.py lib/broker/standalone-install.sh
