@@ -100,6 +100,10 @@ grep -Fq 'hmac.compare_digest' lib/broker/server.py
 grep -Fq 'def broker_preflight(' lib/broker/server.py
 grep -Fq '"invalid_preflight_request"' lib/broker/server.py
 grep -Fq 'http://localhost/preflight' lib/scripts/fieldwork-onboard
+grep -Fq 'curl -fsSL https://claude.ai/install.sh | bash' \
+  lib/templates/repo/.github/workflows/claude-review.yml
+! grep -Fq 'curl -fsSL https://claude.ai/install.sh | sh' \
+  lib/templates/repo/.github/workflows/claude-review.yml
 grep -Fq 'socket_type == "maintenance" and not MAINTENANCE' lib/broker/server.py
 grep -Fq '/usr/local/lib/fieldwork-pr-broker' lib/broker/policy_writer.py
 grep -Fq 'os.fchown' lib/broker/policy_writer.py

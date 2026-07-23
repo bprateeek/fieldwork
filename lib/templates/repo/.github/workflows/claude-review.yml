@@ -35,7 +35,7 @@ jobs:
         if: ${{ env.ANTHROPIC_API_KEY != '' }}
         run: |
           set -euo pipefail
-          curl -fsSL https://claude.ai/install.sh | sh
+          curl -fsSL https://claude.ai/install.sh | bash
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           export PATH="$HOME/.local/bin:$PATH"
 
