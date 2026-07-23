@@ -269,7 +269,8 @@ link_one "$ROOT/bin/fieldwork" "$HOME/.local/bin/fieldwork"
 # skill via its absolute ~/.local/bin path so it can be listed in the agent's
 # `sandbox.excludedCommands`. fieldwork-verify-runner is invoked by systemd
 # socket activation, also via ~/.local/bin so the user unit's ExecStart is
-# stable. Mirror the fieldwork-pr-submit shape: ~/.fieldwork/scripts/ holds the
+# stable. In hard-boundary installs these clients are copied root-owned to
+# /usr/local; this symlink layout remains for convenience-only user installs.
 # canonical file, ~/.local/bin/ holds the symlink. fieldwork-verify-pipeline
 # is reached relative to the runner's location, so only ~/.fieldwork/scripts/.
 link_one "$HOME/.fieldwork/scripts/fieldwork-verify" "$HOME/.local/bin/fieldwork-verify"
@@ -280,6 +281,7 @@ link_one "$HOME/.fieldwork/scripts/fieldwork-verify-runner" "$HOME/.local/bin/fi
 # the runner via readlink -f.
 link_one "$HOME/.fieldwork/scripts/fieldwork-pr-prepare" "$HOME/.local/bin/fieldwork-pr-prepare"
 link_one "$HOME/.fieldwork/scripts/fieldwork-pr-prepare-runner" "$HOME/.local/bin/fieldwork-pr-prepare-runner"
+link_one "$HOME/.fieldwork/scripts/fieldwork-pr-build" "$HOME/.local/bin/fieldwork-pr-build"
 link_one "$HOME/.fieldwork/scripts/fieldwork-setup-probe" "$HOME/.local/bin/fieldwork-setup-probe"
 link_one "$HOME/.fieldwork/scripts/fieldwork-codex-sandbox" "$HOME/.local/bin/fieldwork-codex-sandbox"
 # fieldwork-task-enqueue is invoked by `fieldwork task add` over SSH and by the
@@ -291,7 +293,7 @@ link_one "$HOME/.fieldwork/scripts/fieldwork-task-dispatcher" "$HOME/.local/bin/
 record_group_state command
 
 start_group "Claude helpers"
-for script in fieldwork-project.sh fieldwork-status fieldwork-status-snapshot fieldwork-dashboard-server fieldwork-clone fieldwork-init fieldwork-launch fieldwork-pr-submit fieldwork-agent-session fieldwork-task-enqueue fieldwork-task-run fieldwork-task-dispatcher fieldwork-event-poll fieldwork-setup-probe fieldwork-session-probe fieldwork-codex-sandbox fieldwork-verify fieldwork-verify-runner fieldwork-verify-pipeline fieldwork-pr-prepare fieldwork-pr-prepare-runner fieldwork-pr-prepare-impl notify.sh; do
+for script in fieldwork-project.sh fieldwork-status fieldwork-status-snapshot fieldwork-dashboard-server fieldwork-clone fieldwork-init fieldwork-launch fieldwork-agent-session fieldwork-task-enqueue fieldwork-task-run fieldwork-task-dispatcher fieldwork-event-poll fieldwork-setup-probe fieldwork-session-probe fieldwork-codex-sandbox fieldwork-verify fieldwork-verify-runner fieldwork-verify-pipeline fieldwork-pr-prepare fieldwork-pr-prepare-runner fieldwork-pr-prepare-impl fieldwork-pr-build fieldwork-pr-upload notify.sh; do
   link_one "$ROOT/lib/scripts/$script" "$HOME/.fieldwork/scripts/$script"
 done
 link_one "$ROOT/lib/claude/CLAUDE.md" "$HOME/.claude/CLAUDE.md"
@@ -312,6 +314,7 @@ link_one "$ROOT/lib/systemd/fieldwork-event-poll.timer" "$HOME/.fieldwork/infra/
 link_one "$ROOT/lib/systemd/fieldwork-task-dispatcher.service" "$HOME/.fieldwork/infra/fieldwork-task-dispatcher.service"
 link_one "$ROOT/lib/systemd/fieldwork-pr-prepare-runner.socket" "$HOME/.fieldwork/infra/fieldwork-pr-prepare-runner.socket"
 link_one "$ROOT/lib/systemd/fieldwork-pr-prepare-runner@.service" "$HOME/.fieldwork/infra/fieldwork-pr-prepare-runner@.service"
+link_one "$ROOT/lib/systemd/install-boundary.sh" "$HOME/.fieldwork/infra/install-boundary.sh"
 link_one "$ROOT/lib/agents" "$HOME/.fieldwork/infra/agents"
 link_one "$ROOT/lib/broker" "$HOME/.fieldwork/infra/fieldwork-pr-broker"
 record_group_state vps

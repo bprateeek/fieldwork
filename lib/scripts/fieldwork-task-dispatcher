@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3 -I
 """fieldwork-task-dispatcher - schedule one_shot_job tasks.
 
 Always-on user service (fieldwork-task-dispatcher.service). It does NOT run
@@ -39,7 +39,7 @@ TASKS_DIR = Path(os.environ.get("FIELDWORK_TASKS_DIR", "/var/lib/fieldwork-tasks
 QUEUE = TASKS_DIR / "queue"
 PROCESSING = TASKS_DIR / "processing"
 FAILED = TASKS_DIR / "failed"
-RUN_BIN = os.environ.get("FIELDWORK_TASK_RUN_BIN", str(HOME / ".local" / "bin" / "fieldwork-task-run"))
+RUN_BIN = os.environ.get("FIELDWORK_TASK_RUN_BIN", "/usr/local/lib/fieldwork/fieldwork-task-run")
 PROJECTS_ROOT = Path(os.environ.get("FIELDWORK_PROJECTS_ROOT", str(HOME / "projects")))
 POLL_SECONDS = int(os.environ.get("FIELDWORK_TASK_POLL_SECONDS", "5") or "5")
 DISPATCH_ONCE = os.environ.get("FIELDWORK_TASK_DISPATCH_ONCE") == "1"

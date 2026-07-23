@@ -1,140 +1,106 @@
-# Runbook
+# Operations runbook
 
-This doc is task-oriented (flows you'll do). For a per-command index, see [cli-reference.md](cli-reference.md).
-
-## Flow A: Onboard an Existing Repo
-
-1. Widen the existing broker credential to include the target project. For
-   GitHub, that means adding `<owner>/<repo>` to the fine-grained PAT or GitHub
-   App installation. For GitLab, use a Project Access Token on the target
-   project with Developer role and `api` plus `write_repository` scopes.
-2. Run:
-
-   ```sh
-   fieldwork onboard <project> --with-approval-gate
-   ```
-
-   If the broker PAT does not have Workflows read/write, use:
-
-   ```sh
-   fieldwork onboard <project> --no-workflows
-   ```
-
-3. Paste the read-only deploy key when prompted.
-4. In Claude mode, run the printed `ssh -t fieldwork-vps ...` commands to
-   prime workspace trust and remote-control consent. In Codex mode, Codex
-   Desktop owns the live SSH session and remote-project folder state.
-5. Review the init PR/MR in GitHub or GitLab mobile.
-6. Merge only after reading the diff and CI results; failed workflow checks
-   need review even when the broker successfully opened the PR.
-7. Prove the broker path without Claude or Codex:
-
-   ```sh
-   fieldwork smoke <owner>/<repo>
-   ```
-
-   `fieldwork smoke` is GitHub-only. For GitLab, use a throwaway project and
-   prove onboarding, broker preflight, push/MR creation, approval-gated push,
-   no-diff, and verify-fail paths.
-
-8. Refresh the VPS checkout:
-
-   ```sh
-   fieldwork refresh <slug>
-   ```
-
-### Pause And Resume
-
-`fieldwork onboard` is designed to be rerun. It stores a non-secret checkpoint in the VPS checkout at `.fieldwork/local/fieldwork-onboard-state.json` after the repo has been cloned.
-
-If you stop during deploy-key setup, workspace trust, remote-control consent, init PR creation, or systemd startup, rerun:
+## Daily checks
 
 ```sh
-fieldwork onboard <project>
+fieldwork doctor --remote --explain      # VPS
+fieldwork verify-security                # VPS
+sudo fieldwork-local status              # local
+sudo fieldwork-local logs broker         # local
 ```
 
-To inspect progress without changing anything:
+Use `/usr/local/bin/fieldwork-pr-upload --status <request-id>` for durable
+request state. Do not infer completion from notification delivery.
+
+## Stop intake
+
+Local:
 
 ```sh
-fieldwork onboard <project> --status
+sudo fieldwork-local down
 ```
 
-If the checkpoint is stale or corrupt:
+VPS:
 
 ```sh
-fieldwork onboard <project> --reset-state
+sudo systemctl stop 'fieldwork-agent@*.service'
+sudo systemctl stop fieldwork-pr-broker.socket fieldwork-pr-approve.socket
 ```
 
-## Flow B: Bootstrap a New Project
+Preserve state. If credential exposure is possible, revoke the forge token
+before diagnostics.
 
-For an empty GitHub-first project:
+## Protocol-v2 upgrade transaction
+
+The upgrade is discrete; do not run mixed v1/v2 intake.
+
+1. Stop task intake and all agent sessions.
+2. Drain or quarantine every v1 pending request. V1 records have no pack and
+   cannot be approved by v2.
+3. Verify both release chains and install v2. Confirm the persistent MAC key was
+   generated.
+4. Re-wire every slug. Re-wire is the default: the migration helper may prefill
+   only project and base branch for confirmation. It must not import host, CA,
+   private-network opt-in, or automatic approval.
+5. Start maintenance.
+
+VPS:
 
 ```sh
-gh repo create <owner>/<repo> --private --description "<description>"
-fieldwork onboard <owner>/<repo>
+sudo /usr/local/sbin/fieldwork-pr-maintenance-mode start
 ```
 
-Then open Claude mobile or Codex Desktop and ask the repo session to scaffold
-the project in a follow-up PR.
-
-For a local scaffold first:
+Local:
 
 ```sh
-pnpm create vite my-app --template react-ts
-cd my-app
-git init -b main
-git add -A
-git commit -m "initial scaffold"
-gh repo create <owner>/my-app --private --source=. --push
-fieldwork onboard <owner>/my-app
+sudo fieldwork-local maintenance-start
 ```
 
-## Flow C: Daily Agent Work
+6. For each repository, run the structural migrator:
 
-1. Open Claude mobile and tap the `vps-<slug>` session, or open Codex Desktop
-   `Connections -> SSH`, enable `"Available from signed-in devices"` in Details,
-   then open `/home/fieldwork/projects/<slug>` on mobile or desktop. For Codex
-   folder or Offline confusion, run `fieldwork doctor --remote <slug> --explain`.
-   Before Codex PR work, the mobile header should show the repo on the
-   configured VPS SSH connection (for example, `fieldwork-vps`; it may display
-   as the server name), not the local Mac/Windows host.
-2. Describe the task. For broad work, ask the agent for a plan first.
-3. Respond when the agent needs input or permission. Claude can send ntfy
-   lifecycle notifications; Codex lifecycle notifications are not wired in this
-   milestone.
-4. If the repo is approval-gated, approve or deny the PR/MR request in Telegram.
-5. Review the PR/MR in GitHub or GitLab mobile.
-6. Merge only when the diff and checks are acceptable.
-7. Refresh the VPS checkout after merge.
+```sh
+sudo /usr/local/sbin/fieldwork-migrate-instructions /path/to/checkout
+```
 
-## Notification Icons
+It replaces only an exact byte match of a known legacy delivery section, creates
+`fieldwork/protocol-v2-instructions`, and commits the change. Modified or
+ambiguous instructions are reported and left untouched.
 
-| Icon | Meaning | Action |
-|---|---|---|
-| checkmark | clean turn end | open the session if a PR URL is expected |
-| question mark | Claude needs input or approval | answer in Claude mobile or Telegram |
-| x | failure | read the session and, if needed, inspect the journal |
+7. Build and submit that migration branch through the privileged maintenance
+path using the same v2 metadata plus pack. Never push the default branch.
+8. Merge migration PRs.
+9. Stop maintenance and explicitly restart without the maintenance environment.
+   On VPS run `sudo /usr/local/sbin/fieldwork-pr-maintenance-mode stop`; locally
+   use `sudo fieldwork-local maintenance-stop`.
+10. Re-enable normal broker sockets, dispatcher, timer, and agent sessions.
 
-## Caveats
+Normal `/pr` and `/approve` return 503 in maintenance. Status and
+reconciliation continue. A repository remains `repo_not_wired` until its
+broker-owned policy exists.
 
-- Workspace trust is one-time per repo, but must be repeated if the clone is deleted.
-- Default onboarding adds workflow templates; `--no-workflows` skips them and leaves existing workflow files untouched. Do not merge an init PR with failed workflow checks until you understand whether the failure is template tuning, GitHub billing/permissions, or an intentional no-workflows choice.
-- Approval gating requires `fieldwork setup-notify --telegram-bot` and `.fieldwork/approval-gate`.
-- Private repos without paid GitHub features may not enforce branch protection or secret scanning. GitLab onboarding currently skips branch protection, secret scanning, CodeQL, and `.github/` templates.
-- If GitHub Actions says billing is locked, Fieldwork opened the PR successfully but GitHub refused to start CI. Fix billing or rerun checks before treating the PR as green.
-- Fieldwork records the forge default branch during onboarding. Rename unusual
-  default branches before onboarding if `fieldwork onboard` rejects the branch
-  shape.
-- Anything merged to the default branch may deploy if the repo has Vercel,
-  Cloudflare Pages, or similar automation.
+## Pending and policy incidents
 
-## Future Codex Paths
+- `metadata_tampered`: preserve record/pack and audit evidence; do not bypass
+  the HMAC check.
+- `policy_changed`: request is `needs_operator`; inspect whether a pinned
+  branch was already pushed, then explicitly decide whether to resubmit.
+- `unexpected_objects`: reject the upload; rebuild from a clean, non-alternate
+  SHA-1 checkout.
+- `pack_limits_exceeded`: establish a common base; raise caps only after
+  reviewing repository size and resource limits.
+- `private_network_rejected`: inspect all DNS answers. Enable private
+  networking only for an intentionally self-managed forge.
 
-- Experimental direct VPS `codex remote-control` is not part of the supported
-  V1 path; it needs a controlled test before Fieldwork can expose `start|stop`
-  helpers.
-- A Fieldwork-owned mobile controller over Codex app-server/SDK is the stronger
-  long-term option because it can preserve the broker PR boundary without
-  depending on Codex Desktop mobile rollout details.
-- Queued mobile jobs via Telegram or a small web surface are a lighter fallback
-  for non-interactive Codex work.
+## Recovery after crash
+
+Restart the broker without deleting state. Reconciliation validates MAC, pack,
+and policy; queries remote branch and PR state; and performs only missing steps.
+Never manually change state JSON. A policy change after a push intentionally
+stops at `needs_operator`.
+
+## Token rotation
+
+Drain or pause writes, then use `rotate-pat` on VPS or
+`sudo fieldwork-local token` locally. Both validate forge reachability and fail
+closed. Pending-record MAC-key rotation is separate and requires an empty
+pending set.

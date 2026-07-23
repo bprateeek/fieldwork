@@ -1,0 +1,84 @@
+{
+  "allowManagedHooksOnly": true,
+  "allowManagedMcpServersOnly": true,
+  "allowManagedPermissionRulesOnly": true,
+  "allowedMcpServers": [],
+  "autoMemoryEnabled": false,
+  "disableArtifact": true,
+  "disableBypassPermissionsMode": "disable",
+  "disableClaudeAiConnectors": true,
+  "disableSideloadFlags": true,
+  "strictKnownMarketplaces": [],
+  "permissions": {
+    "deny": [
+      "WebFetch",
+      "WebSearch",
+      "Bash(docker *)",
+      "Bash(podman *)",
+      "Bash(colima *)",
+      "Bash(orbstack *)",
+      "Bash(nerdctl *)",
+      "Bash(systemctl --user *)",
+      "Bash(systemd-run *)",
+      "Read(~/.claude.json)",
+      "Read(~/.claude/**)",
+      "Read(~/.fieldwork/http-auth)",
+      "Read(~/.ssh/**)",
+      "Read(~/.docker/**)",
+      "Read(~/.colima/**)",
+      "Read(~/.orbstack/**)",
+      "Read(~/.config/containers/**)",
+      "Read(//var/run/docker.sock)",
+      "Read(//run/user/*/bus)"
+    ]
+  },
+  "sandbox": {
+    "enabled": true,
+    "failIfUnavailable": true,
+    "allowUnsandboxedCommands": false,
+    "excludedCommands": [
+      "/usr/local/bin/fieldwork-pr-upload *",
+      "/usr/local/bin/fieldwork-pr-prepare *",
+      "/usr/local/bin/fieldwork-verify *"
+    ],
+    "filesystem": {
+      "allowManagedReadPathsOnly": true,
+      "allowRead": ["."],
+      "allowWrite": [
+        ".",
+        "/private/var/run/fieldwork/*/spool",
+        "/run/user/*/fieldwork/spool"
+      ],
+      "denyRead": [
+        "~/.claude",
+        "~/.claude.json",
+        "~/.fieldwork/http-auth",
+        "~/.ssh",
+        "~/.docker",
+        "~/.colima",
+        "~/.orbstack",
+        "~/.config/containers",
+        "/var/run/docker.sock",
+        "/run/user/*/bus"
+      ],
+      "denyWrite": [
+        "~/.claude",
+        "~/.claude.json",
+        "~/.fieldwork/http-auth",
+        "~/.ssh",
+        "~/.docker",
+        "~/.colima",
+        "~/.orbstack",
+        "~/.config/containers",
+        "/var/run/docker.sock",
+        "/run/user/*/bus"
+      ]
+    },
+    "network": {
+      "allowedDomains": [],
+      "allowManagedDomainsOnly": true,
+      "allowAllUnixSockets": false,
+      "allowLocalBinding": false
+    }
+  }
+}

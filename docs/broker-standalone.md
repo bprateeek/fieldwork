@@ -1,243 +1,105 @@
-# Standalone Broker
+# Standalone broker
 
-> Advanced / operator path. The supported developer preview path is `fieldwork setup`.
-> Use this guide only when you are integrating the PR broker with a non-Fieldwork
-> agent or custom control plane.
+Use the standalone installer to give another agent the protocol-v2 delivery
+boundary without the rest of the Fieldwork VPS UI.
 
-The Fieldwork PR broker is a small Linux daemon that owns the forge write
-credential, listens on a Unix socket for JSON PR requests from an unprivileged
-agent user, and opens the PR/MR on the agent's behalf. **You don't need the rest
-of Fieldwork to use it.** Any coding agent (Claude, Codex, OpenAI Agent SDK, a
-CI runner, anything that can write a JSON request) can submit review requests
-through it without ever holding a forge token itself.
+## Requirements
 
-If you are running Fieldwork end-to-end, run `fieldwork setup` and use
-[`setup.md`](setup.md) instead. Setup handles broker install for you. This page
-is for **broker-only** installs.
+- systemd Linux with Python 3.10+, Git, OpenSSL, and gitleaks;
+- an existing unprivileged agent user;
+- a verified Fieldwork release tree;
+- a least-privilege GitHub or GitLab token.
 
-## What you get
-
-- A systemd-managed daemon (`fieldwork-pr-broker.service`) running as its own
-  user, with the token or GitHub App private key in a 0600 file only it can read.
-- A Unix socket at `/run/fieldwork-pr-broker/fieldwork-pr.sock`, group-writable
-  by your agent user.
-- A `rotate-pat` helper to (re)store the broker credential without it ever
-  passing through argv or environment.
-- A documented JSON request contract (see [`broker-contract.md`](broker-contract.md))
-  and [`../schema/pr-request.schema.json`](../schema/pr-request.schema.json).
-- Replay protection (per-request UUID, stored ledger), per-repo rate limiting,
-  secret-shaped body scanning via `gitleaks`, branch-prefix enforcement, and
-  origin-spoofing checks. See [`threat-model.md`](threat-model.md).
-
-The broker is agent-agnostic: it does not know or care which coding agent
-produced the commit, only that the request satisfies the contract.
-
-## Prerequisites
-
-These must already be installed on the host. The standalone installer **does
-not** install them. It only checks for them and fails fast if anything is
-missing:
-
-- Ubuntu 24.04 LTS (other systemd-based distros likely work; only 24.04 is
-  tested in developer preview).
-- `python3` (3.8+, stdlib only, no pip packages needed).
-- `gh` (the GitHub CLI), used by the broker to create GitHub PRs. GitLab
-  standalone installs do not use `gh` at request time, but the installer still
-  checks the shared broker dependency set in this preview.
-- `gitleaks`, used by the broker to scan the PR body before opening.
-- An unprivileged agent user that already exists on the host. The broker reads
-  per-repo checkouts under that user's home; it does not need write access there.
-
-If you already use Fieldwork's `bootstrap-vps.sh` you have all of these. If you
-are wiring the broker into a different agent host, install them however your
-distro prefers.
+`gh` is not a runtime dependency.
 
 ## Install
 
-From a checkout of this repo on the target host:
-
-```bash
-sudo bash lib/broker/standalone-install.sh \
-  --agent-user alice \
-  --projects-root /home/alice/projects
+```sh
+sudo bash lib/broker/standalone-install.sh --agent-user alice
 ```
 
-Flags (all optional except `--agent-user`):
+Optional flags select a different broker user or submit-socket group. The
+installer creates:
 
-| Flag | Default | Purpose |
-|---|---|---|
-| `--agent-user` | (required) | Unprivileged user that will submit requests. Must already exist; the broker socket group is added to this user. |
-| `--projects-root` | `/home/<agent-user>/projects` | Directory containing per-repo checkouts the broker may read and push from. |
-| `--broker-user` | `fieldwork-pr-broker` | Broker daemon user. |
-| `--broker-group` | agent user's primary group | Socket-access group for the submit socket. Leave unset unless you know your agent preserves supplementary groups. |
-| `--verbose` | off | Stream raw install output instead of buffering to the install log. |
-| `--log-file <path>` | auto | Override the install log path. |
+- broker service and submit/approve sockets;
+- non-enabled root-only maintenance socket;
+- broker-owned policy, CA, pending, ledger, tombstone, and key stores;
+- persistent 0600 pending-record MAC key;
+- root-owned build/upload clients and policy/token maintenance tools.
 
-After the install completes:
+The broker has `ProtectHome=yes` and no checkout access.
 
-1. Store the broker's forge credential. GitHub PAT mode is the default: the broker
-   reads the PAT from a 0600 file; this is the only path the PAT takes into the
-   broker.
+## Wire a slug
 
-   ```bash
-   sudo /usr/local/sbin/rotate-pat
-   ```
-
-   GitLab mode stores a GitLab token in the same broker-private token file and
-   persists the selected backend:
-
-   ```bash
-   sudo env FIELDWORK_FORGE=gitlab \
-     FIELDWORK_GITLAB_API=https://gitlab.com/api/v4 \
-     FIELDWORK_ROTATE_PAT_TTY=1 \
-     /usr/local/sbin/rotate-pat
-   ```
-
-   Use a Project Access Token with Developer role and `api` plus
-   `write_repository` scopes. For self-managed GitLab, set
-   `FIELDWORK_GITLAB_API` to the exact `https://host/api/v4` API root. If the
-   instance needs a private CA, install it on the broker host and set
-   `FIELDWORK_GITLAB_CA_BUNDLE` to that broker-local PEM path.
-
-   GitHub App mode stores the App private key instead and mints short-lived
-   installation tokens at request time:
-
-   ```bash
-   sudo env FIELDWORK_GITHUB_CREDENTIAL_MODE=app \
-     FIELDWORK_GITHUB_APP_ID=<app-id> \
-     FIELDWORK_GITHUB_APP_INSTALLATION_ID=<installation-id> \
-     /usr/local/sbin/rotate-pat < github-app-private-key.pem
-   ```
-
-2. Confirm the broker is up:
-
-   ```bash
-   systemctl status fieldwork-pr-broker.service
-   ls -l /run/fieldwork-pr-broker/fieldwork-pr.sock
-   # srw-rw---- 1 fieldwork-pr-broker alice ... fieldwork-pr.sock
-   ```
-
-3. Confirm the agent can see the socket group. By default this is the agent
-   user's primary group, so no extra membership is needed. If you passed
-   `--broker-group`, reconnect after install so the new group is visible:
-
-   ```bash
-   id alice
-   ```
-
-## Per-repo setup
-
-For each repository the agent will work on, the checkout must:
-
-- Live under `--projects-root` (default `/home/<agent-user>/projects/<slug>`).
-- Contain a `.fieldwork/expected-origin` file with the HTTPS URL of the
-  upstream repo/project (for example, `https://github.com/owner/repo.git` or
-  `https://gitlab.example.com/group/subgroup/project.git`).
-- Have its `origin` remote pointing at the same project (HTTPS or SSH style).
-  For GitLab, the expected-origin host must match `FIELDWORK_GITLAB_API`; SSH
-  remotes are parsed only for the project path. The broker checks both and refuses if they don't
-  match.
-
-This is how the broker prevents an attacker who can change the local checkout's
-remote from re-pointing pushes at a different repo.
-
-## Submitting a PR
-
-The agent assembles a JSON request that matches
-[`../schema/pr-request.schema.json`](../schema/pr-request.schema.json) and POSTs
-it to the broker's Unix socket.
-
-### Python (reference client)
-
-The repo ships [`../examples/broker-client.py`](../examples/broker-client.py),
-~50 lines, stdlib only. Drop it into any agent project:
-
-```bash
-python3 examples/broker-client.py path/to/request.json
-# prints https://github.com/owner/repo/pull/123
+```sh
+sudo /usr/local/sbin/fieldwork-policy-write \
+  --policy-dir /var/lib/fieldwork-pr-broker/policy \
+  --ca-dir /var/lib/fieldwork-pr-broker/ca \
+  --slug app \
+  --forge github \
+  --project owner/app \
+  --base-branch main \
+  --approval require
 ```
 
-Request file:
+The writer defaults to required approval, validates endpoint relationships,
+copies custom CA material into a content-addressed store, refuses symlink
+targets, and replaces policy atomically. For self-managed GitLab supply the
+GitLab endpoint options and use `--allow-private-network` only when the
+operator intends access to private address space.
+
+## Store or rotate the credential
+
+```sh
+sudo /usr/local/sbin/rotate-pat
+```
+
+The helper validates the token against the configured forge and stores it as a
+broker-only 0600 file. The broker rereads the credential per request.
+
+## Agent delivery
+
+The agent commits on `fieldwork/...` and writes:
 
 ```json
 {
-  "request_id": "2d7b8cf0-6c9d-42e2-a0e1-f8d3c4d5f678",
-  "created_at": "2026-05-11T10:30:00Z",
-  "repo_path": "/home/alice/projects/my-app",
-  "branch": "fieldwork/fix-login-redirect",
-  "title": "Fix login redirect after auth",
-  "body": "Summary:\n- Preserve next URL during login.\n\nTests:\n- npm test"
+  "schema_version": 2,
+  "slug": "app",
+  "branch": "fieldwork/change",
+  "title": "Change",
+  "body": "Summary and tests"
 }
 ```
 
-`request_id` must be a fresh UUID. Duplicates are rejected with HTTP 409 as
-replay protection. The branch prefix (`fieldwork` by default) is configurable
-via `FIELDWORK_BROKER_BRANCH_PREFIX` at install time.
+Then:
 
-### curl
-
-`curl` speaks Unix sockets directly; useful from shells and CI without writing
-client code:
-
-```bash
-curl --unix-socket /run/fieldwork-pr-broker/fieldwork-pr.sock \
-  -H 'Content-Type: application/json' \
-  --data @request.json \
-  http://localhost/pr
+```sh
+fieldwork-pr-build .fieldwork/local/pr-build-request.json
+/usr/local/bin/fieldwork-pr-upload <printed-request-id>
 ```
 
-The `Host:` header is required by HTTP/1.1 but ignored by the broker; any value
-works.
+For required approval, an operator or isolated approval service speaks the
+`POST /approve` contract on the approve socket. Query with uploader
+`--status`.
 
-### Any other language
+## Operational checks
 
-Open a `AF_UNIX SOCK_STREAM` socket, send a minimal HTTP/1.1 `POST /pr` request
-with `Content-Length` and the JSON body, read the response. The wire format is
-documented in [`broker-contract.md`](broker-contract.md). The reference Python
-client is the smallest correct implementation worth copying.
+```sh
+systemctl status fieldwork-pr-broker.socket fieldwork-pr-approve.socket
+journalctl -u fieldwork-pr-broker.service
+sudo stat -c '%U:%G %a' /etc/fieldwork-pr-broker/gh-token
+sudo stat -c '%U:%G %a' /var/lib/fieldwork-pr-broker/keys/pending-mac.key
+```
 
-## Operational notes
+Back up policy, CA material, token, MAC key, replay ledger, pending stores, and
+tombstones together. Do not rotate the MAC key while work is pending.
 
-- **Logs:** `/var/log/fieldwork-pr-broker.log` (mode 0640, owned by the broker
-  user). Includes request IDs, validation results, push attempts, and rejection
-  reasons. **Does not include the token.**
-- **Replay ledger:** `/var/lib/fieldwork-pr-broker/requests/<request_id>.json`,
-  one file per accepted request, mode 0600.
-- **Rate limit:** 12 PRs/MRs per hour per project, in-memory; resets on broker
-  restart. Adjust with `FIELDWORK_BROKER_RATE_LIMIT_PER_HOUR` in the broker
-  service environment. Bad values fall back to the default; values are clamped
-  to `1..120`.
-- **Forge and credentials:** `FIELDWORK_FORGE=github` is the default backend.
-  `FIELDWORK_FORGE=gitlab` enables core GitLab push/MR creation. For GitHub,
-  `FIELDWORK_GITHUB_CREDENTIAL_MODE=pat` is the default credential provider;
-  `app` uses the stored GitHub App private key to mint
-  one-hour installation tokens, cached by the broker and refreshed before
-  expiry. GitLab uses the
-  stored token via `PRIVATE-TOKEN` and requires `FIELDWORK_GITLAB_API` for
-  self-managed hosts.
-- **Token rotation:** `sudo /usr/local/sbin/rotate-pat` prompts for the new token
-  and writes it atomically; the broker re-reads on the next request.
-- **GitHub App token files:** installation tokens are never written to
-  `/etc/fieldwork-pr-broker/gh-token`. For `git push`, the broker writes the
-  short-lived token to a broker-private file under `/run/fieldwork-pr-broker`,
-  points `FIELDWORK_BROKER_TOKEN_PATH` at it for `git-askpass`, and removes it
-  after the request.
-- **Re-install:** `lib/broker/standalone-install.sh` is idempotent; rerun it
-  after a Fieldwork upgrade to pick up new daemon code. The ledger, log, and
-  stored token are preserved.
+## Upgrade
 
-## Trust model in one paragraph
-
-Two unix uids. The **broker user** holds the forge credential and runs the daemon.
-The **agent user** writes commits to checkouts under `--projects-root` and
-submits JSON requests over a socket whose group it is in. Cross-uid auth is by
-filesystem group on the socket. There are no shared secrets in env vars or
-config files between them. The broker validates every request before any
-forge-side action; rejected requests never touch `git push` or PR/MR creation.
-Full detail in [`threat-model.md`](threat-model.md).
-
-## Writing your own agent adapter
-
-If you want your agent to plug into a Fieldwork host the way Claude Code does
-(rather than just calling the broker directly from your own code), see
-[`agent-adapters.md`](agent-adapters.md) for the adapter contract.
+Protocol v1 and v2 are not mixed. Stop agent intake/sessions, drain or quarantine
+v1 pending work, verify and install the v2 release, re-wire policies, start the
+root-only maintenance socket explicitly, migrate structural instructions on
+`fieldwork/...` branches through PRs, stop maintenance, and restart normal
+intake. Use `sudo fieldwork-pr-maintenance-mode start` and
+`sudo fieldwork-pr-maintenance-mode stop` for the fail-closed socket/service
+transaction. See [runbook](runbook.md).

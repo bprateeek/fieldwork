@@ -56,7 +56,7 @@ fieldwork adapter doctor claude-remote-control
 each per-repo session it picks an adapter name and execs it:
 
 ```text
-~/.fieldwork/infra/agents/<adapter-name> <repo-slug> <repo-dir>
+/usr/local/lib/fieldwork/agents/<adapter-name> <repo-slug> <repo-dir>
 ```
 
 Your adapter must:
@@ -70,12 +70,12 @@ Your adapter must:
    The branch prefix is exported by `fieldwork-agent-session` and the broker
    enforces the same prefix on every PR request. Anything else is rejected.
 
-3. **Never receive the forge write token.** PRs/MRs go through the broker
-   (`lib/scripts/fieldwork-pr-submit`, or your agent's own equivalent that
-   POSTs to the broker socket). In the default install, the broker submit
-   socket is writable by the agent user's primary group so it survives sandbox
-   user-namespace group stripping. The agent user is not in any group that can
-   read the PAT file.
+3. **Never receive the forge write token.** Commit a clean `fieldwork/...`
+   branch, build protocol-v2 metadata plus a non-thin pack with
+   `fieldwork-pr-build`, then invoke the absolute root-owned
+   `/usr/local/bin/fieldwork-pr-upload` as a separate top-level command. The
+   broker socket is writable by the agent identity, but the credential, policy,
+   pending packs, and MAC key are not.
 
 4. **Honor `FIELDWORK_SKIP_LOCAL_HOOKS`** for any hooks/notifications you ship.
    When set, the adapter is running in a non-local context (e.g. cloud /

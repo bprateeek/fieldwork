@@ -1,1287 +1,859 @@
 #!/usr/bin/env python3
-"""Broker validation smoke tests.
-
-These tests run entirely in a temporary projects root. They do not contact
-GitHub, do not need a broker socket, and do not use a real PAT.
-"""
+"""Protocol-v2 broker security and lifecycle tests."""
 
 from __future__ import annotations
 
-import base64
+import contextlib
 import importlib.util
+import io
 import json
 import os
-import shutil
+from pathlib import Path
 import socket
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
-import urllib.error
-import urllib.request
 import uuid
-from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
+BROKER_DIR = ROOT / "lib/broker"
+SCHEMA = ROOT / "schema/pr-request.schema.json"
+ASKPASS = BROKER_DIR / "git-askpass"
+MIGRATOR = BROKER_DIR / "migrate-instructions"
+IMPORT_STATE = tempfile.TemporaryDirectory(prefix="fieldwork-broker-import-")
+IMPORT_ROOT = Path(IMPORT_STATE.name)
+os.environ.update({
+    "FIELDWORK_BROKER_LOG_PATH": str(IMPORT_ROOT / "broker.log"),
+    "FIELDWORK_BROKER_SCHEMA_PATH": str(SCHEMA),
+    "FIELDWORK_BROKER_POLICY_DIR": str(IMPORT_ROOT / "policy"),
+    "FIELDWORK_BROKER_CA_DIR": str(IMPORT_ROOT / "ca"),
+    "FIELDWORK_BROKER_LEDGER_DIR": str(IMPORT_ROOT / "ledger"),
+    "FIELDWORK_BROKER_PENDING_META_DIR": str(IMPORT_ROOT / "meta"),
+    "FIELDWORK_BROKER_PENDING_SIDECAR_DIR": str(IMPORT_ROOT / "sidecar"),
+    "FIELDWORK_BROKER_PENDING_PACK_DIR": str(IMPORT_ROOT / "pack"),
+    "FIELDWORK_BROKER_TOMBSTONE_DIR": str(IMPORT_ROOT / "tombstones"),
+    "FIELDWORK_BROKER_WORK_DIR": str(IMPORT_ROOT / "work"),
+    "FIELDWORK_BROKER_PENDING_MAC_KEY_PATH": str(IMPORT_ROOT / "mac.key"),
+    "FIELDWORK_BROKER_TOKEN_PATH": str(IMPORT_ROOT / "token"),
+    "FIELDWORK_BROKER_NOTIFICATIONS_DIR": str(IMPORT_ROOT / "notifications"),
+})
+sys.path.insert(0, str(BROKER_DIR))
 
 
-class BrokerValidationTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls) -> None:
-        cls.tmp = Path(tempfile.mkdtemp(prefix="fieldwork-broker-tests."))
-        cls.projects = cls.tmp / "projects"
-        cls.ledger = cls.tmp / "ledger"
-        cls.audit = cls.tmp / "audit.jsonl"
-        cls.pending = cls.tmp / "pending"
-        cls.app_tokens = cls.tmp / "app-tokens"
-        cls.fake_bin = cls.tmp / "bin"
-        cls.projects.mkdir()
-        cls.ledger.mkdir()
-        cls.pending.mkdir()
-        cls.app_tokens.mkdir()
-        cls.fake_bin.mkdir()
+def load(name: str, path: Path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
 
-        gitleaks = cls.fake_bin / "gitleaks"
-        gitleaks.write_text(
-            "#!/usr/bin/env bash\n"
-            "if grep -R -q 'SECRET_SHAPED_TOKEN' \"${2:-}\" 2>/dev/null; then exit 1; fi\n"
-            "exit 0\n"
-        )
-        gitleaks.chmod(0o755)
 
-        os.environ["PATH"] = f"{cls.fake_bin}:{os.environ['PATH']}"
-        os.environ["FIELDWORK_BROKER_COMMAND_PATH"] = os.environ["PATH"]
-        os.environ["FIELDWORK_BROKER_PROJECTS_ROOT"] = str(cls.projects)
-        os.environ["FIELDWORK_BROKER_LEDGER_DIR"] = str(cls.ledger)
-        os.environ["FIELDWORK_BROKER_AUDIT_LOG_PATH"] = str(cls.audit)
-        os.environ["FIELDWORK_BROKER_PENDING_DIR"] = str(cls.pending)
-        os.environ["FIELDWORK_BROKER_SCHEMA_PATH"] = str(ROOT / "schema/pr-request.schema.json")
-        os.environ["FIELDWORK_BROKER_LOG_PATH"] = str(cls.tmp / "broker.log")
-        os.environ["FIELDWORK_BROKER_TOKEN_PATH"] = str(cls.tmp / "gh-token")
-        os.environ["FIELDWORK_BROKER_ASKPASS_PATH"] = str(cls.tmp / "git-askpass")
-        os.environ["FIELDWORK_GITHUB_APP_TOKEN_DIR"] = str(cls.app_tokens)
+server = load("fieldwork_broker_v2", BROKER_DIR / "server.py")
+policy_writer = load("fieldwork_policy_writer_v2", BROKER_DIR / "policy_writer.py")
+originnorm = load("fieldwork_originnorm_v2", BROKER_DIR / "originnorm.py")
 
-        spec = importlib.util.spec_from_file_location("fieldwork_broker_server", ROOT / "lib/broker/server.py")
-        assert spec and spec.loader
-        cls.server = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = cls.server
-        spec.loader.exec_module(cls.server)
 
-    @classmethod
-    def tearDownClass(cls) -> None:
-        shutil.rmtree(cls.tmp)
+def git(cwd: Path, *args: str, input_bytes: bytes | None = None) -> bytes:
+    result = subprocess.run(
+        ["/usr/bin/git", *args], cwd=cwd, input=input_bytes,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True,
+        env={"PATH": "/usr/bin:/bin", "HOME": str(cwd), "LANG": "C", "LC_ALL": "C"},
+    )
+    return result.stdout
 
-    def setUp(self) -> None:
-        self.server._recent_requests.clear()
-        for item in self.ledger.glob("*.json"):
-            item.unlink()
-        for item in self.pending.glob("*"):
-            item.unlink()
-        gh = self.fake_bin / "gh"
-        if gh.exists():
-            gh.unlink()
-        token = self.tmp / "gh-token"
-        if token.exists():
-            token.unlink()
-        for item in self.app_tokens.glob("*"):
-            item.unlink()
-        if self.audit.exists():
-            self.audit.unlink()
-        self.server.GITHUB_CREDENTIAL_MODE = "pat"
-        self.server.FORGE = "github"
-        self.server.GITHUB_API = "https://api.github.com"
-        self.server.GITLAB_API = "https://gitlab.com/api/v4"
-        self.server.GITLAB_CA_BUNDLE = ""
-        self.server.GITHUB_APP_ID = ""
-        self.server.GITHUB_APP_INSTALLATION_ID = ""
-        self.server.GITHUB_APP_PRIVATE_KEY_PATH = "/etc/fieldwork-pr-broker/github-app-private-key.pem"
-        self.server._github_app_token_cache.clear()
 
-    def git(self, *args: str, cwd: Path) -> None:
-        subprocess.run(["git", *args], cwd=cwd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+class BrokerV2Tests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="fieldwork-broker-v2-")
+        self.root = Path(self.temp.name)
+        for attribute, child in (
+            ("POLICY_DIR", "policy"), ("CA_DIR", "ca"), ("LEDGER_DIR", "ledger"),
+            ("PENDING_META_DIR", "meta"), ("PENDING_SIDECAR_DIR", "sidecar"),
+            ("PENDING_PACK_DIR", "packs"), ("TOMBSTONE_DIR", "tombstones"),
+            ("WORK_DIR", "work"), ("NOTIFICATIONS_DIR", "notifications"),
+        ):
+            path = self.root / child
+            path.mkdir(mode=0o700)
+            setattr(server, attribute, path)
+        server.MAC_KEY_PATH = self.root / "mac.key"
+        server.MAC_KEY_PATH.write_bytes(os.urandom(64))
+        server.TOKEN_PATH = self.root / "token"
+        server.TOKEN_PATH.write_text("github_pat_test\n")
+        server.SCHEMA_PATH = SCHEMA
+        server._schema_cache = None
+        server._recent_requests.clear()
+        server.initialize_state_dirs()
 
-    def write_fake_gh(self, body: str) -> None:
-        gh = self.fake_bin / "gh"
-        gh.write_text(body)
-        gh.chmod(0o755)
+    def tearDown(self):
+        self.temp.cleanup()
 
-    def make_repo(
-        self,
-        slug: str = "fieldwork-smoke",
-        owner: str = "owner",
-        repo: str = "fieldwork-smoke",
-        expected_owner: str | None = None,
-        expected_repo: str | None = None,
-        origin_owner: str | None = None,
-        origin_repo: str | None = None,
-        missing_expected_origin: bool = False,
-        dirty: bool = False,
-    ) -> Path:
-        path = self.projects / slug
-        if path.exists():
-            shutil.rmtree(path)
-        path.mkdir()
-        self.git("init", "-q", cwd=path)
-        self.git("config", "user.email", "test@example.com", cwd=path)
-        self.git("config", "user.name", "Fieldwork Test", cwd=path)
-        (path / "README.md").write_text("hello\n")
-        (path / ".claude").mkdir()
-        (path / ".fieldwork").mkdir()
-        if not missing_expected_origin:
-            exp_owner = expected_owner or owner
-            exp_repo = expected_repo or repo
-            (path / ".fieldwork/expected-origin").write_text(f"https://github.com/{exp_owner}/{exp_repo}.git\n")
-        remote_owner = origin_owner or owner
-        remote_repo = origin_repo or repo
-        self.git("remote", "add", "origin", f"git@github-{slug}:{remote_owner}/{remote_repo}.git", cwd=path)
-        self.git("add", ".", cwd=path)
-        self.git("commit", "-m", "init", cwd=path)
-        if dirty:
-            (path / "README.md").write_text("dirty\n")
-        return path
-
-    def make_gitlab_repo(self, slug: str = "project", project: str = "group/sub/project") -> Path:
-        path = self.projects / slug
-        if path.exists():
-            shutil.rmtree(path)
-        path.mkdir()
-        self.git("init", "-q", cwd=path)
-        self.git("config", "user.email", "test@example.com", cwd=path)
-        self.git("config", "user.name", "Fieldwork Test", cwd=path)
-        (path / "README.md").write_text("hello\n")
-        (path / ".claude").mkdir()
-        (path / ".fieldwork").mkdir()
-        (path / ".fieldwork/expected-origin").write_text(f"https://gitlab.example.com/{project}.git\n")
-        self.git("remote", "add", "origin", f"git@gitlab-{slug}:{project}.git", cwd=path)
-        self.git("add", ".", cwd=path)
-        self.git("commit", "-m", "init", cwd=path)
-        return path
-
-    def request(self, path: Path, **overrides: object) -> dict:
-        req = {
+    def request(self, **updates):
+        value = {
+            "schema_version": 2,
             "request_id": str(uuid.uuid4()),
-            "created_at": "2026-05-11T10:30:00Z",
-            "repo_path": str(path),
+            "created_at": "2026-07-18T12:00:00Z",
+            "slug": "demo",
             "branch": "fieldwork/test-change",
             "title": "Test change",
-            "body": "Summary:\n- Test broker validation.\n\nTests:\n- broker unit tests",
+            "body": "A safe body",
+            "head_oid": "1" * 40,
+            "common_base_oid": "2" * 40,
         }
-        req.update(overrides)
+        value.update(updates)
+        return value
+
+    def policy(self, **updates):
+        value = {
+            "schema_version": 1,
+            "forge": "github",
+            "project": "owner/repo",
+            "api_base_url": "https://api.github.com",
+            "git_base_url": "https://github.com",
+            "base_branch": "main",
+            "approval": "require",
+            "allow_private_network": False,
+            "ca_bundle_ref": None,
+        }
+        value.update(updates)
+        return value
+
+    def wire(self, **updates):
+        return policy_writer.write_policy(server.POLICY_DIR, "demo", self.policy(**updates))
+
+    @contextlib.contextmanager
+    def fake_credential(self, _policy, _deadline):
+        yield server.TOKEN_PATH
+
+    @contextlib.contextmanager
+    def fake_quarantine(self, _req, _pack, _policy, _token, _deadline):
+        yield self.root
+
+    def test_v2_schema_accepts_exact_contract(self):
+        req = server.validate_request(self.request())
+        self.assertEqual(req.schema_version, 2)
+        self.assertEqual(req.slug, "demo")
+
+    def test_v1_checkout_field_is_rejected(self):
+        value = self.request(repo_path="/home/fieldwork/projects/demo")
+        with self.assertRaisesRegex(server.RequestError, "invalid_schema"):
+            server.validate_request(value)
+
+    def test_schema_rejects_sha256_and_bad_ref_shapes(self):
+        for updates in (
+            {"head_oid": "a" * 64},
+            {"branch": "main"},
+            {"branch": "fieldwork/bad//name"},
+            {"slug": "Bad"},
+            {"title": "bad\nline"},
+        ):
+            with self.subTest(updates=updates), self.assertRaises(server.RequestError):
+                server.validate_request(self.request(**updates))
+
+    def test_body_limit_is_utf8_bytes(self):
+        with self.assertRaisesRegex(server.RequestError, "body_too_large"):
+            server.validate_request(self.request(body="é" * 40000))
+
+    def test_policy_github_constants_and_default_gate(self):
+        written = self.wire()
+        self.assertEqual(written["approval"], "require")
+        with self.assertRaises(policy_writer.PolicyError):
+            policy_writer.validate_policy(self.policy(api_base_url="https://example.test"))
+
+    def test_policy_gitlab_requires_https_same_endpoint(self):
+        valid = self.policy(
+            forge="gitlab", project="group/sub/repo",
+            api_base_url="https://gitlab.example:8443/api/v4",
+            git_base_url="https://gitlab.example:8443",
+        )
+        self.assertEqual(policy_writer.validate_policy(valid)["project"], "group/sub/repo")
+        with self.assertRaises(policy_writer.PolicyError):
+            policy_writer.validate_policy({**valid, "git_base_url": "https://other.example:8443"})
+        with self.assertRaises(policy_writer.PolicyError):
+            policy_writer.validate_policy({**valid, "api_base_url": "http://gitlab.example:8443/api/v4"})
+
+    def test_policy_writer_refuses_symlink_target(self):
+        target = self.root / "outside"
+        target.write_text("unchanged")
+        (server.POLICY_DIR / "demo.json").symlink_to(target)
+        with self.assertRaises(policy_writer.PolicyError):
+            self.wire()
+        self.assertEqual(target.read_text(), "unchanged")
+
+    def test_ca_bundle_is_copied_and_content_addressed(self):
+        source = self.root / "ca.pem"
+        source.write_text("-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n")
+        ref = policy_writer.copy_ca_bundle(source, server.CA_DIR)
+        self.assertRegex(ref, r"^sha256:[0-9a-f]{64}$")
+        self.assertEqual(len(list(server.CA_DIR.glob("*.pem"))), 1)
+
+    def test_ca_bundle_refuses_existing_symlink_target(self):
+        source = self.root / "ca.pem"
+        data = b"-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n"
+        source.write_bytes(data)
+        digest = policy_writer.hashlib.sha256(data).hexdigest()
+        outside = self.root / "outside.pem"
+        outside.write_text("unchanged")
+        (server.CA_DIR / f"{digest}.pem").symlink_to(outside)
+        with self.assertRaisesRegex(policy_writer.PolicyError, "unsafe"):
+            policy_writer.copy_ca_bundle(source, server.CA_DIR)
+        self.assertEqual(outside.read_text(), "unchanged")
+
+    def test_broker_refuses_symlinked_ca_bundle(self):
+        data = b"-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n"
+        digest = policy_writer.hashlib.sha256(data).hexdigest()
+        outside = self.root / "outside.pem"
+        outside.write_bytes(data)
+        (server.CA_DIR / f"{digest}.pem").symlink_to(outside)
+        with self.assertRaisesRegex(server.RequestError, "ca_bundle_unavailable"):
+            server.ca_bundle(self.policy(
+                forge="gitlab", project="group/repo",
+                api_base_url="https://gitlab.example/api/v4",
+                git_base_url="https://gitlab.example",
+                ca_bundle_ref=f"sha256:{digest}",
+            ))
+
+    def test_policy_writer_children_inherit_store_owner_and_private_modes(self):
+        with policy_writer.policy_lock(server.POLICY_DIR, "demo"):
+            self.wire()
+        lock = server.POLICY_DIR / ".locks" / "demo.lock"
+        policy = server.POLICY_DIR / "demo.json"
+        parent = server.POLICY_DIR.stat()
+        for path in (server.POLICY_DIR / ".locks", lock, policy):
+            with self.subTest(path=path):
+                info = path.stat()
+                self.assertEqual((info.st_uid, info.st_gid), (parent.st_uid, parent.st_gid))
+                self.assertEqual(info.st_mode & 0o022, 0)
+
+    def test_origin_normalization_vectors(self):
+        self.assertEqual(originnorm.normalize_origin("github", "git@github.com:Owner/repo.git"), ("github.com", "Owner/repo"))
+        self.assertEqual(originnorm.normalize_origin("gitlab", "https://gitlab.example:8443/group/repo.git", expected_host="gitlab.example:8443"), ("gitlab.example:8443", "group/repo"))
+        for value in ("http://github.com/o/r", "https://user:pass@github.com/o/r", "https://evil.test/o/r"):
+            with self.subTest(value=value), self.assertRaises(originnorm.OriginError):
+                originnorm.normalize_origin("github", value)
+
+    def test_instruction_migrator_refuses_symlinked_instruction_file(self):
+        repo = self.root / "migration-repo"; repo.mkdir()
+        git(repo, "init", "-b", "main")
+        git(repo, "config", "user.email", "test@example.test"); git(repo, "config", "user.name", "Test")
+        outside = self.root / "outside-instructions"
+        outside.write_text("## Fieldwork Delivery Workflow\nprotected\n")
+        (repo / "AGENTS.md").symlink_to(outside)
+        git(repo, "add", "AGENTS.md"); git(repo, "commit", "-m", "old instructions")
+        result = subprocess.run(
+            ["/usr/bin/python3", "-I", str(MIGRATOR), str(repo)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env={"PATH": "/usr/bin:/bin", "HOME": str(self.root)},
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(b"refusing a symlink", result.stderr)
+        self.assertEqual(outside.read_text(), "## Fieldwork Delivery Workflow\nprotected\n")
+
+    def test_git_environment_scrubs_ambient_configuration(self):
+        env = server.broker_git_env()
+        for key in ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_TERMINAL_PROMPT"):
+            self.assertIn(key, env)
+        for key in ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "GIT_DIR", "GIT_WORK_TREE"):
+            self.assertNotIn(key, env)
+
+    @mock.patch("socket.getaddrinfo")
+    def test_ssrf_rejects_if_any_dns_answer_is_private(self, lookup):
+        lookup.return_value = [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("203.0.113.10", 443)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 443)),
+        ]
+        with self.assertRaisesRegex(server.RequestError, "private_network_rejected"):
+            server.resolve_addresses("forge.test", 443, False, server.Deadline.start())
+        self.assertEqual(server.resolve_addresses("forge.test", 443, True, server.Deadline.start()), ["203.0.113.10", "127.0.0.1"])
+
+    def test_git_dns_pin_uses_policy_port_and_ipv6_brackets(self):
+        self.assertEqual(server._git_resolve_arg("gitlab.test", 8443, "2001:db8::1"), "http.curloptResolve=gitlab.test:8443:[2001:db8::1]")
+
+    def test_dns_resolution_obeys_processing_deadline(self):
+        def stuck(*_args, **_kwargs):
+            time.sleep(0.1)
+            return []
+        with mock.patch("socket.getaddrinfo", side_effect=stuck):
+            with self.assertRaisesRegex(server.RequestError, "forge_dns_timeout"):
+                server.resolve_addresses("forge.test", 443, False, server.Deadline(time.monotonic() + 0.01))
+
+    def test_askpass_releases_secret_only_to_pinned_host(self):
+        token = self.root / "askpass-token"
+        token.write_text("github_pat_not_logged\n")
+        env = {
+            "PATH": "/usr/bin:/bin", "FIELDWORK_BROKER_ALLOWED_HOST": "github.com",
+            "FIELDWORK_BROKER_TOKEN_PATH": str(token), "FIELDWORK_BROKER_ASKPASS_FORGE": "github",
+        }
+        good = subprocess.run(["/bin/bash", str(ASKPASS), "Password for 'https://x-access-token@github.com/owner/repo.git':"], env=env, capture_output=True, text=True)
+        self.assertEqual(good.returncode, 0)
+        self.assertEqual(good.stdout.strip(), "github_pat_not_logged")
+        bad = subprocess.run(["/bin/bash", str(ASKPASS), "Password for 'https://evil.test/owner/repo.git':"], env=env, capture_output=True, text=True)
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertNotIn("github_pat_not_logged", bad.stdout + bad.stderr)
+
+    def multipart(self, parts):
+        boundary = b"fieldwork-test-boundary"
+        body = bytearray()
+        for name, value in parts:
+            content_type = b"application/json" if name == "meta" else b"application/octet-stream"
+            body += b"--" + boundary + b'\r\nContent-Disposition: form-data; name="' + name.encode() + b'"\r\nContent-Type: ' + content_type + b"\r\n\r\n" + value + b"\r\n"
+        body += b"--" + boundary + b"--\r\n"
+        path = self.root / f"body-{uuid.uuid4().hex}"
+        path.write_bytes(body)
+        return path, "multipart/form-data; boundary=fieldwork-test-boundary"
+
+    def test_multipart_accepts_exact_meta_and_pack(self):
+        path, content_type = self.multipart([("meta", json.dumps(self.request()).encode()), ("pack", b"PACKdata")])
+        meta, pack = server.parse_multipart(path, content_type)
+        self.assertEqual(meta["slug"], "demo")
+        self.assertEqual(pack.read_bytes(), b"PACKdata")
+
+    def test_multipart_rejects_duplicate_unknown_and_long_boundary(self):
+        cases = [
+            self.multipart([("meta", b"{}"), ("meta", b"{}"), ("pack", b"PACK")]),
+            self.multipart([("meta", b"{}"), ("other", b"x"), ("pack", b"PACK")]),
+        ]
+        for path, content_type in cases:
+            with self.subTest(path=path), self.assertRaises(server.RequestError):
+                server.parse_multipart(path, content_type)
+        with self.assertRaises(server.RequestError):
+            server.parse_multipart(cases[0][0], "multipart/form-data; boundary=" + "x" * 71)
+
+    def test_multipart_rejects_trailing_bytes_and_unknown_headers(self):
+        path, content_type = self.multipart([("meta", b"{}"), ("pack", b"PACK")])
+        path.write_bytes(path.read_bytes() + b"smuggled")
+        with self.assertRaisesRegex(server.RequestError, "malformed_multipart"):
+            server.parse_multipart(path, content_type)
+        raw = self.root / "body-unknown-header"
+        raw.write_bytes(
+            b'--x\r\nContent-Disposition: form-data; name="meta"\r\nContent-Type: application/json\r\nX-Evil: yes\r\n\r\n{}\r\n'
+            b'--x\r\nContent-Disposition: form-data; name="pack"\r\nContent-Type: application/octet-stream\r\n\r\nPACK\r\n--x--\r\n'
+        )
+        with self.assertRaisesRegex(server.RequestError, "malformed_multipart"):
+            server.parse_multipart(raw, "multipart/form-data; boundary=x")
+        invalid_meta, invalid_type = self.multipart([("meta", b"\xff"), ("pack", b"PACK")])
+        with self.assertRaisesRegex(server.RequestError, "invalid_json"):
+            server.parse_multipart(invalid_meta, invalid_type)
+
+    def test_tcp_auth_is_checked_before_body_receipt(self):
+        auth = self.root / "http-auth"
+        auth.write_text("correct")
+        server.HTTP_AUTH_TOKEN_PATH = str(auth)
+        left, right = socket.socketpair()
+        try:
+            left.sendall(b"POST /pr-status HTTP/1.1\r\nContent-Length: 100\r\nX-Fieldwork-Local-Auth: wrong\r\n\r\n")
+            with self.assertRaisesRegex(server.RequestError, "unauthorized"):
+                server.read_http_request(right, "tcp", time.monotonic() + 1)
+        finally:
+            left.close(); right.close()
+
+    def test_ingress_deadline_rejects_a_drip_feed(self):
+        left, right = socket.socketpair()
+        try:
+            with self.assertRaisesRegex(server.RequestError, "ingress_timeout"):
+                server._recv_with_deadline(right, 1, time.monotonic() + 0.01)
+        finally:
+            left.close(); right.close()
+
+    def test_rest_redirects_and_cross_endpoint_urls_are_refused(self):
+        class Response:
+            status = 302
+            def read(self, _maximum): return b"{}"
+            def getheaders(self): return [("Location", "https://example.test/")]
+        class Connection:
+            def __init__(self, *_args, **_kwargs): pass
+            def request(self, *_args, **_kwargs): pass
+            def getresponse(self): return Response()
+            def close(self): pass
+        with mock.patch.object(server, "resolve_addresses", return_value=["192.0.2.1"]), \
+             mock.patch.object(server, "PinnedHTTPSConnection", Connection), \
+             mock.patch.object(server.ssl, "create_default_context", return_value=object()):
+            with self.assertRaisesRegex(server.RequestError, "forge_redirect_refused"):
+                server.api_json(self.policy(), "GET", "https://api.github.com/repos/owner/repo", server.Deadline.start())
+        with self.assertRaisesRegex(server.RequestError, "unsafe_forge_url"):
+            server.api_json(self.policy(), "GET", "https://example.test/repos/owner/repo", server.Deadline.start())
+
+    def test_maintenance_socket_is_closed_outside_maintenance_phase(self):
+        body = self.root / "maintenance-body"
+        body.write_bytes(b"{}")
+        left, right = socket.socketpair()
+        try:
+            with mock.patch.object(server, "MAINTENANCE", False), \
+                 mock.patch.object(server, "read_http_request", return_value=("/pr", {}, body)):
+                server.handle(right, "maintenance")
+            response = left.recv(4096)
+            self.assertIn(b"HTTP/1.1 404", response)
+            self.assertIn(b'"error":"route_not_available"', response)
+        finally:
+            left.close()
+
+    def test_maintenance_contract_blocks_intake_but_keeps_status(self):
+        body = self.root / "maintenance-contract-body"
+        body.write_bytes(b"{}")
+        cases = (("/pr", "agent"), ("/approve", "approve"))
+        for route, transport in cases:
+            left, right = socket.socketpair()
+            try:
+                with self.subTest(route=route), mock.patch.object(server, "MAINTENANCE", True), \
+                     mock.patch.object(server, "read_http_request", return_value=(route, {}, body)):
+                    server.handle(right, transport)
+                response = left.recv(4096)
+                self.assertIn(b"HTTP/1.1 503", response)
+                self.assertIn(b'"error":"maintenance"', response)
+            finally:
+                left.close()
+        request_id = str(uuid.uuid4())
+        body.write_text(json.dumps({"request_id": request_id}))
+        left, right = socket.socketpair()
+        try:
+            with mock.patch.object(server, "MAINTENANCE", True), \
+                 mock.patch.object(server, "read_http_request", return_value=("/pr-status", {}, body)), \
+                 mock.patch.object(server, "pr_status", return_value={"ok": True, "request_id": request_id, "state": "queued"}) as status:
+                server.handle(right, "agent")
+            response = left.recv(4096)
+            self.assertIn(b"HTTP/1.1 200", response)
+            self.assertIn(b'"state":"queued"', response)
+            status.assert_called_once()
+        finally:
+            left.close()
+
+    def test_title_and_body_are_both_scanned(self):
+        captured = {}
+        def inspect(path, _deadline):
+            captured.update({item.name: item.read_text() for item in path.iterdir()})
+        with mock.patch.object(server, "scan_directory", inspect):
+            server.scan_title_body(server.validate_request(self.request()), server.Deadline.start())
+        self.assertEqual(captured, {"title.txt": "Test change", "body.txt": "A safe body"})
+
+    def test_typed_notification_preserves_setgid_queue_mode(self):
+        request_id = str(uuid.uuid4())
+        requested_modes = []
+        real_mkdir = server._mkdir
+        def capture_mode(path, mode):
+            requested_modes.append((path, mode))
+            real_mkdir(path, mode)
+        with mock.patch.object(server, "_mkdir", side_effect=capture_mode):
+            server.notify("queued", request_id, "demo")
+        # Darwin clears setgid on unprivileged temporary directories, so assert
+        # the broker requests the production mode rather than the host result.
+        self.assertIn((server.NOTIFICATIONS_DIR, 0o2770), requested_modes)
+        payloads = [json.loads(item.read_text()) for item in server.NOTIFICATIONS_DIR.glob("*.json")]
+        self.assertEqual(payloads, [{"schema_version": 1, "event": "queued", "request_id": request_id, "slug": "demo"}])
+
+    def test_object_scan_covers_tree_names_commit_identity_signature_and_flat_blobs(self):
+        blob_oid, tree_oid, commit_oid = "a" * 40, "b" * 40, "c" * 40
+        objects = {
+            blob_oid: ("blob", 24), tree_oid: ("tree", 64), commit_oid: ("commit", 256),
+        }
+        raw = {
+            blob_oid: b"SECRET_SHAPED_BLOB\n",
+            tree_oid: b"100644 SECRET_SHAPED_FILENAME\0" + bytes.fromhex(blob_oid),
+            commit_oid: (
+                b"tree " + tree_oid.encode() + b"\n"
+                b"author Fieldwork <SECRET_SHAPED_EMAIL> 1 +0000\n"
+                b"committer Fieldwork <safe@example.test> 1 +0000\n"
+                b"gpgsig SECRET_SHAPED_SIGNATURE\n\nSECRET_SHAPED_MESSAGE\n"
+            ),
+        }
+        def fake_git(args, *_positional, **_keywords):
+            return subprocess.CompletedProcess(args, 0, stdout=raw[args[-1]], stderr=b"")
+        def inspect(path, _deadline):
+            blob_dir, text_dir = path / "blobs", path / "text"
+            self.assertEqual({item.name for item in blob_dir.iterdir()}, {blob_oid})
+            self.assertEqual((blob_dir / blob_oid).read_bytes(), raw[blob_oid])
+            tree_text = (text_dir / "tree-names.txt").read_bytes()
+            self.assertIn(b"SECRET_SHAPED_FILENAME", tree_text)
+            self.assertIn(b"5345435245545f5348415045445f46494c454e414d45", tree_text)
+            commit_text = b"".join(item.read_bytes() for item in text_dir.glob("commit-*.txt"))
+            for marker in (b"SECRET_SHAPED_EMAIL", b"SECRET_SHAPED_SIGNATURE", b"SECRET_SHAPED_MESSAGE"):
+                self.assertIn(marker, commit_text)
+        with mock.patch.object(server, "run_git", side_effect=fake_git), mock.patch.object(server, "scan_directory", side_effect=inspect):
+            server.scan_objects(self.root, objects, server.Deadline.start())
+
+    def test_require_gate_persists_without_forge_write(self):
+        self.wire(approval="require")
+        pack = self.root / "incoming.pack"; pack.write_bytes(b"PACK-test")
+        req = server.validate_request(self.request())
+        with mock.patch.object(server, "scan_title_body"), \
+             mock.patch.object(server, "credential", self.fake_credential), \
+             mock.patch.object(server, "quarantine", self.fake_quarantine), \
+             mock.patch.object(server, "push_head") as push, \
+             mock.patch.object(server, "create_pr") as create:
+            result = server.submit_pr(req, pack, server.Deadline.start())
+        self.assertEqual(result["state"], "queued")
+        push.assert_not_called(); create.assert_not_called()
+        self.assertTrue((server.PENDING_PACK_DIR / f"{req.request_id}.pack").is_file())
+
+    def test_auto_is_durable_before_processing(self):
+        self.wire(approval="auto")
+        pack = self.root / "incoming.pack"; pack.write_bytes(b"PACK-test")
+        req = server.validate_request(self.request())
+        observed = {}
+        def process(request_id, _deadline):
+            observed.update(server.load_record(request_id))
+            return server.load_record(request_id)
+        with mock.patch.object(server, "scan_title_body"), \
+             mock.patch.object(server, "credential", self.fake_credential), \
+             mock.patch.object(server, "quarantine", self.fake_quarantine), \
+             mock.patch.object(server, "process_record", process):
+            server.submit_pr(req, pack, server.Deadline.start())
+        self.assertEqual(observed["state"], "approved")
+        self.assertTrue((server.PENDING_PACK_DIR / f"{req.request_id}.pack").is_file())
+
+    def test_failed_first_persistence_rolls_back_replay_reservation(self):
+        self.wire(approval="require")
+        pack = self.root / "incoming.pack"; pack.write_bytes(b"PACK-test")
+        req = server.validate_request(self.request())
+        with mock.patch.object(server, "scan_title_body"), \
+             mock.patch.object(server, "credential", self.fake_credential), \
+             mock.patch.object(server, "quarantine", self.fake_quarantine), \
+             mock.patch.object(server, "persist_pack", side_effect=OSError("disk full")):
+            with self.assertRaisesRegex(OSError, "disk full"):
+                server.submit_pr(req, pack, server.Deadline.start())
+        self.assertFalse((server.LEDGER_DIR / f"{req.request_id}.json").exists())
+        self.assertFalse((server.PENDING_PACK_DIR / f"{req.request_id}.pack").exists())
+
+    def queued(self):
+        self.wire(approval="require")
+        pack = self.root / f"incoming-{uuid.uuid4().hex}.pack"; pack.write_bytes(b"PACK-test")
+        req = server.validate_request(self.request())
+        with mock.patch.object(server, "scan_title_body"), mock.patch.object(server, "credential", self.fake_credential), mock.patch.object(server, "quarantine", self.fake_quarantine):
+            server.submit_pr(req, pack, server.Deadline.start())
         return req
 
-    def audit_events(self) -> list[dict]:
-        if not self.audit.exists():
-            return []
-        return [json.loads(line) for line in self.audit.read_text().splitlines() if line.strip()]
+    def test_record_mac_and_pack_digest_fail_closed(self):
+        req = self.queued()
+        path = server.PENDING_META_DIR / f"{req.request_id}.json"
+        value = json.loads(path.read_text()); value["title"] = "tampered"; path.write_text(json.dumps(value))
+        with self.assertRaisesRegex(server.RequestError, "metadata_tampered"):
+            server.load_record(req.request_id)
+        # Restore a new request and corrupt only its stored pack.
+        req = self.queued()
+        (server.PENDING_PACK_DIR / f"{req.request_id}.pack").write_bytes(b"changed")
+        with self.assertRaisesRegex(server.RequestError, "metadata_tampered"):
+            server.verify_stored_pack(server.load_record(req.request_id))
 
-    def assert_rejects(self, req: object, expected: str) -> None:
-        with self.assertRaises(self.server.RequestError) as ctx:
-            self.server.validate(req)
-        self.assertIn(expected, ctx.exception.message)
-
-    def test_valid_request_accepted(self) -> None:
-        repo = self.make_repo()
-        validated = self.server.validate(self.request(repo))
-        self.assertEqual(validated.project, "owner/fieldwork-smoke")
-        self.assertEqual(validated.base_branch, "main")
-
-    def test_default_branch_file_sets_pr_base(self) -> None:
-        repo = self.make_repo()
-        (repo / ".fieldwork/default-branch").write_text("trunk\n")
-        self.git("add", ".fieldwork/default-branch", cwd=repo)
-        self.git("commit", "-m", "set default branch", cwd=repo)
-        validated = self.server.validate(self.request(repo))
-        self.assertEqual(validated.base_branch, "trunk")
-
-    def test_invalid_default_branch_file_rejected(self) -> None:
-        repo = self.make_repo()
-        (repo / ".fieldwork/default-branch").write_text("../main\n")
-        self.git("add", ".fieldwork/default-branch", cwd=repo)
-        self.git("commit", "-m", "set invalid default branch", cwd=repo)
-        self.assert_rejects(self.request(repo), "default branch")
-
-    def test_invalid_json_rejected_by_handler(self) -> None:
-        left, right = socket.socketpair()
-        thread = threading.Thread(target=self.server.handle, args=(right,))
-        thread.start()
-        left.sendall(b"{not-json")
-        left.shutdown(socket.SHUT_WR)
-        response = left.recv(4096).decode()
-        thread.join(timeout=5)
-        left.close()
-        self.assertIn('"ok": false', response)
-        self.assertIn("invalid JSON", response)
-
-    def test_preflight_accepts_reachable_repo(self) -> None:
-        (self.tmp / "gh-token").write_text("github_pat_test\n")
-        self.write_fake_gh(
-            "#!/usr/bin/env bash\n"
-            "test \"$GH_TOKEN\" = github_pat_test\n"
-            "printf '%s\\n' '{\"nameWithOwner\":\"owner/fieldwork-smoke\",\"defaultBranchRef\":{\"name\":\"main\"},\"visibility\":\"PRIVATE\"}'\n"
-        )
-        result = self.server.preflight({"repo": "owner/fieldwork-smoke"})
-        self.assertEqual(result["repo"], "owner/fieldwork-smoke")
-        self.assertEqual(result["defaultBranch"], "main")
-        self.assertEqual(result["visibility"], "PRIVATE")
-
-    def test_preflight_reports_missing_token(self) -> None:
-        with self.assertRaises(self.server.RequestError) as ctx:
-            self.server.preflight({"repo": "owner/fieldwork-smoke"})
-        self.assertEqual(ctx.exception.status, 503)
-        self.assertIn("PAT is not stored", ctx.exception.message)
-
-    def test_github_app_mode_selects_app_provider(self) -> None:
-        old = self.server.GITHUB_CREDENTIAL_MODE
-        self.server.GITHUB_CREDENTIAL_MODE = "app"
+    def test_authority_file_readers_refuse_symlinks_and_oversized_files(self):
+        outside = self.root / "outside-key"; outside.write_bytes(os.urandom(64))
+        server.MAC_KEY_PATH.unlink(); server.MAC_KEY_PATH.symlink_to(outside)
+        with self.assertRaisesRegex(server.RequestError, "mac_key_unavailable"):
+            server._mac_key()
+        auth = self.root / "http-auth"; auth.write_bytes(b"x" * 4097)
+        old_auth = server.HTTP_AUTH_TOKEN_PATH
         try:
-            provider = self.server.github_credential_provider()
+            server.HTTP_AUTH_TOKEN_PATH = str(auth)
+            with self.assertRaisesRegex(server.RequestError, "http_auth_unconfigured"):
+                server._http_auth_token()
         finally:
-            self.server.GITHUB_CREDENTIAL_MODE = old
-        self.assertIsInstance(provider, self.server.AppCredentialProvider)
+            server.HTTP_AUTH_TOKEN_PATH = old_auth
 
-    def test_github_app_provider_mints_and_caches_installation_token(self) -> None:
-        key_path = self.tmp / "github-app.pem"
-        key_path.write_text("-----BEGIN PRIVATE KEY-----\ntest\n-----END PRIVATE KEY-----\n")
-        openssl = self.fake_bin / "openssl"
-        openssl.write_text("#!/usr/bin/env bash\ncat >/dev/null\nprintf test-signature\n")
-        openssl.chmod(0o755)
-        captured: list[dict] = []
-        from unittest.mock import patch
+    def test_policy_drift_moves_request_to_needs_operator(self):
+        req = self.queued()
+        self.wire(approval="auto")
+        result = server.process_record(req.request_id, server.Deadline.start())
+        self.assertEqual(result["state"], "needs_operator")
+        self.assertEqual(result["error_code"], "policy_changed")
 
-        class FakeResponse:
-            def __enter__(self):
-                return self
+    def test_deny_is_terminal_and_replay_returns_tombstone(self):
+        req = self.queued()
+        result = server.approve_request({"request_id": req.request_id, "decision": "deny"}, server.Deadline.start())
+        self.assertEqual(result["state"], "denied")
+        self.assertFalse((server.PENDING_PACK_DIR / f"{req.request_id}.pack").exists())
+        self.assertEqual(server.existing_request(req.request_id)["state"], "denied")
+        self.assertEqual(server.pr_status({"request_id": req.request_id})["state"], "denied")
 
-            def __exit__(self, *_args: object) -> None:
-                return None
+    def test_status_expires_queued_request_durably(self):
+        req = self.queued()
+        record = server.load_record(req.request_id)
+        record["expires_at"] = "2020-01-01T00:00:00Z"
+        server.write_record({key: value for key, value in record.items() if key != "mac"})
+        self.assertEqual(server.pr_status({"request_id": req.request_id})["state"], "expired")
+        self.assertTrue((server.TOMBSTONE_DIR / f"{req.request_id}.json").is_file())
 
-            def read(self) -> bytes:
-                return json.dumps({
-                    "token": "ghs_installation_token",
-                    "expires_at": "2099-01-01T00:00:00Z",
-                }).encode()
+    def test_sweep_preserves_valid_record_after_unexpected_reconcile_fault(self):
+        req = self.queued()
+        record = server.load_record(req.request_id)
+        server.transition(record, "approved")
+        with mock.patch.object(server, "process_record", side_effect=RuntimeError("crash after push")):
+            server.sweep_state()
+        self.assertTrue((server.PENDING_META_DIR / f"{req.request_id}.json").is_file())
+        self.assertTrue((server.PENDING_PACK_DIR / f"{req.request_id}.pack").is_file())
 
-        def fake_urlopen(request, timeout):
-            captured.append({
-                "url": request.full_url,
-                "auth": request.get_header("Authorization", ""),
-                "body": request.data.decode(),
-                "timeout": timeout,
-            })
-            return FakeResponse()
+    def test_sweep_finishes_interrupted_terminalization(self):
+        req = self.queued()
+        record = server.transition(server.load_record(req.request_id), "denied")
+        self.assertTrue((server.PENDING_META_DIR / f"{req.request_id}.json").is_file())
+        server.sweep_state()
+        self.assertFalse((server.PENDING_META_DIR / f"{req.request_id}.json").exists())
+        self.assertFalse((server.PENDING_PACK_DIR / f"{req.request_id}.pack").exists())
+        self.assertEqual(server.load_record(req.request_id)["state"], record["state"])
 
-        with patch.object(self.server.urllib.request, "urlopen", side_effect=fake_urlopen):
-            self.server.GITHUB_APP_ID = "12345"
-            self.server.GITHUB_APP_INSTALLATION_ID = "67890"
-            self.server.GITHUB_APP_PRIVATE_KEY_PATH = str(key_path)
-            self.server.GITHUB_API = "https://github.example.test/api/v3"
-            provider = self.server.AppCredentialProvider()
-            self.assertEqual(provider.acquire_token(), "ghs_installation_token")
-            self.assertEqual(provider.acquire_token(), "ghs_installation_token")
+    def test_reconciliation_is_idempotent_when_branch_and_pr_exist(self):
+        self.wire(approval="auto")
+        pack = self.root / "incoming.pack"; pack.write_bytes(b"PACK-test")
+        req = server.validate_request(self.request())
+        with mock.patch.object(server, "scan_title_body"), mock.patch.object(server, "credential", self.fake_credential), mock.patch.object(server, "quarantine", self.fake_quarantine), mock.patch.object(server, "process_record", lambda rid, dl: server.load_record(rid)):
+            server.submit_pr(req, pack, server.Deadline.start())
+        with mock.patch.object(server, "scan_title_body"), \
+             mock.patch.object(server, "credential", self.fake_credential), \
+             mock.patch.object(server, "quarantine", self.fake_quarantine), \
+             mock.patch.object(server, "remote_branch_oid", return_value=req.head_oid), \
+             mock.patch.object(server, "find_pr", return_value="https://example.test/pr/1"), \
+             mock.patch.object(server, "push_head") as push, \
+             mock.patch.object(server, "create_pr") as create:
+            result = server.process_record(req.request_id, server.Deadline.start())
+        self.assertEqual(result["state"], "done")
+        push.assert_not_called(); create.assert_not_called()
 
-        self.assertEqual(len(captured), 1)
-        self.assertEqual(captured[0]["url"], "https://github.example.test/api/v3/app/installations/67890/access_tokens")
-        self.assertEqual(captured[0]["body"], "{}")
-        self.assertEqual(captured[0]["timeout"], 30)
-        auth = captured[0]["auth"]
-        self.assertTrue(auth.startswith("Bearer "))
-        header, payload, signature = auth[len("Bearer "):].split(".")
-        jwt_header = json.loads(base64.urlsafe_b64decode(header + "=" * (-len(header) % 4)))
-        jwt_payload = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
-        self.assertEqual(jwt_header["alg"], "RS256")
-        self.assertEqual(jwt_payload["iss"], "12345")
-        self.assertGreater(jwt_payload["exp"], jwt_payload["iat"])
-        self.assertEqual(signature, self.server.base64url(b"test-signature"))
+    def durable_approved_request(self):
+        self.wire(approval="auto")
+        pack = self.root / f"incoming-{uuid.uuid4().hex}.pack"; pack.write_bytes(b"PACK-test")
+        req = server.validate_request(self.request())
+        with mock.patch.object(server, "scan_title_body"), mock.patch.object(server, "credential", self.fake_credential), \
+             mock.patch.object(server, "quarantine", self.fake_quarantine), \
+             mock.patch.object(server, "process_record", lambda rid, dl: server.load_record(rid)):
+            server.submit_pr(req, pack, server.Deadline.start())
+        return req
 
-    def test_preflight_reports_selected_repo_scope(self) -> None:
-        (self.tmp / "gh-token").write_text("github_pat_test\n")
-        self.write_fake_gh(
-            "#!/usr/bin/env bash\n"
-            "echo 'GraphQL: Could not resolve to a Repository with the name owner/fieldwork-smoke.' >&2\n"
-            "exit 1\n"
+    def test_fault_boundaries_resume_without_duplicate_forge_writes(self):
+        for label in ("before_push", "after_push"):
+            with self.subTest(label=label):
+                req = self.durable_approved_request()
+                with mock.patch.dict(os.environ, {"FIELDWORK_BROKER_FAULT": label}), \
+                     mock.patch.object(server, "scan_title_body"), mock.patch.object(server, "credential", self.fake_credential), \
+                     mock.patch.object(server, "quarantine", self.fake_quarantine), \
+                     mock.patch.object(server, "remote_branch_oid", return_value=None), \
+                     mock.patch.object(server, "push_head") as first_push:
+                    with self.assertRaisesRegex(RuntimeError, label):
+                        server.process_record(req.request_id, server.Deadline.start())
+                self.assertEqual(first_push.call_count, 0 if label == "before_push" else 1)
+                retry_remote = None if label == "before_push" else req.head_oid
+                with mock.patch.dict(os.environ, {}, clear=False), \
+                     mock.patch.object(server, "scan_title_body"), mock.patch.object(server, "credential", self.fake_credential), \
+                     mock.patch.object(server, "quarantine", self.fake_quarantine), \
+                     mock.patch.object(server, "remote_branch_oid", return_value=retry_remote), \
+                     mock.patch.object(server, "find_pr", return_value=None), \
+                     mock.patch.object(server, "push_head") as retry_push, \
+                     mock.patch.object(server, "create_pr", return_value="https://example.test/pr/1") as create:
+                    os.environ.pop("FIELDWORK_BROKER_FAULT", None)
+                    result = server.process_record(req.request_id, server.Deadline.start())
+                self.assertEqual(result["state"], "done")
+                self.assertEqual(retry_push.call_count, 1 if label == "before_push" else 0)
+                create.assert_called_once()
+
+        for label in ("before_pr", "after_pr"):
+            with self.subTest(label=label):
+                req = self.durable_approved_request()
+                server.transition(server.load_record(req.request_id), "pushed")
+                with mock.patch.dict(os.environ, {"FIELDWORK_BROKER_FAULT": label}), \
+                     mock.patch.object(server, "scan_title_body"), mock.patch.object(server, "credential", self.fake_credential), \
+                     mock.patch.object(server, "quarantine", self.fake_quarantine), \
+                     mock.patch.object(server, "find_pr", return_value=None), \
+                     mock.patch.object(server, "create_pr", return_value="https://example.test/pr/1") as first_create:
+                    with self.assertRaisesRegex(RuntimeError, label):
+                        server.process_record(req.request_id, server.Deadline.start())
+                self.assertEqual(first_create.call_count, 0 if label == "before_pr" else 1)
+                retry_url = None if label == "before_pr" else "https://example.test/pr/1"
+                with mock.patch.dict(os.environ, {}, clear=False), \
+                     mock.patch.object(server, "scan_title_body"), mock.patch.object(server, "credential", self.fake_credential), \
+                     mock.patch.object(server, "quarantine", self.fake_quarantine), \
+                     mock.patch.object(server, "find_pr", return_value=retry_url), \
+                     mock.patch.object(server, "create_pr", return_value="https://example.test/pr/1") as retry_create:
+                    os.environ.pop("FIELDWORK_BROKER_FAULT", None)
+                    result = server.process_record(req.request_id, server.Deadline.start())
+                self.assertEqual(result["state"], "done")
+                self.assertEqual(retry_create.call_count, 1 if label == "before_pr" else 0)
+
+    def test_policy_writer_waits_for_the_processing_lock(self):
+        self.wire()
+        started, finished = threading.Event(), threading.Event()
+        def replace_policy():
+            started.set()
+            with policy_writer.policy_lock(server.POLICY_DIR, "demo"):
+                policy_writer.write_policy(server.POLICY_DIR, "demo", self.policy(approval="auto"))
+            finished.set()
+        with policy_writer.policy_lock(server.POLICY_DIR, "demo"):
+            worker = threading.Thread(target=replace_policy, daemon=True)
+            worker.start()
+            self.assertTrue(started.wait(1))
+            self.assertFalse(finished.wait(0.05))
+            self.assertEqual(server.read_policy(server.POLICY_DIR, "demo")["approval"], "require")
+        self.assertTrue(finished.wait(1))
+        worker.join(1)
+        self.assertEqual(server.read_policy(server.POLICY_DIR, "demo")["approval"], "auto")
+
+    def git_fixture(self):
+        seed = self.root / f"seed-{uuid.uuid4().hex}"; seed.mkdir()
+        git(seed, "init", "-b", "main")
+        git(seed, "config", "user.email", "test@example.test")
+        git(seed, "config", "user.name", "Test")
+        (seed / "base.txt").write_text("base\n")
+        git(seed, "add", "base.txt"); git(seed, "commit", "-m", "base")
+        base = git(seed, "rev-parse", "HEAD").decode().strip()
+        remote = self.root / f"remote-{uuid.uuid4().hex}.git"
+        git(self.root, "clone", "--bare", str(seed), str(remote))
+        work = self.root / f"work-{uuid.uuid4().hex}"
+        git(self.root, "clone", str(remote), str(work))
+        git(work, "config", "user.email", "test@example.test"); git(work, "config", "user.name", "Test")
+        git(work, "checkout", "-b", "fieldwork/test-change")
+        (work / "change.txt").write_text("safe change\n")
+        git(work, "add", "change.txt"); git(work, "commit", "-m", "change")
+        head = git(work, "rev-parse", "HEAD").decode().strip()
+        return remote, work, base, head
+
+    def pack(self, work: Path, revs: str, *, thin: bool = False) -> Path:
+        args = ["pack-objects", "--revs", "--stdout"]
+        if thin:
+            args.insert(1, "--thin")
+        data = git(work, *args, input_bytes=revs.encode())
+        path = self.root / f"pack-{uuid.uuid4().hex}"
+        path.write_bytes(data)
+        return path
+
+    def quarantine_request(self, head, common):
+        return server.validate_request(self.request(head_oid=head, common_base_oid=common))
+
+    def fake_fetch(self, remote: Path):
+        def run(_policy, args, _url, _token, _deadline, *, cwd=None, timeout_cap=120):
+            translated = [str(remote) if isinstance(arg, str) and arg.startswith("https://") else arg for arg in args]
+            result = subprocess.run(["/usr/bin/git", *translated], cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if result.returncode:
+                raise server.RequestError("git_forge_failed", 502)
+            return result
+        return run
+
+    def test_quarantine_accepts_normal_and_full_non_thin_packs(self):
+        remote, work, base, head = self.git_fixture()
+        for common, revs in ((base, f"{head}\n^{base}\n"), (None, f"{head}\n")):
+            with self.subTest(common=common), mock.patch.object(server, "network_git", self.fake_fetch(remote)), mock.patch.object(server, "scan_objects"):
+                with server.quarantine(self.quarantine_request(head, common), self.pack(work, revs), self.policy(), server.TOKEN_PATH, server.Deadline.start()) as repo:
+                    self.assertTrue((repo / "objects").is_dir())
+
+    def test_quarantine_rejects_thin_pack(self):
+        seed = self.root / "thin-seed"; seed.mkdir()
+        git(seed, "init", "-b", "main")
+        git(seed, "config", "user.email", "test@example.test"); git(seed, "config", "user.name", "Test")
+        (seed / "large.txt").write_text("base-line\n" * 20000)
+        git(seed, "add", "large.txt"); git(seed, "commit", "-m", "base")
+        base = git(seed, "rev-parse", "HEAD").decode().strip()
+        remote = self.root / "thin-remote.git"
+        git(self.root, "clone", "--bare", str(seed), str(remote))
+        work = self.root / "thin-work"
+        git(self.root, "clone", str(remote), str(work))
+        git(work, "config", "user.email", "test@example.test"); git(work, "config", "user.name", "Test")
+        git(work, "checkout", "-b", "fieldwork/test-change")
+        lines = (work / "large.txt").read_text().splitlines()
+        lines[10000] = "changed-line"
+        (work / "large.txt").write_text("\n".join(lines) + "\n")
+        git(work, "add", "large.txt"); git(work, "commit", "-m", "change")
+        head = git(work, "rev-parse", "HEAD").decode().strip()
+        thin = self.pack(work, f"{head}\n^{base}\n", thin=True)
+        with mock.patch.object(server, "network_git", self.fake_fetch(remote)), mock.patch.object(server, "scan_objects"):
+            with self.assertRaisesRegex(server.RequestError, "invalid_pack"):
+                with server.quarantine(self.quarantine_request(head, base), thin, self.policy(), server.TOKEN_PATH, server.Deadline.start()):
+                    pass
+
+    def test_quarantine_maps_sha256_pack_to_unsupported_format(self):
+        probe = self.root / "sha256-work"
+        initialized = subprocess.run(
+            ["/usr/bin/git", "init", "--object-format=sha256", "-b", "main", str(probe)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env={"PATH": "/usr/bin:/bin", "HOME": str(self.root)},
         )
-        with self.assertRaises(self.server.RequestError) as ctx:
-            self.server.preflight({"repo": "owner/fieldwork-smoke"})
-        self.assertEqual(ctx.exception.status, 404)
-        self.assertIn("selected repositories", ctx.exception.message)
+        if initialized.returncode != 0 or git(probe, "rev-parse", "--show-object-format").strip() != b"sha256":
+            self.skipTest("installed Git does not support SHA-256 repositories")
+        git(probe, "config", "user.email", "test@example.test"); git(probe, "config", "user.name", "Test")
+        (probe / "file.txt").write_text("sha256 object format\n")
+        git(probe, "add", "file.txt"); git(probe, "commit", "-m", "sha256")
+        sha_head = git(probe, "rev-parse", "HEAD").decode().strip()
+        sha_pack = self.pack(probe, f"{sha_head}\n")
+        remote, _work, _base, _head = self.git_fixture()
+        request = self.quarantine_request("1" * 40, None)
+        with mock.patch.object(server, "network_git", self.fake_fetch(remote)), mock.patch.object(server, "scan_objects"):
+            with self.assertRaisesRegex(server.RequestError, "unsupported_object_format"):
+                with server.quarantine(request, sha_pack, self.policy(), server.TOKEN_PATH, server.Deadline.start()):
+                    pass
 
-    def test_preflight_handler_routes_without_pr_validation(self) -> None:
-        (self.tmp / "gh-token").write_text("github_pat_test\n")
-        self.write_fake_gh(
-            "#!/usr/bin/env bash\n"
-            "printf '%s\\n' '{\"nameWithOwner\":\"owner/fieldwork-smoke\",\"defaultBranchRef\":{\"name\":\"main\"},\"visibility\":\"PRIVATE\"}'\n"
-        )
-        body = b'{"repo":"owner/fieldwork-smoke"}'
-        req = (
-            b"POST /preflight HTTP/1.1\r\n"
-            b"Host: localhost\r\n"
-            b"Content-Type: application/json\r\n"
-            + f"Content-Length: {len(body)}\r\n\r\n".encode()
-            + body
-        )
-        left, right = socket.socketpair()
-        thread = threading.Thread(target=self.server.handle, args=(right,))
-        thread.start()
-        left.sendall(req)
-        response = left.recv(4096).decode()
-        thread.join(timeout=5)
-        left.close()
-        self.assertIn("HTTP/1.1 200 OK", response)
-        self.assertIn('"ok": true', response)
-        self.assertIn('"repo": "owner/fieldwork-smoke"', response)
+    def test_quarantine_rejects_stuffed_pack(self):
+        remote, work, base, head = self.git_fixture()
+        git(work, "checkout", "--orphan", "stuff")
+        git(work, "rm", "-rf", ".")
+        (work / "stuff.txt").write_text("extra\n")
+        git(work, "add", "stuff.txt"); git(work, "commit", "-m", "stuff")
+        extra = git(work, "rev-parse", "HEAD").decode().strip()
+        stuffed = self.pack(work, f"{head}\n^{base}\n{extra}\n")
+        with mock.patch.object(server, "network_git", self.fake_fetch(remote)), mock.patch.object(server, "scan_objects"):
+            with self.assertRaisesRegex(server.RequestError, "unexpected_objects"):
+                with server.quarantine(self.quarantine_request(head, base), stuffed, self.policy(), server.TOKEN_PATH, server.Deadline.start()):
+                    pass
 
-    def test_missing_required_field_rejected(self) -> None:
-        repo = self.make_repo()
-        req = self.request(repo)
-        del req["body"]
-        self.assert_rejects(req, "missing required field: body")
+    def test_quarantine_rejects_stale_invalid_and_unrelated_histories(self):
+        remote, work, base, head = self.git_fixture()
+        unrelated = self.root / "unrelated"; unrelated.mkdir()
+        git(unrelated, "init", "-b", "main")
+        git(unrelated, "config", "user.email", "test@example.test"); git(unrelated, "config", "user.name", "Test")
+        (unrelated / "other.txt").write_text("other\n")
+        git(unrelated, "add", "other.txt"); git(unrelated, "commit", "-m", "other")
+        unrelated_head = git(unrelated, "rev-parse", "HEAD").decode().strip()
+        unrelated_pack = self.pack(unrelated, f"{unrelated_head}\n")
+        with mock.patch.object(server, "network_git", self.fake_fetch(remote)), mock.patch.object(server, "scan_objects"):
+            with self.assertRaisesRegex(server.RequestError, "unrelated_history"):
+                with server.quarantine(self.quarantine_request(unrelated_head, None), unrelated_pack, self.policy(), server.TOKEN_PATH, server.Deadline.start()):
+                    pass
+            with self.assertRaisesRegex(server.RequestError, "invalid_base_claim"):
+                with server.quarantine(self.quarantine_request(unrelated_head, base), unrelated_pack, self.policy(), server.TOKEN_PATH, server.Deadline.start()):
+                    pass
+            missing_ancestor = "d" * 40
+            with self.assertRaisesRegex(server.RequestError, "stale_base"):
+                with server.quarantine(self.quarantine_request(head, missing_ancestor), self.pack(work, f"{head}\n^{base}\n"), self.policy(), server.TOKEN_PATH, server.Deadline.start()):
+                    pass
 
-    def test_unexpected_field_rejected(self) -> None:
-        repo = self.make_repo()
-        self.assert_rejects(self.request(repo, extra="nope"), "unexpected field: extra")
-
-    def test_invalid_request_id_rejected(self) -> None:
-        repo = self.make_repo()
-        self.assert_rejects(self.request(repo, request_id="not-a-uuid"), "request_id")
-
-    def test_invalid_created_at_rejected(self) -> None:
-        repo = self.make_repo()
-        self.assert_rejects(self.request(repo, created_at="2026-05-11 10:30:00"), "created_at")
-
-    def test_repo_outside_projects_root_rejected(self) -> None:
-        repo = self.make_repo()
-        req = self.request(repo, repo_path="/tmp/fieldwork-smoke")
-        self.assert_rejects(req, "repo_path")
-
-    def test_branch_main_rejected(self) -> None:
-        repo = self.make_repo()
-        self.assert_rejects(self.request(repo, branch="main"), "branch")
-
-    def test_branch_not_under_prefix_rejected(self) -> None:
-        repo = self.make_repo()
-        self.assert_rejects(self.request(repo, branch="feature/test"), "branch")
-
-    def test_branch_prefix_is_configurable(self) -> None:
-        repo = self.make_repo()
-        # The default prefix is "fieldwork"; a "claude/" branch is now rejected
-        # unless FIELDWORK_BROKER_BRANCH_PREFIX is overridden.
-        self.assert_rejects(self.request(repo, branch="claude/test"), "branch")
-
-    def test_title_with_newline_rejected(self) -> None:
-        repo = self.make_repo()
-        self.assert_rejects(self.request(repo, title="Bad\ntitle"), "title")
-
-    def test_oversized_body_rejected(self) -> None:
-        repo = self.make_repo()
-        self.assert_rejects(self.request(repo, body="x" * (64 * 1024 + 1)), "body")
-
-    def test_missing_expected_origin_rejected(self) -> None:
-        repo = self.make_repo(missing_expected_origin=True)
-        self.assert_rejects(self.request(repo), "missing .fieldwork/expected-origin")
-
-    def test_empty_expected_origin_rejected(self) -> None:
-        repo = self.make_repo()
-        (repo / ".fieldwork/expected-origin").write_text("")
-        self.git("add", ".fieldwork/expected-origin", cwd=repo)
-        self.git("commit", "-m", "empty expected origin", cwd=repo)
-        self.assert_rejects(self.request(repo), "expected-origin is empty")
-
-    def test_dirty_worktree_rejected(self) -> None:
-        repo = self.make_repo(dirty=True)
-        self.assert_rejects(self.request(repo), "worktree not clean")
-
-    def test_origin_spoofing_rejected(self) -> None:
-        repo = self.make_repo(expected_owner="attacker", expected_repo="target")
-        self.assert_rejects(self.request(repo), "origin remote does not match")
-
-    def test_secret_shaped_body_rejected(self) -> None:
-        repo = self.make_repo()
-        self.assert_rejects(self.request(repo, body="SECRET_SHAPED_TOKEN"), "secret-shaped")
-
-    def test_replay_request_id_rejected(self) -> None:
-        repo = self.make_repo()
-        validated = self.server.validate(self.request(repo))
-        self.server.reserve_request_id(validated)
-        with self.assertRaises(self.server.RequestError) as ctx:
-            self.server.reserve_request_id(validated)
-        self.assertEqual(ctx.exception.status, 409)
-        self.assertIn("duplicate request_id", ctx.exception.message)
-
-    def test_rate_limit_rejected(self) -> None:
-        repo_key = "owner/fieldwork-smoke"
-        for _ in range(self.server.RATE_LIMIT_PER_HOUR):
-            self.server.rate_limit(repo_key)
-        with self.assertRaises(self.server.RequestError) as ctx:
-            self.server.rate_limit(repo_key)
-        self.assertEqual(ctx.exception.status, 429)
-        self.assertIn("rate limit hit", ctx.exception.message)
-
-    def test_rate_limit_env_int_is_bounded(self) -> None:
-        old = os.environ.get("FIELDWORK_BROKER_RATE_LIMIT_PER_HOUR")
+    def test_quarantine_enforces_policy_delta_cap(self):
+        remote, work, base, head = self.git_fixture()
+        pack = self.pack(work, f"{head}\n^{base}\n")
+        old = server.SCAN_MAX_OBJECTS; server.SCAN_MAX_OBJECTS = 1
         try:
-            os.environ["FIELDWORK_BROKER_RATE_LIMIT_PER_HOUR"] = "9"
-            self.assertEqual(
-                self.server.bounded_env_int("FIELDWORK_BROKER_RATE_LIMIT_PER_HOUR", 12, minimum=1, maximum=120),
-                9,
-            )
-            os.environ["FIELDWORK_BROKER_RATE_LIMIT_PER_HOUR"] = "bad"
-            self.assertEqual(
-                self.server.bounded_env_int("FIELDWORK_BROKER_RATE_LIMIT_PER_HOUR", 12, minimum=1, maximum=120),
-                12,
-            )
-            os.environ["FIELDWORK_BROKER_RATE_LIMIT_PER_HOUR"] = "0"
-            self.assertEqual(
-                self.server.bounded_env_int("FIELDWORK_BROKER_RATE_LIMIT_PER_HOUR", 12, minimum=1, maximum=120),
-                1,
-            )
-            os.environ["FIELDWORK_BROKER_RATE_LIMIT_PER_HOUR"] = "999"
-            self.assertEqual(
-                self.server.bounded_env_int("FIELDWORK_BROKER_RATE_LIMIT_PER_HOUR", 12, minimum=1, maximum=120),
-                120,
-            )
+            with mock.patch.object(server, "network_git", self.fake_fetch(remote)), mock.patch.object(server, "scan_objects"):
+                with self.assertRaisesRegex(server.RequestError, "scan_range_too_large"):
+                    with server.quarantine(self.quarantine_request(head, base), pack, self.policy(), server.TOKEN_PATH, server.Deadline.start()):
+                        pass
         finally:
-            if old is None:
-                os.environ.pop("FIELDWORK_BROKER_RATE_LIMIT_PER_HOUR", None)
-            else:
-                os.environ["FIELDWORK_BROKER_RATE_LIMIT_PER_HOUR"] = old
+            server.SCAN_MAX_OBJECTS = old
 
-    def test_workflow_push_error_is_actionable(self) -> None:
-        err = subprocess.CalledProcessError(
-            1,
-            ["git", "push"],
-            stderr=(
-                b"refusing to allow a Personal Access Token to create or update workflow "
-                b"'.github/workflows/ci.yml' without 'workflow' scope"
-            ),
-        )
-        message = self.server.broker_subprocess_error_message(err)
-        self.assertIn("Workflows read/write", message)
-        self.assertIn("--no-workflows", message)
-
-    def test_pr_permission_error_is_actionable(self) -> None:
-        err = subprocess.CalledProcessError(
-            1,
-            ["gh", "pr", "create"],
-            stderr="HTTP 403: Resource not accessible by personal access token",
-        )
-        message = self.server.broker_subprocess_error_message(err)
-        self.assertIn("Pull requests read/write", message)
-
-    def enable_gate(self, path: Path) -> None:
-        (path / ".fieldwork/approval-gate").write_text("")
-        self.git("add", ".fieldwork/approval-gate", cwd=path)
-        self.git("commit", "-m", "enable approval gate", cwd=path)
-
-    def test_queued_when_approval_gate_present(self) -> None:
-        repo = self.make_repo()
-        self.enable_gate(repo)
-
-        req = self.request(repo)
-        body = json.dumps(req).encode()
-        http = (
-            b"POST /pr HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n"
-            + f"Content-Length: {len(body)}\r\n\r\n".encode()
-            + body
-        )
-        left, right = socket.socketpair()
-        thread = threading.Thread(target=self.server.handle, args=(right, "agent"))
-        thread.start()
-        left.sendall(http)
-        response = left.recv(8192).decode()
-        thread.join(timeout=5)
-        left.close()
-
-        self.assertIn("HTTP/1.1 200 OK", response)
-        self.assertIn('"ok": true', response)
-        self.assertIn('"queued": true', response)
-        self.assertIn('"expires_at"', response)
-
-        pending_files = list(self.pending.glob("*.json"))
-        self.assertEqual(len(pending_files), 1, f"expected 1 pending file, got {pending_files}")
-        record = json.loads(pending_files[0].read_text())
-        self.assertEqual(record["request_id"], req["request_id"])
-        self.assertEqual(record["branch"], req["branch"])
-        self.assertEqual(record["repo"], "owner/fieldwork-smoke")
-
-        ledger_files = list(self.ledger.glob("*.json"))
-        self.assertEqual(len(ledger_files), 1, "ledger entry must be reserved at queue time")
-        events = self.audit_events()
-        self.assertIn("request_received", [event["event"] for event in events])
-        self.assertIn("request_queued", [event["event"] for event in events])
-        queued = [event for event in events if event["event"] == "request_queued"][-1]
-        self.assertEqual(queued["repo"], "owner/fieldwork-smoke")
-        self.assertEqual(queued["repo_path_slug"], "fieldwork-smoke")
-        self.assertNotIn("body", queued)
-
-    def test_duplicate_branch_request_rejected_while_pending(self) -> None:
-        repo = self.make_repo()
-        self.enable_gate(repo)
-
-        def post_pr(req: dict) -> str:
-            body = json.dumps(req).encode()
-            http = (
-                b"POST /pr HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n"
-                + f"Content-Length: {len(body)}\r\n\r\n".encode()
-                + body
-            )
-            left, right = socket.socketpair()
-            thread = threading.Thread(target=self.server.handle, args=(right, "agent"))
-            thread.start()
-            left.sendall(http)
-            response = left.recv(8192).decode()
-            thread.join(timeout=5)
-            left.close()
-            return response
-
-        first = self.request(repo)
-        self.assertIn('"queued": true', post_pr(first))
-
-        # A re-submit for the same branch (fresh request_id) must be rejected
-        # while the first is still pending, instead of queuing a duplicate.
-        second = self.request(repo)
-        self.assertNotEqual(second["request_id"], first["request_id"])
-        second_resp = post_pr(second)
-        self.assertIn("HTTP/1.1 409 ERROR", second_resp)
-        self.assertIn('"already_pending": true', second_resp)
-        self.assertIn(first["request_id"], second_resp)
-
-        pending_files = list(self.pending.glob("*.json"))
-        self.assertEqual(len(pending_files), 1, f"expected 1 pending file, got {pending_files}")
-
-    def test_approve_route_pushes_and_clears_pending(self) -> None:
-        repo = self.make_repo()
-        self.enable_gate(repo)
-        validated = self.server.validate(self.request(repo))
-        self.server.reserve_request_id(validated)
-        self.server.queue_pending(validated)
-
-        push_calls: list[list[str]] = []
-
-        def fake_push_and_open_pr(req: object) -> str:
-            push_calls.append(["push_and_open_pr", req.request_id])
-            return "https://github.com/owner/fieldwork-smoke/pull/1"
-
-        original = self.server.push_and_open_pr
-        self.server.push_and_open_pr = fake_push_and_open_pr
+    def test_quarantine_enforces_physical_object_cap(self):
+        remote, work, base, head = self.git_fixture()
+        pack = self.pack(work, f"{head}\n^{base}\n")
+        old = server.PACK_MAX_OBJECTS; server.PACK_MAX_OBJECTS = 1
         try:
-            result = self.server.approve({
-                "request_id": validated.request_id,
-                "decision": "approve",
-            })
+            with mock.patch.object(server, "network_git", self.fake_fetch(remote)), mock.patch.object(server, "scan_objects"):
+                with self.assertRaisesRegex(server.RequestError, "pack_limits_exceeded"):
+                    with server.quarantine(self.quarantine_request(head, base), pack, self.policy(), server.TOKEN_PATH, server.Deadline.start()):
+                        pass
         finally:
-            self.server.push_and_open_pr = original
-
-        self.assertEqual(result["url"], "https://github.com/owner/fieldwork-smoke/pull/1")
-        self.assertEqual(result["decision"], "approve")
-        self.assertEqual(len(push_calls), 1)
-        self.assertEqual(list(self.pending.glob("*.json")), [])
-        events = self.audit_events()
-        self.assertIn("request_approved", [event["event"] for event in events])
-
-    def test_approve_route_deny_removes_pending(self) -> None:
-        repo = self.make_repo()
-        self.enable_gate(repo)
-        validated = self.server.validate(self.request(repo))
-        self.server.reserve_request_id(validated)
-        self.server.queue_pending(validated)
-        self.assertEqual(len(list(self.pending.glob("*.json"))), 1)
-
-        result = self.server.approve({
-            "request_id": validated.request_id,
-            "decision": "deny",
-        })
-        self.assertEqual(result["decision"], "deny")
-        self.assertEqual(list(self.pending.glob("*.json")), [])
-        events = self.audit_events()
-        self.assertIn("request_denied", [event["event"] for event in events])
-
-        # Ledger entry persists. Denied request_id cannot be replayed.
-        ledger_files = list(self.ledger.glob("*.json"))
-        self.assertEqual(len(ledger_files), 1)
-
-    def test_approve_route_rejected_on_agent_socket(self) -> None:
-        body = b'{"request_id":"deadbeef-dead-4dad-bdad-deadbeefdead","decision":"approve"}'
-        http = (
-            b"POST /approve HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n"
-            + f"Content-Length: {len(body)}\r\n\r\n".encode()
-            + body
-        )
-        left, right = socket.socketpair()
-        thread = threading.Thread(target=self.server.handle, args=(right, "agent"))
-        thread.start()
-        left.sendall(http)
-        response = left.recv(8192).decode()
-        thread.join(timeout=5)
-        left.close()
-
-        self.assertIn("HTTP/1.1 404", response)
-        self.assertIn("/approve is only available on the approve socket", response)
-
-    def test_pr_route_rejected_on_approve_socket(self) -> None:
-        body = b'{"repo":"owner/repo"}'
-        http = (
-            b"POST /pr HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n"
-            + f"Content-Length: {len(body)}\r\n\r\n".encode()
-            + body
-        )
-        left, right = socket.socketpair()
-        thread = threading.Thread(target=self.server.handle, args=(right, "approve"))
-        thread.start()
-        left.sendall(http)
-        response = left.recv(8192).decode()
-        thread.join(timeout=5)
-        left.close()
-
-        self.assertIn("HTTP/1.1 404", response)
-        self.assertIn("approve socket only serves /approve", response)
-
-    def test_approve_unknown_request_id_404(self) -> None:
-        with self.assertRaises(self.server.RequestError) as ctx:
-            self.server.approve({
-                "request_id": "deadbeef-dead-4dad-bdad-deadbeefdead",
-                "decision": "approve",
-            })
-        self.assertEqual(ctx.exception.status, 404)
-        self.assertIn("no pending request", ctx.exception.message)
-
-    def test_approve_rejects_invalid_decision(self) -> None:
-        with self.assertRaises(self.server.RequestError) as ctx:
-            self.server.approve({
-                "request_id": "deadbeef-dead-4dad-bdad-deadbeefdead",
-                "decision": "maybe",
-            })
-        self.assertIn("decision must be", ctx.exception.message)
-
-    def test_expiry_sweep_drops_old_pending(self) -> None:
-        repo = self.make_repo()
-        self.enable_gate(repo)
-        validated = self.server.validate(self.request(repo))
-        self.server.reserve_request_id(validated)
-        self.server.queue_pending(validated)
-
-        # Rewrite queued_at to be older than the expiry window.
-        pending_file = self.pending / f"{validated.request_id}.json"
-        record = json.loads(pending_file.read_text())
-        record["queued_at"] = "2020-01-01T00:00:00Z"
-        pending_file.write_text(json.dumps(record))
-
-        dropped = self.server.sweep_expired_pending()
-        self.assertEqual(dropped, 1)
-        self.assertEqual(list(self.pending.glob("*.json")), [])
-        self.assertIn("request_expired", [event["event"] for event in self.audit_events()])
-
-        # Replay protection survives expiry. Same request_id is rejected.
-        with self.assertRaises(self.server.RequestError) as ctx:
-            self.server.reserve_request_id(validated)
-        self.assertEqual(ctx.exception.status, 409)
-
-    def test_expired_pending_rejected_on_approve(self) -> None:
-        repo = self.make_repo()
-        self.enable_gate(repo)
-        validated = self.server.validate(self.request(repo))
-        self.server.reserve_request_id(validated)
-        self.server.queue_pending(validated)
-
-        pending_file = self.pending / f"{validated.request_id}.json"
-        record = json.loads(pending_file.read_text())
-        record["queued_at"] = "2020-01-01T00:00:00Z"
-        pending_file.write_text(json.dumps(record))
-
-        with self.assertRaises(self.server.RequestError) as ctx:
-            self.server.approve({
-                "request_id": validated.request_id,
-                "decision": "approve",
-            })
-        self.assertEqual(ctx.exception.status, 410)
-        self.assertEqual(list(self.pending.glob("*.json")), [])
-
-    def test_non_gated_repo_still_pushes_immediately(self) -> None:
-        repo = self.make_repo(slug="ungated-smoke")
-        validated = self.server.validate(self.request(repo))
-        # No .fieldwork/approval-gate present.
-        self.assertFalse(self.server.approval_gate_enabled(str(repo)))
-        self.assertEqual(list(self.pending.glob("*.json")), [])
-
-    def _run_push_with_subprocess_stub(self, gh_edit_returncode: int = 0,
-                                       gh_edit_stderr: bytes = b"") -> tuple[str, list[list[str]]]:
-        """Drive push_and_open_pr with subprocess.run stubbed.
-
-        Returns (pr_url, recorded_calls). The stub answers in order:
-        - git push  -> ok
-        - gh pr create -> stdout = "https://github.com/owner/repo/pull/42\n"
-        - gh pr edit --add-label -> exit code per gh_edit_returncode
-        Anything else is recorded but unmocked is a test bug.
-        """
-        repo = self.make_repo()
-        (self.tmp / "gh-token").write_text("github_pat_test\n")
-        validated = self.server.validate(self.request(repo))
-
-        calls: list[list[str]] = []
-        from unittest.mock import patch
-
-        def fake_run(argv, *args, **kwargs):
-            calls.append(list(argv))
-            class _R:
-                returncode = 0
-                stdout = ""
-                stderr = ""
-            r = _R()
-            # git push: ok
-            if argv[:2] == ["git", "-C"] and "push" in argv:
-                return r
-            # gh pr create
-            if argv[:3] == ["gh", "pr", "create"]:
-                r.stdout = "https://github.com/owner/fieldwork-smoke/pull/42\n"
-                r.returncode = 0
-                return r
-            # gh pr edit ... --add-label
-            if argv[:3] == ["gh", "pr", "edit"]:
-                if gh_edit_returncode != 0:
-                    raise subprocess.CalledProcessError(
-                        returncode=gh_edit_returncode,
-                        cmd=argv,
-                        output=b"",
-                        stderr=gh_edit_stderr,
-                    )
-                return r
-            raise AssertionError(f"unexpected subprocess.run call: {argv}")
-
-        with patch.object(self.server.subprocess, "run", side_effect=fake_run):
-            pr_url = self.server.push_and_open_pr(validated)
-        return pr_url, calls
-
-    def test_push_applies_ready_for_review_label(self) -> None:
-        pr_url, calls = self._run_push_with_subprocess_stub()
-        self.assertEqual(pr_url, "https://github.com/owner/fieldwork-smoke/pull/42")
-        creates = [c for c in calls if c[:3] == ["gh", "pr", "create"]]
-        self.assertEqual(len(creates), 1)
-        base_index = creates[0].index("--base")
-        self.assertEqual(creates[0][base_index + 1], "main")
-        edits = [c for c in calls if c[:3] == ["gh", "pr", "edit"]]
-        self.assertEqual(len(edits), 1, f"expected one gh pr edit call, got: {edits}")
-        edit = edits[0]
-        self.assertIn(pr_url, edit)
-        self.assertIn("--add-label", edit)
-        self.assertIn("ready for review", edit)
-        events = self.audit_events()
-        names = [event["event"] for event in events]
-        self.assertIn("push_attempted", names)
-        self.assertIn("pr_opened", names)
-        opened = [event for event in events if event["event"] == "pr_opened"][-1]
-        self.assertEqual(opened["pr_url"], pr_url)
-
-    def test_github_backend_preserves_pat_command_and_env_shape(self) -> None:
-        repo = self.make_repo()
-        (self.tmp / "gh-token").write_text("github_pat_test\n")
-        validated = self.server.validate(self.request(repo))
-        calls: list[dict] = []
-        from unittest.mock import patch
-
-        def fake_run(argv, *args, **kwargs):
-            calls.append({"argv": list(argv), "env": dict(kwargs.get("env") or {})})
-
-            class _R:
-                returncode = 0
-                stdout = ""
-                stderr = ""
-
-            r = _R()
-            if argv[:2] == ["git", "-C"] and "push" in argv:
-                return r
-            if argv[:3] == ["gh", "pr", "create"]:
-                r.stdout = "https://github.com/owner/fieldwork-smoke/pull/42\n"
-                return r
-            if argv[:3] == ["gh", "pr", "edit"]:
-                return r
-            raise AssertionError(f"unexpected subprocess.run call: {argv}")
-
-        backend = self.server.GitHubBackend(self.server.PatCredentialProvider())
-        with patch.object(self.server.subprocess, "run", side_effect=fake_run):
-            pr_url = backend.push_and_open_pr(validated)
-
-        self.assertEqual(pr_url, "https://github.com/owner/fieldwork-smoke/pull/42")
-        push = calls[0]
-        create = calls[1]
-        edit = calls[2]
-        self.assertEqual(
-            push["argv"],
-            [
-                "git", "-C", str(repo), "push", "--no-verify",
-                "https://github.com/owner/fieldwork-smoke.git",
-                "HEAD:refs/heads/fieldwork/test-change",
-            ],
-        )
-        self.assertEqual(create["argv"][:5], ["gh", "pr", "create", "--repo", "owner/fieldwork-smoke"])
-        self.assertEqual(edit["argv"][:3], ["gh", "pr", "edit"])
-        self.assertEqual(push["env"]["GIT_ASKPASS"], self.server.ASKPASS_PATH)
-        self.assertNotIn("GH_TOKEN", push["env"])
-        self.assertEqual(create["env"]["GH_TOKEN"], "github_pat_test")
-        self.assertEqual(edit["env"]["GH_TOKEN"], "github_pat_test")
-
-    def test_github_backend_uses_temp_token_file_for_app_push(self) -> None:
-        repo = self.make_repo()
-        validated = self.server.validate(self.request(repo))
-        calls: list[dict] = []
-        token_paths: list[str] = []
-        from unittest.mock import patch
-
-        class StaticAppProvider:
-            mode = "app"
-
-            def acquire_token(self) -> str:
-                return "ghs_app_token"
-
-        def fake_run(argv, *args, **kwargs):
-            calls.append({"argv": list(argv), "env": dict(kwargs.get("env") or {})})
-
-            class _R:
-                returncode = 0
-                stdout = ""
-                stderr = ""
-
-            r = _R()
-            if argv[:2] == ["git", "-C"] and "push" in argv:
-                token_path = Path(kwargs["env"]["FIELDWORK_BROKER_TOKEN_PATH"])
-                token_paths.append(str(token_path))
-                self.assertTrue(token_path.is_file())
-                self.assertEqual(token_path.stat().st_mode & 0o777, 0o600)
-                self.assertEqual(token_path.read_text(), "ghs_app_token\n")
-                self.assertNotIn("ghs_app_token", " ".join(argv))
-                return r
-            if argv[:3] == ["gh", "pr", "create"]:
-                self.assertEqual(kwargs["env"]["GH_TOKEN"], "ghs_app_token")
-                self.assertNotIn("ghs_app_token", " ".join(argv))
-                r.stdout = "https://github.com/owner/fieldwork-smoke/pull/42\n"
-                return r
-            if argv[:3] == ["gh", "pr", "edit"]:
-                self.assertEqual(kwargs["env"]["GH_TOKEN"], "ghs_app_token")
-                self.assertNotIn("ghs_app_token", " ".join(argv))
-                return r
-            raise AssertionError(f"unexpected subprocess.run call: {argv}")
-
-        backend = self.server.GitHubBackend(StaticAppProvider())
-        with patch.object(self.server.subprocess, "run", side_effect=fake_run):
-            pr_url = backend.push_and_open_pr(validated)
-
-        self.assertEqual(pr_url, "https://github.com/owner/fieldwork-smoke/pull/42")
-        self.assertEqual(len(token_paths), 1)
-        self.assertFalse(Path(token_paths[0]).exists())
-        push = calls[0]
-        self.assertEqual(push["env"]["GIT_ASKPASS"], self.server.ASKPASS_PATH)
-        self.assertIn("FIELDWORK_BROKER_TOKEN_PATH", push["env"])
-        self.assertNotIn("GH_TOKEN", push["env"])
-
-    def test_old_format_pending_record_revalidates_from_repo_key(self) -> None:
-        repo = self.make_repo()
-        validated = self.server.validate(self.request(repo))
-        record = {
-            "request_id": validated.request_id,
-            "created_at": validated.created_at,
-            "repo": validated.project,
-            "owner": "owner",
-            "repo_name": "fieldwork-smoke",
-            "repo_path": validated.repo_path,
-            "branch": validated.branch,
-            "base_branch": validated.base_branch,
-            "title": validated.title,
-            "body": validated.body,
-        }
-        rebuilt = self.server.revalidate_pending_for_push(record)
-        self.assertEqual(rebuilt.project, "owner/fieldwork-smoke")
-
-    def test_gitlab_nested_project_validates_with_pinned_expected_origin(self) -> None:
-        self.server.FORGE = "gitlab"
-        self.server.GITLAB_API = "https://gitlab.example.com/api/v4"
-        repo = self.make_gitlab_repo()
-        validated = self.server.validate(self.request(repo))
-        self.assertEqual(validated.project, "group/sub/project")
-
-    def test_gitlab_expected_origin_host_must_match_pin(self) -> None:
-        self.server.FORGE = "gitlab"
-        self.server.GITLAB_API = "https://gitlab.example.com/api/v4"
-        repo = self.make_gitlab_repo()
-        (repo / ".fieldwork/expected-origin").write_text("https://attacker.example.com/group/sub/project.git\n")
-        self.git("add", ".fieldwork/expected-origin", cwd=repo)
-        self.git("commit", "-m", "spoof expected origin", cwd=repo)
-        self.assert_rejects(self.request(repo), "must match FIELDWORK_GITLAB_API")
-
-    def test_gitlab_api_rejects_path_prefixed_instances(self) -> None:
-        self.server.GITLAB_API = "https://gitlab.example.com/gitlab/api/v4"
-        with self.assertRaises(self.server.RequestError) as ctx:
-            self.server.GitLabBackend(self.server.PatCredentialProvider())
-        self.assertIn("path must be exactly /api/v4", ctx.exception.message)
-
-    def test_gitlab_preflight_uses_private_token_and_encoded_project(self) -> None:
-        self.server.GITLAB_API = "https://gitlab.example.com/api/v4"
-        (self.tmp / "gh-token").write_text("gitlab-token\n")
-        captured: list[dict] = []
-
-        class FakeResponse:
-            def __enter__(self):
-                return self
-            def __exit__(self, *_args: object) -> None:
-                return None
-            def read(self) -> bytes:
-                return json.dumps({
-                    "path_with_namespace": "group/sub/project",
-                    "default_branch": "trunk",
-                    "visibility": "private",
-                }).encode()
-
-        backend = self.server.GitLabBackend(self.server.PatCredentialProvider())
-
-        def fake_open(request, timeout):
-            captured.append({
-                "url": request.full_url,
-                "headers": dict(request.header_items()),
-                "timeout": timeout,
-            })
-            return FakeResponse()
-
-        backend.opener.open = fake_open
-        result = backend.preflight({"repo": "group/sub/project"})
-        self.assertEqual(result["project"], "group/sub/project")
-        self.assertEqual(result["default_branch"], "trunk")
-        self.assertEqual(captured[0]["url"], "https://gitlab.example.com/api/v4/projects/group%2Fsub%2Fproject")
-        self.assertEqual(captured[0]["headers"].get("Private-token"), "gitlab-token")
-        self.assertEqual(captured[0]["timeout"], 30)
-
-    def test_gitlab_push_creates_mr_with_json_body_and_nonfatal_label(self) -> None:
-        self.server.FORGE = "gitlab"
-        self.server.GITLAB_API = "https://gitlab.example.com/api/v4"
-        (self.tmp / "gh-token").write_text("gitlab-token\n")
-        repo = self.make_gitlab_repo()
-        validated = self.server.validate(self.request(repo, branch="fieldwork/project-abc123"))
-        calls: list[dict] = []
-
-        class FakeResponse:
-            def __init__(self, payload: object):
-                self.payload = payload
-            def __enter__(self):
-                return self
-            def __exit__(self, *_args: object) -> None:
-                return None
-            def read(self) -> bytes:
-                return json.dumps(self.payload).encode()
-
-        backend = self.server.GitLabBackend(self.server.PatCredentialProvider())
-
-        def fake_open(request, timeout):
-            calls.append({
-                "url": request.full_url,
-                "method": request.get_method(),
-                "headers": dict(request.header_items()),
-                "body": request.data.decode() if request.data else "",
-            })
-            if request.get_method() == "PUT":
-                raise self.server.RequestError("label denied")
-            return FakeResponse({"iid": 7, "web_url": "https://gitlab.example.com/group/sub/project/-/merge_requests/7"})
-
-        def fake_run(argv, *args, **kwargs):
-            self.assertEqual(argv[-1], "HEAD:refs/heads/fieldwork/project-abc123")
-            self.assertEqual(argv[-2], "https://gitlab.example.com/group/sub/project.git")
-            self.assertIn("GIT_ASKPASS", kwargs["env"])
-            class _R:
-                returncode = 0
-            return _R()
-
-        backend.opener.open = fake_open
-        from unittest.mock import patch
-        with patch.object(self.server.subprocess, "run", side_effect=fake_run):
-            url = backend.push_and_open_pr(validated)
-
-        self.assertEqual(url, "https://gitlab.example.com/group/sub/project/-/merge_requests/7")
-        create = calls[0]
-        self.assertEqual(create["method"], "POST")
-        self.assertEqual(create["headers"].get("Content-type"), "application/json")
-        body = json.loads(create["body"])
-        self.assertEqual(body["source_branch"], "fieldwork/project-abc123")
-        self.assertEqual(body["target_branch"], "main")
-        self.assertIs(body["remove_source_branch"], False)
-        self.assertIn("?add_labels=ready+for+review", calls[1]["url"])
-
-    def test_gitlab_conflict_lookup_returns_single_existing_mr(self) -> None:
-        self.server.FORGE = "gitlab"
-        self.server.GITLAB_API = "https://gitlab.example.com/api/v4"
-        (self.tmp / "gh-token").write_text("gitlab-token\n")
-        repo = self.make_gitlab_repo()
-        validated = self.server.validate(self.request(repo))
-
-        class FakeResponse:
-            def __init__(self, payload: object):
-                self.payload = payload
-            def __enter__(self):
-                return self
-            def __exit__(self, *_args: object) -> None:
-                return None
-            def read(self) -> bytes:
-                return json.dumps(self.payload).encode()
-
-        backend = self.server.GitLabBackend(self.server.PatCredentialProvider())
-        seen: list[str] = []
-
-        def fake_open(request, timeout):
-            seen.append(request.full_url)
-            if request.get_method() == "POST":
-                raise urllib.error.HTTPError(request.full_url, 409, "Conflict", {}, None)
-            return FakeResponse([{"iid": 9, "web_url": "https://gitlab.example.com/group/sub/project/-/merge_requests/9"}])
-
-        def fake_run(argv, *args, **kwargs):
-            class _R:
-                returncode = 0
-            return _R()
-
-        import urllib.error
-        backend.opener.open = fake_open
-        from unittest.mock import patch
-        with patch.object(self.server.subprocess, "run", side_effect=fake_run):
-            url = backend.push_and_open_pr(validated)
-        self.assertEqual(url, "https://gitlab.example.com/group/sub/project/-/merge_requests/9")
-        self.assertIn("source_branch=fieldwork%2Ftest-change", seen[1])
-
-    def test_gitlab_api_self_validation_rejects_unsafe_bases(self) -> None:
-        for api, needle in (
-            ("http://gitlab.example.com/api/v4", "must use https"),
-            ("https://user@gitlab.example.com/api/v4", "must not include userinfo"),
-            ("https://gitlab.example.com/api/v4?x=1", "must not include query or fragment"),
-        ):
-            self.server.GITLAB_API = api
-            with self.assertRaises(self.server.RequestError) as ctx:
-                self.server.GitLabBackend(self.server.PatCredentialProvider())
-            self.assertIn(needle, ctx.exception.message)
-
-    def test_gitlab_expected_origin_rejects_unsafe_scheme_and_userinfo(self) -> None:
-        # An agent-writable expected-origin must not smuggle a non-https scheme
-        # or userinfo past the host pin (SSRF / credential-courier guard).
-        self.server.GITLAB_API = "https://gitlab.example.com/api/v4"
-        backend = self.server.GitLabBackend(self.server.PatCredentialProvider())
-        with self.assertRaises(self.server.RequestError) as ctx:
-            backend.parse_expected_origin("http://gitlab.example.com/group/sub/project.git")
-        self.assertIn("must use https", ctx.exception.message)
-        with self.assertRaises(self.server.RequestError) as ctx:
-            backend.parse_expected_origin("https://user@gitlab.example.com/group/sub/project.git")
-        self.assertIn("must not include userinfo", ctx.exception.message)
-
-    def test_gitlab_redirect_refused_and_leaks_no_token(self) -> None:
-        # The redirect handler refuses outright; defense-in-depth, a 302 HTTPError
-        # surfacing through _api_json maps to a token-free RequestError.
-        import urllib.error
-        self.server.GITLAB_API = "https://gitlab.example.com/api/v4"
-        (self.tmp / "gh-token").write_text("gitlab-secret-token\n")
-        backend = self.server.GitLabBackend(self.server.PatCredentialProvider())
-        with self.assertRaises(urllib.error.HTTPError):
-            backend.opener.handlers  # touch to ensure opener is built
-            self.server.NoTokenRedirectHandler().redirect_request(
-                urllib.request.Request("https://gitlab.example.com/api/v4/projects/x"),
-                None, 302, "Found", {}, "https://169.254.169.254/api/v4/projects/x",
-            )
-
-        def fake_open(request, timeout):
-            raise urllib.error.HTTPError(request.full_url, 302, "Found", {}, None)
-
-        backend.opener.open = fake_open
-        with self.assertRaises(self.server.RequestError) as ctx:
-            backend.preflight({"repo": "group/sub/project"})
-        self.assertIn("refusing to replay the token", ctx.exception.message)
-        self.assertNotIn("gitlab-secret-token", ctx.exception.message)
-
-    def test_gitlab_opener_disables_ambient_proxy(self) -> None:
-        # ProxyHandler({}) neutralizes HTTPS_PROXY so a proxy cannot exfil the
-        # token or bypass the host pin. build_opener drops the empty handler and
-        # skips the default env-reading one, so no proxy ever routes the call.
-        self.server.GITLAB_API = "https://gitlab.example.com/api/v4"
-        saved = os.environ.get("HTTPS_PROXY")
-        os.environ["HTTPS_PROXY"] = "http://attacker.proxy.example:3128"
+            server.PACK_MAX_OBJECTS = old
+
+    def test_verify_pack_layout_enforces_object_and_delta_caps(self):
+        oid = "a" * 40
+        base = "b" * 40
+        old_size, old_depth = server.PACK_MAX_OBJECT_BYTES, server.PACK_MAX_DELTA_DEPTH
         try:
-            backend = self.server.GitLabBackend(self.server.PatCredentialProvider())
+            server.PACK_MAX_OBJECT_BYTES = 10
+            with self.assertRaisesRegex(server.RequestError, "pack_limits_exceeded"):
+                server.validate_pack_layout(f"{oid} blob 11 8 12\n".encode(), [oid])
+            server.PACK_MAX_OBJECT_BYTES = 100
+            server.PACK_MAX_DELTA_DEPTH = 2
+            with self.assertRaisesRegex(server.RequestError, "pack_limits_exceeded"):
+                server.validate_pack_layout(f"{oid} blob 9 8 12 3 {base}\n".encode(), [oid])
+            with self.assertRaisesRegex(server.RequestError, "invalid_pack"):
+                server.validate_pack_layout(b"\xff", [oid])
         finally:
-            if saved is None:
-                os.environ.pop("HTTPS_PROXY", None)
-            else:
-                os.environ["HTTPS_PROXY"] = saved
-        active_proxies = [
-            h.proxies for h in backend.opener.handlers
-            if isinstance(h, urllib.request.ProxyHandler) and h.proxies
-        ]
-        self.assertEqual(active_proxies, [])
-
-    def test_gitlab_ca_bundle_fail_closed_when_unreadable(self) -> None:
-        self.server.GITLAB_API = "https://gitlab.example.com/api/v4"
-        self.server.GITLAB_CA_BUNDLE = str(self.tmp / "missing-ca.pem")
-        with self.assertRaises(self.server.RequestError) as ctx:
-            self.server.GitLabBackend(self.server.PatCredentialProvider())
-        self.assertIn("readable regular file", ctx.exception.message)
-
-    def test_gitlab_conflict_lookup_zero_and_multiple_rejected(self) -> None:
-        import urllib.error
-        self.server.FORGE = "gitlab"
-        self.server.GITLAB_API = "https://gitlab.example.com/api/v4"
-        (self.tmp / "gh-token").write_text("gitlab-token\n")
-        repo = self.make_gitlab_repo()
-        validated = self.server.validate(self.request(repo))
-
-        class FakeResponse:
-            def __init__(self, payload: object):
-                self.payload = payload
-            def __enter__(self):
-                return self
-            def __exit__(self, *_args: object) -> None:
-                return None
-            def read(self) -> bytes:
-                return json.dumps(self.payload).encode()
-
-        def make_open(lookup_payload):
-            def fake_open(request, timeout):
-                if request.get_method() == "POST":
-                    raise urllib.error.HTTPError(request.full_url, 409, "Conflict", {}, None)
-                return FakeResponse(lookup_payload)
-            return fake_open
-
-        def fake_run(argv, *args, **kwargs):
-            class _R:
-                returncode = 0
-            return _R()
-
-        from unittest.mock import patch
-        for payload in ([], [{"web_url": "a"}, {"web_url": "b"}]):
-            backend = self.server.GitLabBackend(self.server.PatCredentialProvider())
-            backend.opener.open = make_open(payload)
-            with patch.object(self.server.subprocess, "run", side_effect=fake_run):
-                with self.assertRaises(self.server.RequestError) as ctx:
-                    backend.push_and_open_pr(validated)
-            self.assertEqual(ctx.exception.status, 409)
-
-    def test_gitlab_credential_error_hint_strings(self) -> None:
-        self.server.GITLAB_API = "https://gitlab.example.com/api/v4"
-        backend = self.server.GitLabBackend(self.server.PatCredentialProvider())
-        self.assertIn(
-            "write_repository",
-            backend.credential_error_hint("git -C /x push --no-verify ...", "remote rejected"),
-        )
-        self.assertIn(
-            "api scope",
-            backend.credential_error_hint("merge_request create", "denied"),
-        )
-
-    def test_push_succeeds_when_label_apply_fails(self) -> None:
-        # gh pr edit returns nonzero (e.g. label not defined on the repo).
-        # push_and_open_pr must still return the PR url; label is non-fatal.
-        pr_url, calls = self._run_push_with_subprocess_stub(
-            gh_edit_returncode=1,
-            gh_edit_stderr=b"label 'ready for review' not found\n",
-        )
-        self.assertEqual(pr_url, "https://github.com/owner/fieldwork-smoke/pull/42")
-        # The label call was still attempted.
-        self.assertTrue(any(c[:3] == ["gh", "pr", "edit"] for c in calls))
-
-    def test_notify_lifecycle_writes_versioned_envelope(self) -> None:
-        notifications = self.tmp / "notifications"
-        notifications.mkdir(exist_ok=True)
-        for item in notifications.glob("*"):
-            item.unlink()
-        saved = (
-            self.server.NOTIFICATIONS_DIR,
-            self.server.NOTIFY_LIFECYCLE_RAW,
-            self.server.NOTIFY_ON_PR_OPENED,
-        )
-        self.server.NOTIFICATIONS_DIR = str(notifications)
-        self.server.NOTIFY_LIFECYCLE_RAW = "1"
-        self.server.NOTIFY_ON_PR_OPENED = False
-        try:
-            self.server.notify_lifecycle(
-                "request_queued",
-                repo_slug_value="fieldwork-smoke",
-                request_id="11111111-1111-4111-8111-111111111111",
-                branch="fieldwork/test",
-            )
-        finally:
-            (
-                self.server.NOTIFICATIONS_DIR,
-                self.server.NOTIFY_LIFECYCLE_RAW,
-                self.server.NOTIFY_ON_PR_OPENED,
-            ) = saved
-
-        drops = list(notifications.glob("*.json"))
-        self.assertEqual(len(drops), 1)
-        payload = json.loads(drops[0].read_text())
-        self.assertEqual(payload["schema"], 1)
-        self.assertEqual(payload["kind"], "broker_lifecycle")
-        self.assertEqual(payload["source"], "broker")
-        self.assertEqual(payload["event"], "request_queued")
-        self.assertEqual(payload["repo_slug"], "fieldwork-smoke")
-        self.assertEqual(payload["request_id"], "11111111-1111-4111-8111-111111111111")
-        self.assertEqual(payload["branch"], "fieldwork/test")
-        self.assertIn("dedupe_key", payload)
-        rendered = json.dumps(payload)
-        self.assertNotIn("github_pat_", rendered)
-        self.assertNotIn("ghp_", rendered)
-
-    def test_runs_with_neutral_user_and_arbitrary_projects_root(self) -> None:
-        # The whole test class already runs the broker module with a tmpdir
-        # projects root and no privileged identities. This is the standalone
-        # broker mode in microcosm. Lock that in: validation must accept a
-        # request whose repo_path is under the arbitrary projects root the
-        # broker was configured with at import time, and the runtime regex
-        # must reflect that root rather than the /home/fieldwork default.
-        self.assertNotEqual(self.server.PROJECTS_ROOT, "/home/fieldwork/projects")
-        self.assertTrue(
-            self.server.REPO_PATH_RE.pattern.startswith("^"),
-            "REPO_PATH_RE must be anchored at start"
-        )
-        import re as _re
-        self.assertIn(_re.escape(str(self.projects)), self.server.REPO_PATH_RE.pattern)
-        repo = self.make_repo(slug="standalone-smoke")
-        validated = self.server.validate(self.request(repo))
-        self.assertTrue(str(validated.repo_path).startswith(str(self.projects)))
-
-
-class AuditLogRotationTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls) -> None:
-        cls.tmp = Path(tempfile.mkdtemp(prefix="fieldwork-audit-rotate."))
-        os.environ["FIELDWORK_BROKER_LOG_PATH"] = str(cls.tmp / "broker.log")
-        os.environ["FIELDWORK_BROKER_AUDIT_LOG_PATH"] = str(cls.tmp / "audit.jsonl")
-        spec = importlib.util.spec_from_file_location(
-            "fieldwork_broker_server_rotation", ROOT / "lib/broker/server.py"
-        )
-        assert spec and spec.loader
-        cls.server = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = cls.server
-        spec.loader.exec_module(cls.server)
-
-    @classmethod
-    def tearDownClass(cls) -> None:
-        shutil.rmtree(cls.tmp, ignore_errors=True)
-
-    def test_audit_log_rotates_by_size(self) -> None:
-        tmp = self.tmp / "rotate"
-        tmp.mkdir(parents=True, exist_ok=True)
-        audit = tmp / "audit.jsonl"
-
-        srv = self.server
-        saved = (srv.AUDIT_LOG_PATH, srv.AUDIT_LOG_MAX_BYTES, srv.AUDIT_LOG_BACKUPS)
-        srv.AUDIT_LOG_PATH = str(audit)
-        srv.AUDIT_LOG_MAX_BYTES = 200
-        srv.AUDIT_LOG_BACKUPS = 2
-        try:
-            for _ in range(50):
-                srv.audit_event(
-                    "request_received", request_id="x" * 20, branch="fieldwork/rotate"
-                )
-        finally:
-            srv.AUDIT_LOG_PATH, srv.AUDIT_LOG_MAX_BYTES, srv.AUDIT_LOG_BACKUPS = saved
-
-        self.assertTrue(audit.exists(), "active audit log must exist after rotation")
-        self.assertTrue((tmp / "audit.jsonl.1").exists(), "expected a rotated backup")
-        self.assertFalse(
-            (tmp / "audit.jsonl.3").exists(),
-            "backups must be capped at AUDIT_LOG_BACKUPS",
-        )
-        self.assertEqual(audit.stat().st_mode & 0o777, 0o640)
-        self.assertEqual((tmp / "audit.jsonl.1").stat().st_mode & 0o777, 0o640)
+            server.PACK_MAX_OBJECT_BYTES, server.PACK_MAX_DELTA_DEPTH = old_size, old_depth
 
 
 if __name__ == "__main__":
-    unittest.main()
+    unittest.main(verbosity=2)

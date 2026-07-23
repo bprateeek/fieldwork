@@ -1,0 +1,19 @@
+#!/usr/bin/python3 -I
+"""Return strict managed policy only for the dedicated Fieldwork agent UID."""
+import json
+import os
+from pathlib import Path
+import sys
+
+try:
+    agent_uid = int(Path("/usr/local/etc/fieldwork-agent.uid").read_text().strip())
+except (OSError, ValueError):
+    raise SystemExit(1)
+if os.getuid() != agent_uid:
+    print('{"managedSettings":{}}')
+    raise SystemExit(0)
+policy = json.loads(Path("/usr/local/lib/fieldwork-local/strict-managed-settings.json").read_text())
+print(json.dumps({
+    "managedSettings": policy,
+    "claudeMd": Path("/usr/local/share/fieldwork-claude/CLAUDE.md").read_text(),
+}, sort_keys=True, separators=(",", ":")))

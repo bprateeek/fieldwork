@@ -59,8 +59,8 @@ Common forms:
 
 ```sh
 fieldwork quickstart --agent codex
-fieldwork quickstart <owner>/<repo> --agent codex --with-approval-gate
-FIELDWORK_FORGE=gitlab fieldwork quickstart <group>/<subgroup>/<project> --agent codex --with-approval-gate
+fieldwork quickstart <owner>/<repo> --agent codex
+FIELDWORK_FORGE=gitlab fieldwork quickstart <group>/<subgroup>/<project> --agent codex
 fieldwork quickstart <project> --dry-run
 fieldwork quickstart <project> --status
 ```
@@ -79,7 +79,9 @@ Flags:
 | `--force-install` | Passed to `fieldwork setup`. |
 | `--branch fieldwork/init` | Passed to `fieldwork onboard`. Requires `<project>`. |
 | `--no-workflows` | Passed to `fieldwork onboard`. Requires `<project>`. |
-| `--with-approval-gate` | Passed to `fieldwork onboard`. Requires `<project>`. |
+| `--auto-approve` | Explicitly wire broker auto-approval; the default is `require`. |
+| `--allow-private-network` | Explicit self-managed GitLab private-address opt-in. |
+| `--with-approval-gate` | Legacy repo-hint flag; broker policy remains authoritative. |
 | `--reseed-templates` | Passed to `fieldwork onboard`. Requires `<project>`. |
 | `--slug <slug>` | Passed to `fieldwork onboard`. Useful for GitLab nested paths or same-leaf project names. |
 | `--dry-run` | Run a read-only doctor preflight for quickstart without setup, onboarding, or ledger writes. |
@@ -184,7 +186,7 @@ usage: fieldwork uninstall [--dry-run] [--yes] [--quiet] [--local] [--remote] [-
 ```
 
 Guided teardown for Fieldwork-managed assets. The default scope removes
-discovered local files, remote user services/scripts, broker/system services, and
+discovered local files, root-owned remote boundary services/scripts, broker/system services, and
 approval-bot infrastructure after showing a plan.
 
 It keeps repositories, SSH keys, non-Fieldwork SSH config, VPS users, Docker,
@@ -238,7 +240,8 @@ Use this before manually debugging SSH, broker, notification, service, or Codex 
 usage: fieldwork dashboard [--local-port <port>] [--remote-port <port>] [--no-open]
 ```
 
-Starts `fieldwork-dashboard.service` as a user service on the VPS, forwards it over SSH to `http://127.0.0.1:<local-port>/`, and opens that local URL in your browser. Keep the command running while using the dashboard; Ctrl-C closes the tunnel.
+Disabled in hard-boundary mode. Use `fieldwork status` and typed notifications;
+the CLI fails closed instead of starting an agent-user dashboard process.
 
 The remote server binds only to `127.0.0.1` and exposes read-only GET routes:
 
@@ -280,12 +283,12 @@ discarded). See [agent-adapters.md](agent-adapters.md) for the Aider setup.
 ## `fieldwork onboard <project>`
 
 ```text
-usage: fieldwork onboard <project> [--slug <slug>] [--branch fieldwork/init] [--no-workflows] [--with-approval-gate] [--status] [--reset-state] [--reseed-templates]
+usage: fieldwork onboard <project> [--slug <slug>] [--branch fieldwork/init] [--no-workflows] [--auto-approve] [--allow-private-network] [--status] [--reset-state] [--reseed-templates]
 ```
 
 Onboards a GitHub repo or GitLab project onto the VPS. It validates the project
-shape, asks the broker to prove token reachability, clones with a read-only
-deploy key, applies repo templates, and opens the init PR/MR through the broker.
+shape, clones with a read-only deploy key, derives its default branch, writes a
+root-owned broker policy, applies repo templates, and opens the init PR/MR.
 For GitHub, `project` is `owner/repo`. For GitLab, use the full project path
 such as `group/subgroup/project`. In Claude mode it also primes Claude
 workspace trust and remote-control consent and starts
@@ -299,7 +302,9 @@ Flags:
 | `--slug <slug>`        | Override the local checkout/service slug. The default comes from the project leaf.             |
 | `--branch <name>`      | Init PR branch. Must match the broker `fieldwork/...` branch policy.                          |
 | `--no-workflows`       | Skip GitHub workflow templates so the broker PAT does not need Workflows read/write for the init PR and users can add CI manually later. GitLab skips `.github/` templates. |
-| `--with-approval-gate` | Commit `.fieldwork/approval-gate` so future PR requests queue for Telegram approval.          |
+| `--auto-approve`       | Explicitly set broker policy to `auto`; default wiring uses `require`.                       |
+| `--allow-private-network` | Allow a self-managed GitLab policy to resolve private addresses; explicit opt-in only.  |
+| `--with-approval-gate` | Legacy human-hint marker; the root-owned broker policy remains authoritative.               |
 | `--status`             | Inspect onboarding checkpoint without changing state.                                         |
 | `--reset-state`        | Remove only the onboarding checkpoint and recompute from repo state.                          |
 | `--reseed-templates`   | Re-apply Fieldwork-managed templates to an already onboarded repo after a Fieldwork upgrade.  |
@@ -332,8 +337,9 @@ an explicit form for consistency with `doctor`, but there is no local-only mode.
 
 ## `fieldwork eval up|smoke|logs|down|clean`
 
-Docker-backed, no-VPS evaluation harness. It uses fake GitHub behavior and no
-real PAT. This is evaluation only and not a supported deployment topology.
+Docker-backed, no-VPS evaluation harness. It exercises the protocol-v2 parser,
+pack validation, approval queue, and deterministic forge stubs without a real
+credential. This is evaluation only and not a supported deployment topology.
 
 See [evaluation.md](evaluation.md).
 
@@ -373,7 +379,7 @@ usage: fieldwork refresh <repo-slug>
 
 Refreshes the VPS checkout after a PR merge. When Claude is configured, it restarts `fieldwork-agent@<slug>` so Claude mobile sees the merged default branch. When Codex is configured, it does not restart anything because Codex Desktop owns its SSH connection state.
 
-It refuses dirty checkouts, reads `.fieldwork/default-branch` with `main` as the fallback, runs `git fetch --prune origin`, checks out the default branch, pulls with `--ff-only`, and restarts the matching Claude systemd user service only when Claude is configured.
+It refuses dirty checkouts, reads `.fieldwork/default-branch` with `main` as the fallback, runs `git fetch --prune origin`, checks out the default branch, pulls with `--ff-only`, and restarts the matching root-owned Claude system service only when Claude is configured.
 
 Use this after merging a PR that was opened from mobile:
 
@@ -389,7 +395,7 @@ fieldwork refresh myrepo
 usage: fieldwork start <repo-slug>
 ```
 
-Starts the per-repo Claude Code systemd user session on the VPS via `systemctl --user start fieldwork-agent@<slug>` when Claude is configured, then waits for `is-active`. When Codex is configured, it prints Codex Desktop SSH connection instructions instead of starting a service. In `both` mode it does both and warns that concurrent Claude+Codex work on the same checkout is unsupported.
+Starts the root-owned per-repo Claude Code system service on the VPS via `sudo systemctl start fieldwork-agent@<slug>` when Claude is configured, then waits for `is-active`. When Codex is configured, it prints Codex Desktop SSH connection instructions instead of starting a service. In `both` mode it does both and warns that concurrent Claude+Codex work on the same checkout is unsupported.
 
 **When to use it.** For Claude, use it when the per-repo session isn't running and you want to drive it from Claude mobile. For Codex, use it as a reminder of the Codex Desktop SSH host, user, checkout path, and the `"Available from signed-in devices"` setting required for mobile access.
 
@@ -444,7 +450,8 @@ usage: fieldwork status [repo-slug]
 
 Read-only view of configured agent readiness. Claude status includes the per-repo systemd service. Codex status includes CLI/login marker, SSH PATH, delivery clients, XDG runtime, runner sockets, Codex socket allowlist, and an in-sandbox socket probe when available. Live Codex connection state is owned by Codex Desktop.
 
-**Without a slug**: lists every `fieldwork-agent@*.service` via `systemctl --user list-units`:
+**Without a slug**: lists every `fieldwork-agent@*.service` via the root-owned
+system manager:
 
 ```text
 == Remote sessions ==
@@ -459,7 +466,8 @@ Next action:
   fieldwork status <repo-slug>
 ```
 
-**With a slug**: parses `systemctl --user show` and recent journal lines into a clean per-field summary:
+**With a slug**: parses `sudo systemctl show` and recent system-journal lines
+into a clean per-field summary:
 
 ```text
 == myrepo ==
@@ -500,7 +508,7 @@ The `Last PR` row is best-effort: it reads the broker audit log non-interactivel
   repo                  myrepo
   service               fieldwork-agent@myrepo.service
 
-systemctl --user status:
+systemctl status:
 ● fieldwork-agent@myrepo.service - Fieldwork agent session for myrepo
      Loaded: loaded (…; enabled)
      Active: active (running) since …

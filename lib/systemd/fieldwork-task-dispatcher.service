@@ -1,14 +1,21 @@
 [Unit]
-Description=Fieldwork one_shot_job task dispatcher
-After=default.target
+Description=Fieldwork root-installed task dispatcher
+After=network-online.target
 
 [Service]
-Type=simple
-ExecStart=%h/.fieldwork/scripts/fieldwork-task-dispatcher
+User=fieldwork
+Group=fieldwork
+ExecStart=/usr/local/lib/fieldwork/fieldwork-task-dispatcher
+Environment=HOME=/home/fieldwork
+Environment=FIELDWORK_PROJECTS_ROOT=/home/fieldwork/projects
+Environment=FIELDWORK_TASKS_DIR=/var/lib/fieldwork-tasks
 Restart=on-failure
 RestartSec=10
-Environment=FIELDWORK_PROJECTS_ROOT=%h/projects
-Environment=FIELDWORK_TASKS_DIR=/var/lib/fieldwork-tasks
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/fieldwork/projects /var/lib/fieldwork-tasks
 
 [Install]
-WantedBy=default.target
+WantedBy=multi-user.target

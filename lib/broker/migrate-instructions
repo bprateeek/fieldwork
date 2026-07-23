@@ -1,0 +1,84 @@
+#!/usr/bin/python3 -I
+"""Structural protocol-v1 instruction migrator for the maintenance phase.
+
+Only an exact byte match of a known delivery section is replaced. Modified or
+ambiguous files are reported and left untouched. The tool commits on a
+fieldwork/... branch; submission still uses the privileged maintenance path.
+"""
+from __future__ import annotations
+import argparse, hashlib, pathlib, stat, subprocess, sys
+
+KNOWN = {
+    "b10dabbf2b9b9d342adcdce5f9e3ad910a5c2ac7455efc28ae26c169cab10ea5",
+    "0a919fb448149f4d52a51d94aca7944ebce39fb1df96b9afcfa5d1ca8dabd717",
+}
+REPLACEMENT = '''## Fieldwork Delivery Workflow
+
+Commit every intended change before delivery. If the sandbox cannot commit,
+use the root-owned prepare runner. Then perform the upload phase as two separate
+top-level calls: `fieldwork-pr-build <request-json>` followed by
+`/usr/local/bin/fieldwork-pr-upload <request-id>`. Never combine those commands
+and never push directly. The checkout-blind broker reconstructs and scans the
+pack and applies the operator-owned approval policy.
+'''
+
+def git(repo: pathlib.Path, *args: str) -> str:
+    result = subprocess.run(
+        ["/usr/bin/git", "-c", "core.hooksPath=/dev/null", "-C", str(repo), *args],
+        env={"HOME": "/tmp", "PATH": "/usr/bin:/bin", "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"},
+        text=True, capture_output=True,
+    )
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or "git failed")
+    return result.stdout.strip()
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("repo", type=pathlib.Path)
+    args = parser.parse_args()
+    repo = args.repo.resolve()
+    if git(repo, "status", "--porcelain=v1", "-z", "-uall"):
+        print("refusing a dirty migration checkout", file=sys.stderr); return 1
+    changed: list[str] = []
+    blocked: list[str] = []
+    for name in ("AGENTS.md", "CLAUDE.md"):
+        path = repo / name
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            blocked.append(f"{name}: refusing a symlink or non-regular instruction file"); continue
+        raw = path.read_bytes()
+        marker = b"## Fieldwork Delivery Workflow"
+        count = raw.count(marker)
+        if count == 0:
+            continue
+        if count != 1:
+            blocked.append(f"{name}: ambiguous delivery-section count {count}"); continue
+        start = raw.index(marker)
+        end = raw.find(b"\n## ", start + len(marker))
+        if end < 0:
+            end = len(raw)
+        block = raw[start:end]
+        digest = hashlib.sha256(block).hexdigest()
+        if digest not in KNOWN:
+            blocked.append(f"{name}: delivery section was modified ({digest})"); continue
+        path.write_bytes(raw[:start] + REPLACEMENT.rstrip().encode("utf-8") + raw[end:] + b"\n")
+        changed.append(name)
+    if blocked:
+        for item in blocked: print(item, file=sys.stderr)
+        for name in changed: git(repo, "checkout", "--", name)
+        return 2
+    if not changed:
+        print("no known protocol-v1 delivery section found"); return 0
+    branch = "fieldwork/protocol-v2-instructions"
+    git(repo, "checkout", "-b", branch)
+    git(repo, "add", "--", *changed)
+    git(repo, "-c", "user.name=Fieldwork Operator", "-c", "user.email=fieldwork-operator@localhost", "commit", "-m", "migrate Fieldwork delivery instructions to protocol v2")
+    print(branch)
+    print("Build a protocol-v2 pack and submit it through fieldwork-pr-maintenance-submit; do not push directly.")
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())

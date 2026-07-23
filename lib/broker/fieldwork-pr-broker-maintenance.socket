@@ -1,0 +1,13 @@
+[Unit]
+Description=Fieldwork PR broker privileged maintenance socket
+
+[Socket]
+ListenStream=/run/fieldwork-pr-broker/maintenance.sock
+SocketUser=root
+SocketGroup=root
+SocketMode=0600
+RuntimeDirectory=fieldwork-pr-broker
+Service=fieldwork-pr-broker.service
+
+# Deliberately no [Install] section: the operator starts this socket only for
+# the discrete protocol-v2 maintenance transaction.

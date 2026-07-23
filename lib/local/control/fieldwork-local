@@ -1,0 +1,172 @@
+#!/usr/bin/env bash
+# Root-owned human control surface. No user-level `fieldwork local` wrapper.
+set -euo pipefail
+[ "$(id -u)" -eq 0 ] || { echo "fieldwork-local must run as root" >&2; exit 1; }
+export PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+unset BASH_ENV ENV CDPATH PYTHONPATH PYTHONHOME COMPOSE_FILE COMPOSE_PROJECT_NAME DOCKER_HOST DOCKER_CONFIG
+
+ROOT=/usr/local/lib/fieldwork-local
+COMPOSE="$ROOT/docker-compose.yml"
+case "$(uname -s)" in
+  Darwin) DOCKER=/usr/local/bin/docker; AGENT_HOME=/Users/fieldwork-agent; AGENT_GROUP=staff ;;
+  Linux) DOCKER=/usr/bin/docker; AGENT_HOME=/home/fieldwork-agent; AGENT_GROUP=fieldwork-agent ;;
+  *) echo "unsupported platform" >&2; exit 1 ;;
+esac
+docker_cmd() {
+  [ -x "$DOCKER" ] || { echo "Docker is missing at $DOCKER" >&2; return 1; }
+  env -i PATH=/usr/local/bin:/usr/bin:/bin HOME=/var/empty \
+    "$DOCKER" compose --project-directory "$ROOT" -f "$COMPOSE" -p fieldwork-local "$@"
+}
+
+usage() {
+  echo "usage: fieldwork-local up|down|status|logs|token|wire|telegram|approve|probe|maintenance-start|maintenance-stop|maintenance-submit|clean|claude|uninstall"
+}
+
+command_name="${1:-}"; shift || true
+case "$command_name" in
+  up)
+    docker_cmd up -d --build broker
+    token="$(docker_cmd exec -T broker /usr/local/bin/fieldwork-local-entrypoint read-http-auth)"
+    install -d -o fieldwork-agent -g "$AGENT_GROUP" -m 700 "$AGENT_HOME/.fieldwork"
+    tmp="$AGENT_HOME/.fieldwork/.http-auth.$$"
+    umask 077; printf '%s\n' "$token" >"$tmp"
+    chown "fieldwork-agent:$AGENT_GROUP" "$tmp"; chmod 600 "$tmp"; mv "$tmp" "$AGENT_HOME/.fieldwork/http-auth"
+    echo "Fieldwork local broker is ready on 127.0.0.1:8377"
+    ;;
+  down) docker_cmd down ;;
+  status) docker_cmd ps ;;
+  logs) docker_cmd logs --tail=200 -f "${1:-broker}" ;;
+  token)
+    [ -t 0 ] && [ -t 1 ] || { echo "token requires an interactive TTY" >&2; exit 1; }
+    docker_cmd exec -it broker /usr/local/bin/fieldwork-local-entrypoint rotate-token
+    ;;
+  wire)
+    slug="${1:?slug required}"; project="${2:?owner/repo or group/project required}"; shift 2
+    approval=require
+    base_branch=main
+    forge=github
+    allow_private=""
+    api_base=""
+    git_base=""
+    ca_source=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --auto) approval=auto; shift ;;
+        --base-branch) base_branch="${2:?--base-branch requires a value}"; shift 2 ;;
+        --gitlab) forge=gitlab; shift ;;
+        --allow-private-network) allow_private=--allow-private-network; shift ;;
+        --api-base-url) api_base="${2:?--api-base-url requires a value}"; shift 2 ;;
+        --git-base-url) git_base="${2:?--git-base-url requires a value}"; shift 2 ;;
+        --ca-bundle) ca_source="${2:?--ca-bundle requires a file}"; shift 2 ;;
+        *) echo "unknown wire option: $1" >&2; exit 2 ;;
+      esac
+    done
+    [ "$forge" = gitlab ] || { [ -z "$api_base$git_base$ca_source$allow_private" ] || { echo "custom endpoints, CA, and private networking require --gitlab" >&2; exit 2; }; }
+    printf 'Wire %s to %s with approval=%s? [y/N] ' "$slug" "$project" "$approval"
+    IFS= read -r answer </dev/tty
+    [ "$answer" = y ] || [ "$answer" = Y ] || exit 1
+    writer_args=(--policy-dir /data/policy --ca-dir /data/policy-ca --slug "$slug" --forge "$forge" --project "$project" --base-branch "$base_branch" --approval "$approval")
+    [ -z "$allow_private" ] || writer_args+=("$allow_private")
+    [ -z "$api_base" ] || writer_args+=(--api-base-url "$api_base")
+    [ -z "$git_base" ] || writer_args+=(--git-base-url "$git_base")
+    if [ -n "$ca_source" ]; then
+      [ -f "$ca_source" ] && [ ! -L "$ca_source" ] || { echo "CA bundle must be a regular non-symlink file" >&2; exit 1; }
+      ca_abs="$(cd -P "$(dirname "$ca_source")" && pwd)/$(basename "$ca_source")"
+      docker_cmd cp "$ca_abs" broker:/tmp/fieldwork-policy-ca.pem
+      writer_args+=(--ca-bundle /tmp/fieldwork-policy-ca.pem)
+    fi
+    status=0
+    docker_cmd exec -T broker /usr/local/bin/python3 -I /usr/local/lib/fieldwork-pr-broker/policy_writer.py "${writer_args[@]}" || status=$?
+    [ -z "$ca_source" ] || docker_cmd exec -T broker /bin/rm -f /tmp/fieldwork-policy-ca.pem || true
+    exit "$status"
+    ;;
+  telegram)
+    docker_cmd --profile telegram-config run --rm telegram-config configure-telegram
+    docker_cmd --profile telegram up -d bot
+    ;;
+  approve)
+    request_id="${1:?request id required}"
+    decision="${2:-approve}"
+    case "$decision" in approve|deny) ;; *) echo "decision must be approve or deny" >&2; exit 2 ;; esac
+    docker_cmd exec -T broker /usr/local/bin/fieldwork-local-admin "$decision" "$request_id"
+    ;;
+  probe) exec "$ROOT/fieldwork-local-probe" "$@" ;;
+  maintenance-start)
+    docker_cmd stop broker >/dev/null 2>&1 || true
+    env -i PATH=/usr/local/bin:/usr/bin:/bin HOME=/var/empty FIELDWORK_BROKER_MAINTENANCE=1 \
+      "$DOCKER" compose --project-directory "$ROOT" -f "$COMPOSE" -p fieldwork-local up -d broker
+    echo "Broker maintenance mode is active; normal /pr and /approve return 503."
+    ;;
+  maintenance-stop)
+    docker_cmd stop broker >/dev/null 2>&1 || true
+    docker_cmd up -d broker
+    echo "Broker maintenance mode cleared by explicit restart."
+    ;;
+  maintenance-submit)
+    meta="${1:?meta.json required}"; pack="${2:?pack required}"
+    [ -f "$meta" ] && [ -f "$pack" ] || { echo "metadata and pack must be regular files" >&2; exit 1; }
+    meta_abs="$(cd -P "$(dirname "$meta")" && pwd)/$(basename "$meta")"
+    pack_abs="$(cd -P "$(dirname "$pack")" && pwd)/$(basename "$pack")"
+    docker_cmd cp "$meta_abs" broker:/tmp/maintenance-meta.json
+    docker_cmd cp "$pack_abs" broker:/tmp/maintenance-pack
+    status=0
+    docker_cmd exec -T broker /usr/local/bin/fieldwork-pr-maintenance-submit /tmp/maintenance-meta.json /tmp/maintenance-pack || status=$?
+    docker_cmd exec -T broker /bin/rm -f /tmp/maintenance-meta.json /tmp/maintenance-pack || true
+    exit "$status"
+    ;;
+  clean)
+    [ -t 0 ] || { echo "clean requires a TTY" >&2; exit 1; }
+    printf 'Delete all Fieldwork local containers and persistent volumes? [y/N] '
+    IFS= read -r answer </dev/tty
+    [ "$answer" = y ] || [ "$answer" = Y ] || exit 1
+    docker_cmd down -v
+    echo "Fieldwork local containers and volumes removed; this cannot be recovered without a backup."
+    ;;
+  uninstall)
+    [ -t 0 ] && [ -t 1 ] || { echo "uninstall requires an interactive TTY" >&2; exit 1; }
+    printf 'Remove the Fieldwork local control plane, dedicated user, and broker volumes? [y/N] '
+    IFS= read -r answer </dev/tty
+    [ "$answer" = y ] || [ "$answer" = Y ] || exit 1
+    docker_cmd down -v >/dev/null 2>&1 || true
+    remove_projects=0
+    printf 'Also permanently delete the dedicated projects tree? [y/N] '
+    IFS= read -r answer </dev/tty
+    [ "$answer" != y ] && [ "$answer" != Y ] || remove_projects=1
+    case "$(uname -s)" in
+      Darwin)
+        /bin/launchctl bootout system/com.fieldwork.spool-init >/dev/null 2>&1 || true
+        /bin/rm -f /Library/LaunchDaemons/com.fieldwork.spool-init.plist
+        managed="/Library/Application Support/ClaudeCode/managed-settings.json"
+        if [ -f "$managed" ] && /usr/bin/grep -Fq '/usr/local/lib/fieldwork-local/fieldwork-policy-helper' "$managed"; then
+          /bin/rm -f "$managed"
+        fi
+        /usr/bin/sudo -H -u fieldwork-agent /usr/bin/security delete-keychain /Users/fieldwork-agent/Library/Keychains/login.keychain-db >/dev/null 2>&1 || true
+        /usr/bin/dscl . -delete /Users/fieldwork-agent >/dev/null 2>&1 || true
+        /bin/rm -rf /Users/fieldwork-agent
+        [ "$remove_projects" != 1 ] || /bin/rm -rf /Users/Shared/Fieldwork/projects
+        /bin/rmdir /Users/Shared/Fieldwork >/dev/null 2>&1 || true
+        ;;
+      Linux)
+        managed=/etc/claude-code/managed-settings.json
+        if [ -f "$managed" ] && /usr/bin/grep -Fq '/usr/local/lib/fieldwork-local/fieldwork-policy-helper' "$managed"; then
+          /bin/rm -f "$managed"
+        fi
+        /usr/sbin/userdel -r fieldwork-agent >/dev/null 2>&1 || true
+        [ "$remove_projects" != 1 ] || /bin/rm -rf /srv/fieldwork/projects
+        /bin/rmdir /srv/fieldwork >/dev/null 2>&1 || true
+        ;;
+    esac
+    /bin/rm -rf /usr/local/lib/fieldwork-local /usr/local/share/fieldwork-claude
+    /bin/rm -f /usr/local/sbin/fieldwork-local /usr/local/bin/fieldwork-pr-build \
+      /usr/local/bin/fieldwork-pr-upload /usr/local/bin/fieldwork-pr-prepare \
+      /usr/local/bin/fieldwork-verify /usr/local/etc/fieldwork-agent.uid \
+      /usr/local/etc/fieldwork-agent.keychain-secret
+    if [ "$remove_projects" = 1 ]; then
+      echo "Local mode removed, including the dedicated projects tree; repository recovery requires your backup or forge."
+    else
+      echo "Local mode removed; the dedicated projects tree was kept for manual recovery."
+    fi
+    ;;
+  claude) exec "$ROOT/fieldwork-local-claude" "$@" ;;
+  *) usage; exit 2 ;;
+esac

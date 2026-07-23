@@ -1,31 +1,40 @@
 [Unit]
-Description=Fieldwork PR-prepare runner (connection %i)
+Description=Fieldwork PR prepare runner (system connection %i)
 Requires=fieldwork-pr-prepare-runner.socket
 
 [Service]
-# Critical: do NOT set NoNewPrivileges=true here. The whole point of this
-# unit is to give the prepare runner an execution context where git can
-# run normally — under PR_SET_NO_NEW_PRIVS the runner's children inherit
-# NNP, which interacts poorly with AppArmor profile transitions and
-# generally makes git's subprocess handling unpredictable. The trust
-# boundary is enforced by the socket's 0600 mode (only the fieldwork user
-# can connect) and by the runner's own input validation (path allowlist,
-# branch regex, schema preflight, worktree-state mismatch rejection, and
-# `git -c core.hooksPath=/dev/null` so repo-controlled hooks cannot run),
-# not by systemd hardening on this unit.
-ExecStart=%h/.local/bin/fieldwork-pr-prepare-runner
-Environment=FIELDWORK_PROJECTS_ROOT=%h/projects
-
-# The socket is passed in on stdin and used for stdout. stderr is split off
-# so internal runner errors land in the journal and can't be confused with
-# the framed protocol stream we send to the client.
+User=fieldwork
+Group=fieldwork
+ExecStart=/usr/local/lib/fieldwork/fieldwork-pr-prepare-runner
+Environment=HOME=/var/empty
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Environment=FIELDWORK_PROJECTS_ROOT=/home/fieldwork/projects
+Environment=FIELDWORK_PR_PREPARE_STATE_DIR=/var/lib/fieldwork-pr-prepare
+Environment=GIT_CONFIG_GLOBAL=/dev/null
+Environment=GIT_CONFIG_SYSTEM=/dev/null
+Environment=GIT_CONFIG_NOSYSTEM=1
+Environment=GIT_AUTHOR_NAME=Fieldwork Agent
+Environment=GIT_AUTHOR_EMAIL=fieldwork-agent@localhost
+Environment=GIT_COMMITTER_NAME=Fieldwork Agent
+Environment=GIT_COMMITTER_EMAIL=fieldwork-agent@localhost
 StandardInput=socket
 StandardOutput=socket
 StandardError=journal
-
-# A prepare is short — checkout, add, commit. 30s is generous; any longer
-# is almost certainly a stuck git invocation that should be killed.
 TimeoutStartSec=30
-
-# One-shot: each connection gets its own instance; exit when done.
 Type=simple
+# Deliberately no NoNewPrivileges: this trusted runner is the controlled escape
+# from the agent session's NNP/user-namespace cage.
+PrivateTmp=true
+PrivateNetwork=true
+ProtectSystem=strict
+ProtectHome=tmpfs
+BindPaths=/home/fieldwork/projects
+ReadWritePaths=/home/fieldwork/projects /var/lib/fieldwork-pr-prepare
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX
+UMask=0077

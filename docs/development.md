@@ -7,9 +7,9 @@ This page is for contributors working on Fieldwork itself.
 ```text
 bin/fieldwork              Main CLI dispatcher and shared helpers.
 lib/cli/                   CLI command modules sourced by bin/fieldwork.
-lib/scripts/               Installed user scripts: onboarding, agent session, verify, prepare, submit, bot.
+lib/scripts/               Installed scripts: onboarding, root-boundary sessions, verify, build/upload, bot.
 lib/broker/                PR broker daemon, systemd socket units, PAT rotation, standalone install.
-lib/systemd/               VPS bootstrap and user service templates.
+lib/systemd/               VPS bootstrap and root-owned boundary system units.
 lib/templates/repo/        Files copied into onboarded repositories, including Claude skills.
 lib/claude/                Global Claude settings installed into ~/.claude.
 schema/                    Runtime request contracts.
@@ -23,8 +23,11 @@ docs/                      Public docs.
 - `fieldwork` is the agent user. It owns repo checkouts and calls tokenless clients.
 - `fieldwork-pr-broker` is the broker user. It owns the forge credential and opens PRs/MRs.
 - `fieldwork-bot` is the Telegram bot user. It owns the Telegram token and approval HMAC secret.
-- The verify and pr-prepare runners run as systemd user socket-activated services for the agent user.
-- The broker submit socket is installed with the agent user's primary group so it remains reachable inside Claude's sandbox user namespace.
+- The verify and pr-prepare runners run as root-owned system socket-activated
+  services whose workers drop to the agent user.
+- The broker submit socket is installed with the agent user's primary group so
+  the excluded root-owned uploader can reach it. Fieldwork boundary services
+  and adapters are root-owned system assets, never user-unit search-path code.
 - The approve socket is installed with the bot group so the agent cannot approve its own PR request.
 
 ## Local Checks
@@ -90,7 +93,7 @@ fieldwork report [repo-slug]
 fieldwork smoke <owner/repo> [--yes]   # GitHub only
 fieldwork bootstrap-vps [--print-path] [--verbose] [--log-file <path>]
 fieldwork install-broker [--print-path] [--verbose] [--log-file <path>]
-fieldwork onboard <project> [--slug <slug>] [--branch fieldwork/init] [--no-workflows] [--with-approval-gate] [--status] [--reset-state] [--reseed-templates]
+fieldwork onboard <project> [--slug <slug>] [--branch fieldwork/init] [--no-workflows] [--auto-approve] [--allow-private-network] [--status] [--reset-state] [--reseed-templates]
 fieldwork start <repo-slug>
 fieldwork status [repo-slug] [--verbose]
 fieldwork bot-status

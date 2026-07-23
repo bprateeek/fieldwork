@@ -1,32 +1,44 @@
 [Unit]
-Description=Fieldwork PR broker
+Description=Fieldwork PR broker (checkout-blind protocol v2)
 Requires=fieldwork-pr-broker.socket
 After=fieldwork-pr-broker.socket fieldwork-pr-approve.socket network-online.target
+Wants=network-online.target
 
 [Service]
 User=fieldwork-pr-broker
 Group=fieldwork-pr-broker
-Environment=FIELDWORK_BROKER_AUDIT_READ_USER=fieldwork
 EnvironmentFile=-/etc/fieldwork-pr-broker/credential.env
-Sockets=fieldwork-pr-broker.socket fieldwork-pr-approve.socket
-ExecStart=/usr/bin/python3 /usr/local/lib/fieldwork-pr-broker/server.py
+Environment=FIELDWORK_BROKER_POLICY_DIR=/var/lib/fieldwork-pr-broker/policy
+Environment=FIELDWORK_BROKER_PENDING_META_DIR=/var/lib/fieldwork-pr-broker/pending-meta
+Environment=FIELDWORK_BROKER_PENDING_SIDECAR_DIR=/var/lib/fieldwork-pr-broker/pending-sidecar
+Environment=FIELDWORK_BROKER_PENDING_PACK_DIR=/var/lib/fieldwork-pr-broker/pending-pack
+Environment=FIELDWORK_BROKER_PENDING_MAC_KEY_PATH=/var/lib/fieldwork-pr-broker/keys/pending-mac.key
+Sockets=fieldwork-pr-broker.socket fieldwork-pr-approve.socket fieldwork-pr-broker-maintenance.socket
+ExecStart=/usr/bin/python3 -I /usr/local/lib/fieldwork-pr-broker/server.py
 Restart=on-failure
+RestartSec=2
 NoNewPrivileges=true
 PrivateTmp=true
-ProtectSystem=strict
-# read-only, NOT true: the broker MUST read /home/fieldwork/projects/<repo>
-# to git-push from it. ProtectHome=true would hide all of /home and break the broker.
-ProtectHome=read-only
-ReadOnlyPaths=/home/fieldwork/projects /etc/fieldwork-pr-broker
-ReadWritePaths=/tmp /run/fieldwork-pr-broker /var/log /var/lib/fieldwork-pr-broker
-StateDirectory=fieldwork-pr-broker
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=yes
 ProtectKernelTunables=true
 ProtectKernelModules=true
+ProtectKernelLogs=true
 ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
 LockPersonality=true
 RestrictSUIDSGID=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+MemoryMax=1G
+TasksMax=128
+CPUQuota=200%
+LimitFSIZE=268435456
+ReadOnlyPaths=/etc/fieldwork-pr-broker
+ReadWritePaths=/run/fieldwork-pr-broker /var/lib/fieldwork-pr-broker /var/log
 
 [Install]
 WantedBy=multi-user.target

@@ -526,24 +526,10 @@ EOF
     ssh "$FIELDWORK_SSH_HOST" 'uid="$(id -u)"; runtime="${XDG_RUNTIME_DIR:-/run/user/$uid}"; test "$runtime" = "/run/user/$uid" && test -d "$runtime"' >/dev/null 2>&1
   }
   remote_delivery_clients_ready() {
-    ssh "$FIELDWORK_SSH_HOST" 'export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"; command -v fieldwork-verify >/dev/null 2>&1 && command -v fieldwork-pr-prepare >/dev/null 2>&1 && command -v fieldwork-pr-submit >/dev/null 2>&1' >/dev/null 2>&1
+    ssh "$FIELDWORK_SSH_HOST" 'test -x /usr/local/bin/fieldwork-verify && test -x /usr/local/bin/fieldwork-pr-prepare && test -x /usr/local/bin/fieldwork-pr-build && test -x /usr/local/bin/fieldwork-pr-upload' >/dev/null 2>&1
   }
   ensure_remote_runner_sockets() {
-    ssh "$FIELDWORK_SSH_HOST" "force_install=$(shell_quote "$force_install") bash -s" <<'REMOTE_RUNNER_SOCKETS' >/dev/null 2>&1
-set -eu
-mkdir -p "$HOME/.config/systemd/user"
-cp "$HOME/.fieldwork/infra/fieldwork-verify-runner.socket" "$HOME/.fieldwork/infra/fieldwork-verify-runner@.service" "$HOME/.fieldwork/infra/fieldwork-pr-prepare-runner.socket" "$HOME/.fieldwork/infra/fieldwork-pr-prepare-runner@.service" "$HOME/.fieldwork/infra/fieldwork-event-poll.service" "$HOME/.fieldwork/infra/fieldwork-event-poll.timer" "$HOME/.fieldwork/infra/fieldwork-dashboard.service" "$HOME/.fieldwork/infra/fieldwork-task-dispatcher.service" "$HOME/.config/systemd/user/"
-systemctl --user daemon-reload
-systemctl --user enable --now fieldwork-verify-runner.socket fieldwork-pr-prepare-runner.socket fieldwork-event-poll.timer fieldwork-task-dispatcher.service
-# On --force-install, restart so changed socket-unit settings (e.g. MaxConnections)
-# take effect; enable --now alone does not re-read an already-active socket.
-# Already-accepted runner @ instances run as separate units and are not stopped;
-# a connection attempted during the sub-second restart window may need to retry,
-# which is acceptable for an explicit reprovision.
-if [ "${force_install:-0}" = "1" ]; then
-  systemctl --user restart fieldwork-verify-runner.socket fieldwork-pr-prepare-runner.socket fieldwork-event-poll.timer fieldwork-task-dispatcher.service
-fi
-REMOTE_RUNNER_SOCKETS
+    ssh -t "$FIELDWORK_SSH_HOST" 'cd ~/fieldwork && sudo env FIELDWORK_REMOTE_USER="$(id -un)" bash lib/systemd/install-boundary.sh' >/dev/null 2>&1
   }
   write_remote_codex_socket_allowlist() {
     local profile
@@ -552,8 +538,8 @@ REMOTE_RUNNER_SOCKETS
 set -euo pipefail
 uid="$(id -u)"
 broker_sock="/run/fieldwork-pr-broker/fieldwork-pr.sock"
-verify_sock="/run/user/$uid/fieldwork-verify.sock"
-prepare_sock="/run/user/$uid/fieldwork-pr-prepare.sock"
+verify_sock="/run/fieldwork/fieldwork-verify.sock"
+prepare_sock="/run/fieldwork/fieldwork-pr-prepare.sock"
 mkdir -p "$HOME/.codex"
 cfg="$HOME/.codex/config.toml"
 tmp="$(mktemp)"
@@ -602,8 +588,8 @@ set -euo pipefail
 	grep -Fq 'mode = "limited"' "$cfg"
 	grep -Fq "[permissions.$FIELDWORK_CODEX_PROFILE.network.unix_sockets]" "$cfg"
 	grep -Fq '"/run/fieldwork-pr-broker/fieldwork-pr.sock" = "allow"' "$cfg"
-	grep -Fq "\"/run/user/$uid/fieldwork-verify.sock\" = \"allow\"" "$cfg"
-	grep -Fq "\"/run/user/$uid/fieldwork-pr-prepare.sock\" = \"allow\"" "$cfg"
+	grep -Fq '"/run/fieldwork/fieldwork-verify.sock" = "allow"' "$cfg"
+	grep -Fq '"/run/fieldwork/fieldwork-pr-prepare.sock" = "allow"' "$cfg"
 REMOTE_CODEX_CHECK
   }
   remote_codex_sandbox_socket_probe() {
@@ -613,8 +599,8 @@ REMOTE_CODEX_CHECK
 set -euo pipefail
 uid="$(id -u)"
 broker_sock="/run/fieldwork-pr-broker/fieldwork-pr.sock"
-verify_sock="/run/user/$uid/fieldwork-verify.sock"
-prepare_sock="/run/user/$uid/fieldwork-pr-prepare.sock"
+verify_sock="/run/fieldwork/fieldwork-verify.sock"
+prepare_sock="/run/fieldwork/fieldwork-pr-prepare.sock"
 export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
 	fieldwork-codex-sandbox run -- python3 - "$broker_sock" "$verify_sock" "$prepare_sock" <<'PY'
 import socket
@@ -1295,7 +1281,7 @@ EOF
     fi
     projects_dir_q="$(shell_quote "$FIELDWORK_PROJECTS_DIR")"
     agents_q="$(shell_quote "$setup_agents")"
-    ssh "$FIELDWORK_SSH_HOST" "agents=$agents_q; forge=$(shell_quote "$FIELDWORK_FORGE"); export PATH=\"\$HOME/.local/bin:\$PATH\"; { [ \"\$forge\" = gitlab ] || command -v gh >/dev/null 2>&1; } && test -d $projects_dir_q && test -f ~/.config/systemd/user/fieldwork-verify-runner.socket && test -f ~/.config/systemd/user/fieldwork-pr-prepare-runner.socket && case \"\$agents\" in claude|both) command -v claude >/dev/null 2>&1 && test -f ~/.config/systemd/user/fieldwork-agent@.service ;; *) true ;; esac" >/dev/null 2>&1
+    ssh "$FIELDWORK_SSH_HOST" "agents=$agents_q; test -d $projects_dir_q && test -f /etc/systemd/system/fieldwork-verify-runner.socket && test -f /etc/systemd/system/fieldwork-pr-prepare-runner.socket && case \"\$agents\" in claude|both) command -v claude >/dev/null 2>&1 && test -f /etc/systemd/system/fieldwork-agent@.service ;; *) true ;; esac" >/dev/null 2>&1
   }
   run_remote_bootstrap() {
     local agents_q
@@ -1353,7 +1339,7 @@ EOF
     elif [ "$FIELDWORK_SETUP_SNAPSHOT_READY" = "1" ] && [ "$FIELDWORK_SETUP_SNAPSHOT_DIRTY" != "1" ]; then
       return 1
     fi
-    ssh "$FIELDWORK_SSH_HOST" 'export PATH="$HOME/.local/bin:$PATH"; test -x "$HOME/.local/bin/fieldwork-verify" && test -x "$HOME/.local/bin/fieldwork-verify-runner" && test -x "$HOME/.fieldwork/scripts/fieldwork-verify-pipeline" && test -f "$HOME/.config/systemd/user/fieldwork-verify-runner.socket" && test -f "$HOME/.config/systemd/user/fieldwork-verify-runner@.service" && systemctl --user is-active --quiet fieldwork-verify-runner.socket && runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" && test -S "$runtime_dir/fieldwork-verify.sock" && command -v bwrap >/dev/null 2>&1 && bwrap --unshare-user --unshare-net --unshare-pid --unshare-uts --unshare-ipc --ro-bind / / --tmpfs /tmp --dev /dev --proc /proc -- /bin/true >/dev/null 2>&1' >/dev/null 2>&1
+    ssh "$FIELDWORK_SSH_HOST" 'test -x /usr/local/bin/fieldwork-verify && test -x /usr/local/lib/fieldwork/fieldwork-verify-runner && test -x /usr/local/lib/fieldwork/fieldwork-verify-pipeline && test -f /etc/systemd/system/fieldwork-verify-runner.socket && systemctl is-active --quiet fieldwork-verify-runner.socket && test -S /run/fieldwork/fieldwork-verify.sock && command -v bwrap >/dev/null 2>&1 && bwrap --unshare-user --unshare-net --unshare-pid --unshare-uts --unshare-ipc --ro-bind / / --tmpfs /tmp --dev /dev --proc /proc -- /bin/true >/dev/null 2>&1' >/dev/null 2>&1
   }
   remote_prepare_runner_ready() {
     if fieldwork_setup_snapshot_is_ok prepare_runner; then
@@ -1361,7 +1347,7 @@ EOF
     elif [ "$FIELDWORK_SETUP_SNAPSHOT_READY" = "1" ] && [ "$FIELDWORK_SETUP_SNAPSHOT_DIRTY" != "1" ]; then
       return 1
     fi
-    ssh "$FIELDWORK_SSH_HOST" 'runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"; test -f ~/.config/systemd/user/fieldwork-pr-prepare-runner.socket && systemctl --user is-active --quiet fieldwork-pr-prepare-runner.socket && test -S "$runtime_dir/fieldwork-pr-prepare.sock"' >/dev/null 2>&1
+    ssh "$FIELDWORK_SSH_HOST" 'test -f /etc/systemd/system/fieldwork-pr-prepare-runner.socket && systemctl is-active --quiet fieldwork-pr-prepare-runner.socket && test -S /run/fieldwork/fieldwork-pr-prepare.sock' >/dev/null 2>&1
   }
   remote_claude_service_installed() {
     if fieldwork_setup_snapshot_is_ok claude_service; then
@@ -1369,7 +1355,13 @@ EOF
     elif [ "$FIELDWORK_SETUP_SNAPSHOT_READY" = "1" ] && [ "$FIELDWORK_SETUP_SNAPSHOT_DIRTY" != "1" ]; then
       return 1
     fi
-    ssh "$FIELDWORK_SSH_HOST" "test -f ~/.config/systemd/user/fieldwork-agent@.service" >/dev/null 2>&1
+    ssh "$FIELDWORK_SSH_HOST" "test -f /etc/systemd/system/fieldwork-agent@.service" >/dev/null 2>&1
+  }
+  remote_claude_probe_ready() {
+    ssh "$FIELDWORK_SSH_HOST" 'test -s /usr/local/lib/fieldwork/claude.sha256 && test "$(cat /usr/local/lib/fieldwork/claude.sha256)" = "$(cat /usr/local/lib/fieldwork/claude.probe.sha256 2>/dev/null)"' >/dev/null 2>&1
+  }
+  record_remote_claude_probe() {
+    ssh -t "$FIELDWORK_SSH_HOST" "sudo env FIELDWORK_REMOTE_USER=$(shell_quote "$FIELDWORK_REMOTE_USER") /usr/local/sbin/fieldwork-session-probe-record"
   }
   broker_socket_writable() {
     if fieldwork_setup_snapshot_is_ok broker_socket; then
@@ -1388,15 +1380,13 @@ EOF
     ssh "$FIELDWORK_SSH_HOST" "test -f /usr/local/sbin/rotate-pat" >/dev/null 2>&1
   }
   broker_thin_client_installed() {
-    # install_thin_client links ~/.local/bin/fieldwork-pr-submit to the
-    # Fieldwork scripts dir. Use -e (not -L) so a regular file copy is also
-    # accepted; -e on a broken symlink returns false, which is what we want.
+    # Protocol-v2 delivery clients are immutable root-owned copies.
     if fieldwork_setup_snapshot_is_ok broker_thin_client; then
       return 0
     elif [ "$FIELDWORK_SETUP_SNAPSHOT_READY" = "1" ] && [ "$FIELDWORK_SETUP_SNAPSHOT_DIRTY" != "1" ]; then
       return 1
     fi
-    ssh "$FIELDWORK_SSH_HOST" "test -e ~/.local/bin/fieldwork-pr-submit" >/dev/null 2>&1
+    ssh "$FIELDWORK_SSH_HOST" "test -x /usr/local/bin/fieldwork-pr-build && test -x /usr/local/bin/fieldwork-pr-upload" >/dev/null 2>&1
   }
   broker_install_complete() {
     broker_pat_tool_installed && broker_thin_client_installed
@@ -2204,6 +2194,23 @@ EOF
     else
       setup_row needs "remote Claude session systemd unit missing" "ssh -t $FIELDWORK_SSH_HOST 'cd ~/fieldwork && ./bin/fieldwork bootstrap-vps'"
     fi
+    if progress_wait "checking pinned Claude hostile-probe digest" remote_claude_probe_ready; then
+      setup_row ok "pinned Claude digest has a passing hostile probe"
+    else
+      print_manual_step \
+        "Pinned Claude hostile probe" \
+        "Run the root-owned empirical exclusion/sandbox probe and record only a passing executable digest." \
+        "ssh -t $FIELDWORK_SSH_HOST 'sudo env FIELDWORK_REMOTE_USER=$FIELDWORK_REMOTE_USER /usr/local/sbin/fieldwork-session-probe-record'"
+      if maybe_run_manual_step "[fieldwork setup] Run the pinned Claude hostile probe now?"; then
+        record_remote_claude_probe || true
+        fieldwork_setup_snapshot_mark_dirty
+      fi
+      if remote_claude_probe_ready; then
+        setup_row ok "pinned Claude digest has a passing hostile probe"
+      else
+        setup_row needs "Claude sessions disabled until the hostile probe passes" "ssh -t $FIELDWORK_SSH_HOST 'sudo env FIELDWORK_REMOTE_USER=$FIELDWORK_REMOTE_USER /usr/local/sbin/fieldwork-session-probe-record'"
+      fi
+    fi
   else
     info_row "Purpose" "Verify the delivery runner sockets used from Codex SSH sessions."
     setup_row ok "Claude session systemd unit skipped for Codex-only setup"
@@ -2760,9 +2767,9 @@ setup_notify_telegram_bot() {
 
   echo
   label_line "Next"
-  echo "  Opt a repo into the approval gate:"
-  echo "    fieldwork onboard <owner>/<repo> --with-approval-gate"
-  echo "  Or add .fieldwork/approval-gate to an existing repo and commit it."
+  echo "  Newly wired repos require approval by default. To re-wire an existing"
+  echo "  repo, rerun fieldwork onboard <owner>/<repo>; broker policy, not a"
+  echo "  checkout marker, is authoritative."
 }
 
 setup_notify() {

@@ -1,0 +1,7 @@
+{
+  "policyHelper": {
+    "path": "/usr/local/lib/fieldwork-local/fieldwork-policy-helper",
+    "timeoutMs": 5000,
+    "refreshIntervalMs": 0
+  }
+}

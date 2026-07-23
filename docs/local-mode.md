@@ -1,0 +1,150 @@
+# Local hard-boundary mode
+
+> **Release gate:** this unreleased implementation remains disabled as a
+> supported security claim until the external trusted-builder prerequisite and
+> the real macOS/Linux forge, hostile-probe, persistence, and reboot acceptance
+> gate all pass.
+
+Local mode keeps the forge credential in a hardened Docker broker on the
+machine where the agent works. Claude runs under a dedicated
+`fieldwork-agent` OS account; ordinary Claude sessions are not subject to its
+policy.
+
+## Trust boundary
+
+Docker access is operator authority. A user that controls Docker can inspect
+the token volume, replace policy, or enter the broker container. The agent must
+not have Docker access.
+
+The dedicated Claude session loads only root-owned managed settings. Bash-child
+network access has an empty managed allowlist, outbound tools and unmanaged MCP
+are unavailable, Docker sockets and the local bearer are unreadable, and only
+the absolute root-owned upload/verify/prepare clients may escape the sandbox.
+The launcher refuses symlinked, writable, or digest-changed boundary assets.
+
+Local Codex is not a hard-boundary mode in this release.
+
+## Verified installation
+
+Install only after verifying both the signed tag and the trusted-builder
+provenance described in [supply chain](supply-chain.md):
+
+```sh
+sudo env FIELDWORK_CLAUDE_BIN="$(command -v claude)" bash lib/local/install.sh
+```
+
+The installer creates the dedicated account, copies the pinned Claude
+executable and control assets into root-owned paths, installs
+`/usr/local/sbin/fieldwork-local`, and installs the two protocol-v2 clients.
+Run `sudo fieldwork-local probe <slug>` for that Claude digest before enabling
+agent work. The probe verifies the root-owned managed policy and empirically
+checks the excluded uploader, ordinary sandbox execution, loopback denial,
+bearer denial, and Docker denial. A Claude update requires reinstalling and a
+fresh passing probe; the launcher refuses an unrecorded digest.
+
+## Start and wire
+
+```sh
+sudo fieldwork-local up
+sudo fieldwork-local token
+sudo fieldwork-local wire app owner/app --base-branch main
+```
+
+`token` requires a real TTY, validates the token against the forge, and stores
+it only in the broker volume. `wire` defaults to GitHub, base `main`, and
+`approval=require`. Use `--auto` only when immediate forge writes are
+intended. For self-managed GitLab use `--gitlab --api-base-url
+https://host/api/v4 --git-base-url https://host`; add `--ca-bundle <pem>` when
+needed. Private address space also requires the explicit
+`--allow-private-network` opt-in.
+
+Place or clone the checkout as the dedicated user under:
+
+- macOS: `/Users/Shared/Fieldwork/projects/<slug>`
+- Linux: `/srv/fieldwork/projects/<slug>`
+
+Then authenticate and launch:
+
+```sh
+sudo fieldwork-local claude --login
+sudo fieldwork-local probe app
+sudo fieldwork-local claude app
+```
+
+## Agent delivery
+
+Commit all intended changes so the worktree is clean. The local Claude sandbox
+supports the normal Git commit path; the prepare runner is currently a VPS
+boundary service. Create a build request:
+
+```json
+{
+  "schema_version": 2,
+  "slug": "app",
+  "branch": "fieldwork/my-change",
+  "title": "Describe the change",
+  "body": "Summary and tests"
+}
+```
+
+Then make two separate top-level calls:
+
+```sh
+fieldwork-pr-build .fieldwork/local/pr-build-request.json
+/usr/local/bin/fieldwork-pr-upload <printed-request-id>
+```
+
+Query a durable result with:
+
+```sh
+/usr/local/bin/fieldwork-pr-upload --status <request-id>
+```
+
+For required approval:
+
+```sh
+sudo fieldwork-local approve <request-id>
+# or
+sudo fieldwork-local approve <request-id> deny
+```
+
+## Operations
+
+```sh
+sudo fieldwork-local status
+sudo fieldwork-local logs broker
+sudo fieldwork-local telegram
+sudo fieldwork-local down
+```
+
+Remove local mode with `sudo fieldwork-local uninstall`. It separately confirms
+whether to delete the dedicated projects tree; declining keeps those checkouts
+for manual recovery. On macOS it also removes the dedicated Claude keychain,
+LaunchDaemon, and account.
+
+`down` preserves named volumes. `clean` deletes containers and persistent
+volumes and requires an interactive confirmation. Back up the token, policy,
+MAC-key, pending, and tombstone volumes before using it.
+
+Maintenance mode is only for the discrete protocol upgrade:
+
+```sh
+sudo fieldwork-local maintenance-start
+sudo fieldwork-local maintenance-submit meta.json pack
+sudo fieldwork-local maintenance-stop
+```
+
+Normal submission and approval return 503 while maintenance is active; status
+and reconciliation remain available. Clearing maintenance requires the explicit
+restart performed by `maintenance-stop`.
+
+## Limits and kill switches
+
+The default upload cap is 8 MiB. The broker also caps object count, object
+sizes, expanded delta size, processing time, and request rate. SHA-1 repositories
+and non-thin packs are required. Full-pack delivery for a mature repository may
+exceed caps; establish a common base first rather than weakening the cap
+casually.
+
+Stop intake immediately with `sudo fieldwork-local down`. If a token may have
+escaped, revoke it at the forge before restarting.

@@ -36,17 +36,20 @@
 
 Codex must use the broker path for every PR. The branch must be `fieldwork/<short-feature-name>`, never the default branch.
 
-Invoke the three fieldwork commands below verbatim: absolute path, single argument, no `cd`/`env`/`&&` prefix. Their sandbox exclusion is a literal prefix match on the command string, and any prefix re-enables the per-command sandbox, which fails inside remote sessions.
+The escape-side clients below are root-owned. Invoke each excluded command as a
+separate top-level tool call with its absolute path and one argument; shell
+composition intentionally does not inherit the exclusion.
 
 1. Run verification:
 
 ```bash
-/home/fieldwork/.local/bin/fieldwork-verify "$PWD"
+/usr/local/bin/fieldwork-verify "$PWD"
 ```
 
 If it fails, stop and report the failure. Do not retry with direct lint/test commands, auto-fix, stage, commit, push, or open a PR.
 
-2. Write `.fieldwork/local/pr-prepare-request.json`:
+2. If the sandbox cannot commit, create a fresh per-UID spool directory and
+write its only file, `request.json`, with this prepare request:
 
 ```json
 {
@@ -61,34 +64,42 @@ If it fails, stop and report the failure. Do not retry with direct lint/test com
 
 `paths` must list every modified or untracked file and only those files. No absolute paths or `..` segments.
 
-3. Run the prepare client:
+3. Run the prepare client with that request UUID:
 
 ```bash
-/home/fieldwork/.local/bin/fieldwork-pr-prepare .fieldwork/local/pr-prepare-request.json
+/usr/local/bin/fieldwork-pr-prepare <prepare-request-id>
 ```
 
 The prepare runner creates the branch, stages exactly `paths`, commits outside the agent sandbox, and leaves the worktree clean.
 
-4. Write `.fieldwork/local/pr-request.json`:
+4. Write `.fieldwork/local/pr-build-request.json` (this file is not uploaded):
 
 ```json
 {
-  "request_id": "<fresh uuid v4 distinct from prepare>",
-  "created_at": "<UTC timestamp>",
-  "repo_path": "/home/fieldwork/projects/<slug>",
+  "schema_version": 2,
+  "slug": "<slug>",
   "branch": "fieldwork/<same branch>",
   "title": "<PR title>",
   "body": "<PR body>"
 }
 ```
 
-5. Submit through the broker:
+5. Perform the upload phase as exactly two separate top-level calls. First build:
 
 ```bash
-/home/fieldwork/.local/bin/fieldwork-pr-submit .fieldwork/local/pr-request.json
+fieldwork-pr-build .fieldwork/local/pr-build-request.json
 ```
 
-The broker validates `.fieldwork/expected-origin`, enforces `fieldwork/...` branches, scans the PR body for secrets, and opens the PR. If `.fieldwork/approval-gate` exists, the broker queues the push until the Telegram approval bot receives an approval.
+Then pass the printed UUID to the excluded uploader in a new tool call:
+
+```bash
+/usr/local/bin/fieldwork-pr-upload <request-id>
+```
+
+The broker never reads this checkout. It fetches the operator-wired base,
+reconstructs the uploaded pack in quarantine, enforces object and scan caps,
+scans title/body and the policy delta, and either opens the PR or durably queues
+it for human approval.
 
 If the broker or runners reject the request, do not bypass them with `git push`. Report the rejection and wait for operator guidance.
 

@@ -5,17 +5,23 @@ services:
       dockerfile: examples/eval/Dockerfile
     working_dir: /workspace
     environment:
-      FIELDWORK_BROKER_PROJECTS_ROOT: /workspace/.eval/projects
+      PYTHONDONTWRITEBYTECODE: "1"
+      FIELDWORK_BROKER_POLICY_DIR: /workspace/.eval/state/policy
+      FIELDWORK_BROKER_CA_DIR: /workspace/.eval/state/ca
       FIELDWORK_BROKER_LEDGER_DIR: /workspace/.eval/state/requests
-      FIELDWORK_BROKER_PENDING_DIR: /workspace/.eval/state/pending
+      FIELDWORK_BROKER_PENDING_META_DIR: /workspace/.eval/state/pending-meta
+      FIELDWORK_BROKER_PENDING_SIDECAR_DIR: /workspace/.eval/state/pending-sidecar
+      FIELDWORK_BROKER_PENDING_PACK_DIR: /workspace/.eval/state/pending-pack
+      FIELDWORK_BROKER_TOMBSTONE_DIR: /workspace/.eval/state/tombstones
+      FIELDWORK_BROKER_WORK_DIR: /workspace/.eval/state/work
+      FIELDWORK_BROKER_PENDING_MAC_KEY_PATH: /workspace/.eval/state/pending-mac.key
       FIELDWORK_BROKER_AUDIT_LOG_PATH: /workspace/.eval/state/audit.jsonl
       FIELDWORK_BROKER_TOKEN_PATH: /workspace/.eval/state/fake-token
       FIELDWORK_BROKER_ASKPASS_PATH: /workspace/lib/broker/git-askpass
-      FIELDWORK_BROKER_COMMAND_PATH: /workspace/examples/eval:/usr/bin:/bin
     volumes:
       - ../..:/workspace
       - fieldwork-eval-state:/workspace/.eval
-    command: ["bash", "-lc", "mkdir -p /workspace/.eval/state /workspace/.eval/projects && printf 'github_pat_eval\\n' > /workspace/.eval/state/fake-token && tail -f /dev/null"]
+    command: ["bash", "-lc", "mkdir -p /workspace/.eval/state && tail -f /dev/null"]
 
 volumes:
   fieldwork-eval-state:

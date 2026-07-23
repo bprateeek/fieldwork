@@ -372,7 +372,7 @@ init_repo() {
     info "expected-origin set to $expected_origin"
   fi
 
-  # default-branch — the broker reads this when creating the PR base.
+  # default-branch — a human/client hint; protocol-v2 broker policy is authoritative.
   local default_branch_file="$REPO/.fieldwork/default-branch"
   local detected_default_branch
   detected_default_branch="$(detect_origin_default_branch || true)"
@@ -438,7 +438,8 @@ init_repo() {
     fi
   fi
 
-  # --with-approval-gate: commit an empty marker so the broker queues every PR
+  # --with-approval-gate: commit a human hint. Protocol-v2 broker policy is
+  # authoritative and never reads this marker.
   # request from this repo behind a human approval step. The file body is
   # reserved for future per-repo policy; presence alone is the v1 signal.
   if [ "$WITH_APPROVAL_GATE" = "1" ]; then

@@ -21,15 +21,16 @@ fieldwork eval down
 fieldwork eval clean
 ```
 
-The smoke command creates a throwaway repo inside the container, queues a
-broker request behind the approval gate, approves it through broker code, uses
-fake GitHub behavior, and prints a human-readable broker-flow summary. Use
-`fieldwork eval smoke --json` for the structured smoke result or
-`fieldwork eval smoke --verbose` for the event timeline.
+The smoke command runs a hermetic subset of the real protocol-v2 broker tests.
+It creates real Git repositories and packfiles, exercises quarantine and the
+durable approval lifecycle, and performs no forge or network operation. Use
+`fieldwork eval smoke --json` for the structured result.
 
-The Docker evaluation path remains GitHub-shaped. It does not exercise GitLab
-host pinning, GitLab token liveness, or GitLab MR creation.
+Because the evaluation is forge-free, it does not exercise GitHub or GitLab
+token liveness, host pinning, or PR/MR creation.
 
 For production use, follow the VPS setup path. Production Fieldwork relies on
 separate Unix users, systemd sockets, the broker-owned forge token, and real
-repository checkouts.
+repository checkouts. The gated local-mode implementation instead uses the
+hardened broker container plus a dedicated host account; it is not supported
+until the documented release acceptance gate passes. See [Local Mode](local-mode.md).

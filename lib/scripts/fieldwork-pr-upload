@@ -1,0 +1,258 @@
+#!/usr/bin/python3 -I
+"""Excluded, root-installed protocol-v2 uploader with no subprocess use."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+import pwd
+import re
+import secrets
+import socket
+import stat
+import sys
+
+
+UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
+UNIX_SOCKET = "/run/fieldwork-pr-broker/fieldwork-pr.sock"
+LOCAL_HOST = "127.0.0.1"
+LOCAL_PORT = 8377
+MAX_META = 128 * 1024
+MAX_PACK = 8 * 1024 * 1024
+
+
+class UploadError(RuntimeError):
+    pass
+
+
+def spool_parent(uid: int) -> Path:
+    if sys.platform == "darwin":
+        return Path("/private/var/run/fieldwork", str(uid), "spool")
+    return Path("/run/user", str(uid), "fieldwork", "spool")
+
+
+def _open_dir(path: Path, uid: int) -> int:
+    fd = os.open("/", os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        for component in path.parts[1:]:
+            next_fd = os.open(
+                component,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=fd,
+            )
+            info = os.fstat(next_fd)
+            if not stat.S_ISDIR(info.st_mode) or info.st_uid not in (0, uid):
+                os.close(next_fd)
+                raise UploadError("unsafe spool path ownership or type")
+            if info.st_uid == uid and stat.S_IMODE(info.st_mode) & 0o077:
+                os.close(next_fd)
+                raise UploadError("unsafe spool directory permissions")
+            os.close(fd)
+            fd = next_fd
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _open_regular(parent_fd: int, name: str, uid: int, maximum: int) -> tuple[int, int]:
+    fd = os.open(name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=parent_fd)
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != uid or stat.S_IMODE(info.st_mode) & 0o077:
+        os.close(fd)
+        raise UploadError(f"unsafe spool file: {name}")
+    if info.st_size <= 0 or info.st_size > maximum:
+        os.close(fd)
+        raise UploadError(f"spool file has invalid size: {name}")
+    return fd, info.st_size
+
+
+def _read_exact(fd: int, size: int) -> bytes:
+    chunks: list[bytes] = []
+    remaining = size
+    while remaining:
+        chunk = os.read(fd, min(65536, remaining))
+        if not chunk:
+            raise UploadError("spool file changed while reading")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    if os.read(fd, 1):
+        raise UploadError("spool file grew while reading")
+    return b"".join(chunks)
+
+
+def _send_file(sock: socket.socket, fd: int, size: int) -> None:
+    remaining = size
+    while remaining:
+        chunk = os.read(fd, min(65536, remaining))
+        if not chunk:
+            raise UploadError("pack changed while uploading")
+        sock.sendall(chunk)
+        remaining -= len(chunk)
+    if os.read(fd, 1):
+        raise UploadError("pack grew while uploading")
+
+
+def _bearer(uid: int) -> str:
+    home = Path(pwd.getpwuid(uid).pw_dir)
+    path = home / ".fieldwork/http-auth"
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != uid or stat.S_IMODE(info.st_mode) != 0o600 or info.st_size > 4096:
+            raise UploadError("local bearer file has unsafe ownership, mode, or size")
+        token = _read_exact(fd, info.st_size).decode("ascii", "strict").strip()
+    finally:
+        os.close(fd)
+    if not token:
+        raise UploadError("local bearer is empty; run fieldwork-local up")
+    return token
+
+
+def _response(sock: socket.socket) -> dict[str, object]:
+    data = b""
+    while b"\r\n\r\n" not in data:
+        chunk = sock.recv(4096)
+        if not chunk:
+            raise UploadError("broker closed without an HTTP response")
+        data += chunk
+        if len(data) > 16384:
+            raise UploadError("broker response headers are too large")
+    headers, _, body = data.partition(b"\r\n\r\n")
+    first = headers.split(b"\r\n", 1)[0].split()
+    if len(first) < 2 or not first[1].isdigit():
+        raise UploadError("broker returned a malformed HTTP status")
+    lengths: list[int] = []
+    for line in headers.split(b"\r\n")[1:]:
+        name, sep, value = line.partition(b":")
+        if sep and name.strip().lower() == b"content-length":
+            try:
+                lengths.append(int(value.strip()))
+            except ValueError as exc:
+                raise UploadError("broker returned a malformed Content-Length") from exc
+    if len(lengths) != 1 or lengths[0] < 0 or lengths[0] > 1024 * 1024:
+        raise UploadError("broker response is missing a safe Content-Length")
+    length = lengths[0]
+    while len(body) < length:
+        chunk = sock.recv(min(4096, length - len(body)))
+        if not chunk:
+            raise UploadError("broker response ended early")
+        body += chunk
+    try:
+        value = json.loads(body[:length])
+    except json.JSONDecodeError as exc:
+        raise UploadError("broker returned invalid JSON") from exc
+    if not isinstance(value, dict):
+        raise UploadError("broker returned a non-object response")
+    value.setdefault("http_status", int(first[1]))
+    return value
+
+
+def _connect(uid: int, headers: list[bytes]) -> socket.socket:
+    if os.path.exists(UNIX_SOCKET):
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(30)
+        sock.connect(UNIX_SOCKET)
+        return sock
+    headers.append(b"X-Fieldwork-Local-Auth: " + _bearer(uid).encode("ascii"))
+    return socket.create_connection((LOCAL_HOST, LOCAL_PORT), timeout=30)
+
+
+def status(request_id: str) -> dict[str, object]:
+    request_id = request_id.lower()
+    if not UUID_RE.fullmatch(request_id):
+        raise UploadError("request_id must be a UUID")
+    body = json.dumps({"request_id": request_id}, separators=(",", ":")).encode("ascii")
+    headers = [
+        b"POST /pr-status HTTP/1.1",
+        b"Host: localhost",
+        b"Connection: close",
+        b"Content-Type: application/json",
+        f"Content-Length: {len(body)}".encode("ascii"),
+    ]
+    uid = os.getuid()
+    sock = _connect(uid, headers)
+    with sock:
+        sock.sendall(b"\r\n".join(headers) + b"\r\n\r\n" + body)
+        return _response(sock)
+
+
+def upload(request_id: str) -> dict[str, object]:
+    request_id = request_id.lower()
+    if not UUID_RE.fullmatch(request_id):
+        raise UploadError("request_id must be a UUID")
+    uid = os.getuid()
+    parent_fd = _open_dir(spool_parent(uid), uid)
+    try:
+        request_fd = os.open(
+            request_id,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_fd,
+        )
+    finally:
+        os.close(parent_fd)
+    try:
+        names = set(os.listdir(request_fd))
+        if names != {"meta.json", "pack"}:
+            raise UploadError("spool request directory must contain exactly meta.json and pack")
+        meta_fd, meta_size = _open_regular(request_fd, "meta.json", uid, MAX_META)
+        pack_fd, pack_size = _open_regular(request_fd, "pack", uid, MAX_PACK)
+        try:
+            meta = _read_exact(meta_fd, meta_size)
+            try:
+                parsed = json.loads(meta)
+            except json.JSONDecodeError as exc:
+                raise UploadError("meta.json is invalid JSON") from exc
+            if not isinstance(parsed, dict) or parsed.get("request_id") != request_id:
+                raise UploadError("meta.json request_id does not match the spool directory")
+            boundary = f"fieldwork-{secrets.token_hex(24)}".encode("ascii")
+            before_meta = b"--" + boundary + b"\r\nContent-Disposition: form-data; name=\"meta\"\r\nContent-Type: application/json\r\n\r\n"
+            before_pack = b"\r\n--" + boundary + b"\r\nContent-Disposition: form-data; name=\"pack\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+            ending = b"\r\n--" + boundary + b"--\r\n"
+            content_length = len(before_meta) + meta_size + len(before_pack) + pack_size + len(ending)
+
+            headers = [
+                b"POST /pr HTTP/1.1",
+                b"Host: localhost",
+                b"Connection: close",
+                b"Content-Type: multipart/form-data; boundary=" + boundary,
+                f"Content-Length: {content_length}".encode("ascii"),
+            ]
+            sock = _connect(uid, headers)
+            with sock:
+                sock.sendall(b"\r\n".join(headers) + b"\r\n\r\n")
+                sock.sendall(before_meta)
+                sock.sendall(meta)
+                sock.sendall(before_pack)
+                os.lseek(pack_fd, 0, os.SEEK_SET)
+                _send_file(sock, pack_fd, pack_size)
+                sock.sendall(ending)
+                return _response(sock)
+        finally:
+            os.close(meta_fd)
+            os.close(pack_fd)
+    finally:
+        os.close(request_fd)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="upload or query a Fieldwork protocol-v2 PR request")
+    parser.add_argument("--status", action="store_true", help="query durable request status instead of uploading")
+    parser.add_argument("request_id")
+    args = parser.parse_args(argv)
+    try:
+        result = status(args.request_id) if args.status else upload(args.request_id)
+    except (OSError, UnicodeError, UploadError) as exc:
+        print(f"[fieldwork-pr-upload] {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps(result, sort_keys=True))
+    if result.get("ok") is True:
+        return 0
+    print(f"[fieldwork-pr-upload] broker rejected request: {result.get('error', 'unknown error')}", file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

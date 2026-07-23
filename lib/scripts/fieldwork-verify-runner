@@ -14,7 +14,7 @@
 # A bwrap child of that process cannot create the user namespace it needs,
 # because AppArmor's profile transition into fieldwork-bwrap is blocked by
 # NNP. Routing the verify call through this socket-activated unit puts the
-# real work under the user manager (systemd --user) — outside the agent's
+# real work under the root-owned system manager — outside the agent's
 # userns, with NNP clear, in a context where bwrap works.
 #
 # Wire protocol (one direction in, one direction out, line-delimited):
@@ -35,13 +35,9 @@ set -uo pipefail
 PROJECTS_ROOT="${FIELDWORK_PROJECTS_ROOT:-/home/fieldwork/projects}"
 WORKTREES_ROOT="${FIELDWORK_WORKTREES_ROOT:-/home/fieldwork/worktrees}"
 
-# $0 is whatever path systemd exec'd us through — typically a symlink at
-# ~/.local/bin/fieldwork-verify-runner pointing into ~/.fieldwork/scripts/
-# pointing into the installed lib/scripts/ checkout. The pipeline lives
-# next to the runner's canonical (post-symlink-resolution) location, not
-# next to the user-facing ~/.local/bin/ symlink, so resolve all the way
-# before computing the sibling path.
-PIPELINE="$(dirname -- "$(readlink -f -- "$0")")/fieldwork-verify-pipeline"
+# The system unit executes this root-owned runner and its root-owned pipeline
+# through fixed absolute paths; no checkout or user-scope symlink participates.
+PIPELINE=/usr/local/lib/fieldwork/fieldwork-verify-pipeline
 
 emit_error_and_exit() {
   # Emit a framed error + exit-code so the client sees something coherent,

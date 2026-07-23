@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+set -euo pipefail
+[ "$(id -u)" -eq 0 ] || { echo "launcher must run as root" >&2; exit 1; }
+export PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+unset BASH_ENV ENV CDPATH PYTHONPATH PYTHONHOME COMPOSE_FILE COMPOSE_PROJECT_NAME DOCKER_HOST DOCKER_CONFIG
+ROOT=/usr/local/lib/fieldwork-local
+CLAUDE="$ROOT/claude-pinned"
+assert_root_asset() {
+  path="$1"
+  [ -f "$path" ] && [ ! -L "$path" ] || { echo "hard-boundary asset missing or symlinked: $path" >&2; exit 1; }
+  owner="$(stat -f '%u' "$path" 2>/dev/null || stat -c '%u' "$path")"
+  mode="$(stat -f '%Lp' "$path" 2>/dev/null || stat -c '%a' "$path")"
+  [ "$owner" = 0 ] || { echo "hard-boundary asset is not root-owned: $path" >&2; exit 1; }
+  case "$mode" in *[2367][0-7]|*[0-7][2367]) echo "hard-boundary asset is group/other writable: $path" >&2; exit 1 ;; esac
+}
+for asset in \
+  /usr/local/sbin/fieldwork-local \
+  "$CLAUDE" "$ROOT/claude.sha256" "$ROOT/empty-mcp.json" \
+  "$ROOT/strict-managed-settings.json" "$ROOT/fieldwork-policy-helper" \
+  "$ROOT/spool-init" "$ROOT/fieldwork-local-claude" \
+  "$ROOT/fieldwork-local-probe" "$ROOT/docker-compose.yml" \
+  "$ROOT/entrypoint.sh" "$ROOT/context/lib/local/Dockerfile" \
+  "$ROOT/context/lib/broker/server.py" "$ROOT/context/lib/broker/originnorm.py" \
+  "$ROOT/context/lib/broker/policy_writer.py" "$ROOT/context/schema/pr-request.schema.json" \
+  /usr/local/bin/fieldwork-pr-build /usr/local/bin/fieldwork-pr-upload \
+  /usr/local/bin/fieldwork-pr-prepare /usr/local/bin/fieldwork-verify; do
+  assert_root_asset "$asset"
+done
+case "$(uname -s)" in
+  Darwin) MANAGED_SETTINGS="/Library/Application Support/ClaudeCode/managed-settings.json" ;;
+  Linux) MANAGED_SETTINGS=/etc/claude-code/managed-settings.json ;;
+esac
+assert_root_asset "$MANAGED_SETTINGS"
+assert_root_asset /usr/local/etc/fieldwork-agent.uid
+managed_asset_seen=0
+if find "$ROOT" /usr/local/share/fieldwork-claude -type l -print -quit | grep -q .; then
+  echo "root-owned managed instruction inventory contains a symlink" >&2
+  exit 1
+fi
+while IFS= read -r asset; do
+  assert_root_asset "$asset"
+  managed_asset_seen=1
+done < <(find "$ROOT" /usr/local/share/fieldwork-claude -type f -print)
+[ "$managed_asset_seen" = 1 ] || { echo "root-owned managed instruction inventory is empty" >&2; exit 1; }
+"$ROOT/spool-init"
+EXPECTED="$(/bin/cat "$ROOT/claude.sha256")"
+if command -v shasum >/dev/null 2>&1; then ACTUAL="$(shasum -a 256 "$CLAUDE" | awk '{print $1}')"; else ACTUAL="$(sha256sum "$CLAUDE" | awk '{print $1}')"; fi
+[ "$ACTUAL" = "$EXPECTED" ] || { echo "pinned Claude digest changed; rerun the hostile probe before launch" >&2; exit 1; }
+repo="${1:-}"
+case "$(uname -s)" in Darwin) HOME_DIR=/Users/fieldwork-agent; PROJECTS=/Users/Shared/Fieldwork/projects ;; Linux) HOME_DIR=/home/fieldwork-agent; PROJECTS=/srv/fieldwork/projects ;; esac
+if [ "$(uname -s)" = Darwin ]; then
+  KEYCHAIN_SECRET=/usr/local/etc/fieldwork-agent.keychain-secret
+  KEYCHAIN="$HOME_DIR/Library/Keychains/login.keychain-db"
+  [ -f "$KEYCHAIN_SECRET" ] && [ ! -L "$KEYCHAIN_SECRET" ] && [ "$(stat -f '%u %Lp' "$KEYCHAIN_SECRET")" = "0 600" ] || {
+    echo "dedicated Claude keychain secret is missing or unsafe; reinstall local mode" >&2
+    exit 1
+  }
+  /usr/bin/sudo -H -u fieldwork-agent /usr/bin/security unlock-keychain -p "$(/bin/cat "$KEYCHAIN_SECRET")" "$KEYCHAIN"
+fi
+if [ "$repo" = "--login" ]; then
+  shift
+  exec sudo -H -u fieldwork-agent env -i HOME="$HOME_DIR" PATH=/usr/local/bin:/usr/bin:/bin \
+    CLAUDE_CONFIG_DIR="$HOME_DIR/.claude" "$CLAUDE" auth login "$@"
+fi
+PROBED="$(/bin/cat "$ROOT/claude.probe.sha256" 2>/dev/null || true)"
+[ "$PROBED" = "$EXPECTED" ] || { echo "pinned Claude digest is unprobed; run fieldwork-local probe <slug>" >&2; exit 1; }
+[ -n "$repo" ] || { echo "usage: fieldwork-local claude <slug> | --login" >&2; exit 2; }
+shift
+cd "$PROJECTS/$repo"
+exec sudo -H -u fieldwork-agent env -i HOME="$HOME_DIR" PATH=/usr/local/bin:/usr/bin:/bin \
+  LANG=C.UTF-8 LC_ALL=C.UTF-8 CLAUDE_CONFIG_DIR="$HOME_DIR/.claude" CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 \
+  GIT_AUTHOR_NAME="Fieldwork Agent" GIT_AUTHOR_EMAIL=fieldwork-agent@localhost \
+  GIT_COMMITTER_NAME="Fieldwork Agent" GIT_COMMITTER_EMAIL=fieldwork-agent@localhost \
+  "$CLAUDE" --setting-sources "" --strict-mcp-config --mcp-config "$ROOT/empty-mcp.json" \
+  --tools "Bash,Edit,Read,Write,Glob,Grep" --add-dir /usr/local/share/fieldwork-claude "$@"

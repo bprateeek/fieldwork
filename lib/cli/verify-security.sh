@@ -218,13 +218,32 @@ EOF
   for directive in \
     "NoNewPrivileges=true" \
     "PrivateTmp=true" \
+    "PrivateDevices=true" \
     "ProtectSystem=strict" \
-    "ProtectHome=read-only" \
+    "ProtectHome=yes" \
+    "MemoryMax=1G" \
+    "TasksMax=128" \
+    "CPUQuota=200%" \
+    "LimitFSIZE=268435456" \
     "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6"; do
     if ssh "$FIELDWORK_SSH_HOST" "systemctl cat fieldwork-pr-broker.service 2>/dev/null | grep -Fx '$directive' >/dev/null" >/dev/null 2>&1; then
       security_ok "broker service has $directive"
     else
       security_fail "broker service missing $directive" "Run: fieldwork sync-vps --force-install, then $(remote_sudo_ssh_command "bash ~/.fieldwork/infra/fieldwork-pr-broker/install.sh")"
+    fi
+  done
+
+  phase_section "Root-Owned Runner Boundary"
+  for directive in \
+    /etc/systemd/system/fieldwork-agent@.service \
+    /etc/systemd/system/fieldwork-event-poll.service \
+    /etc/systemd/system/fieldwork-task-dispatcher.service \
+    /etc/systemd/system/fieldwork-verify-runner.socket \
+    /etc/systemd/system/fieldwork-pr-prepare-runner.socket; do
+    if ssh "$FIELDWORK_SSH_HOST" "test -f '$directive' && test ! -L '$directive' && test \"\$(stat -c '%U:%G %a' '$directive')\" = 'root:root 644'" >/dev/null 2>&1; then
+      security_ok "$directive is root-owned 0644"
+    else
+      security_fail "$directive is missing or not root-owned 0644" "Run: fieldwork setup --force-install"
     fi
   done
 
@@ -346,10 +365,10 @@ EOF
     security_ok "no obvious public 22/tcp allow rule in ufw"
   fi
 
-  if ssh "$FIELDWORK_SSH_HOST" "if grep -RqsE 'notify\\.env|NTFY_TOPIC|TG_BOT_TOKEN' ~/.config/systemd/user/fieldwork-agent@.service ~/.config/systemd/user/fieldwork-agent@.service.d 2>/dev/null; then exit 1; else exit 0; fi" >/dev/null 2>&1; then
+  if ssh "$FIELDWORK_SSH_HOST" "if grep -qsE 'notify\\.env|NTFY_TOPIC|TG_BOT_TOKEN' /etc/systemd/system/fieldwork-agent@.service 2>/dev/null; then exit 1; else exit 0; fi" >/dev/null 2>&1; then
     security_ok "notification secrets are not injected into Claude systemd unit"
   else
-    security_fail "notification secrets appear in Claude systemd unit config" "Remove notify.env or token variables from ~/.config/systemd/user/fieldwork-agent@.service, then run systemctl --user daemon-reload."
+    security_fail "notification secrets appear in Claude systemd unit config" "Remove token variables from /etc/systemd/system/fieldwork-agent@.service, then run sudo systemctl daemon-reload."
   fi
 
   if [ -n "$slug" ]; then

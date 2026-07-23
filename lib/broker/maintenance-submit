@@ -1,0 +1,56 @@
+#!/usr/bin/python3 -I
+"""Root/operator protocol-v2 submitter for the discrete maintenance phase."""
+import json, os, pathlib, secrets, socket, sys
+
+if os.getuid() != 0 and not pathlib.Path("/.dockerenv").exists():
+    print("maintenance-submit must run as root (or inside the broker container)", file=sys.stderr)
+    raise SystemExit(1)
+if len(sys.argv) != 3:
+    print("usage: maintenance-submit <meta.json> <pack>", file=sys.stderr)
+    raise SystemExit(2)
+meta_path, pack_path = map(pathlib.Path, sys.argv[1:])
+meta = meta_path.read_bytes()
+pack_size = pack_path.stat().st_size
+if len(meta) > 128 * 1024 or not 0 < pack_size <= 8 * 1024 * 1024:
+    print("unsafe metadata or pack size", file=sys.stderr)
+    raise SystemExit(1)
+json.loads(meta)
+boundary = f"fieldwork-maintenance-{secrets.token_hex(20)}".encode()
+before_meta = b"--" + boundary + b'\r\nContent-Disposition: form-data; name="meta"\r\nContent-Type: application/json\r\n\r\n'
+before_pack = b"\r\n--" + boundary + b'\r\nContent-Disposition: form-data; name="pack"\r\nContent-Type: application/octet-stream\r\n\r\n'
+ending = b"\r\n--" + boundary + b"--\r\n"
+length = len(before_meta) + len(meta) + len(before_pack) + pack_size + len(ending)
+maintenance_socket = pathlib.Path("/run/fieldwork-pr-broker/maintenance.sock")
+headers = [
+    b"Host: localhost", b"Connection: close",
+    b"Content-Type: multipart/form-data; boundary=" + boundary,
+    f"Content-Length: {length}".encode(),
+]
+if maintenance_socket.exists():
+    route = b"/pr"
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.connect(str(maintenance_socket))
+else:
+    route = b"/maintenance-pr"
+    token = pathlib.Path("/data/auth/http-auth").read_bytes().strip()
+    headers.extend([b"X-Fieldwork-Local-Auth: " + token, b"X-Fieldwork-Maintenance: container-exec-v1"])
+    sock = socket.create_connection(("127.0.0.1", 8377), timeout=30)
+with sock, pack_path.open("rb") as pack_handle:
+    sock.settimeout(370)
+    sock.sendall(b"POST " + route + b" HTTP/1.1\r\n" + b"\r\n".join(headers) + b"\r\n\r\n")
+    sock.sendall(before_meta + meta + before_pack)
+    while True:
+        chunk = pack_handle.read(65536)
+        if not chunk:
+            break
+        sock.sendall(chunk)
+    sock.sendall(ending)
+    response = b""
+    while True:
+        chunk = sock.recv(65536)
+        if not chunk:
+            break
+        response += chunk
+_, _, body = response.partition(b"\r\n\r\n")
+sys.stdout.buffer.write(body)
+raise SystemExit(0 if json.loads(body).get("ok") else 1)

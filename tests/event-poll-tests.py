@@ -129,8 +129,10 @@ class EventPollTests(unittest.TestCase):
         self.assertIn("Review checklist", resume_text)
         self.assertIn("add feature", resume_text)
 
+        # Repository-state text is intentionally kept local. Only the closed
+        # broker lifecycle enum may cross into the Telegram drop directory.
         notifications_after_first = sorted(self.notifications.glob("*.json"))
-        self.assertGreaterEqual(len(notifications_after_first), 1)
+        self.assertEqual(notifications_after_first, [])
 
         self.run_poller()
 
@@ -164,8 +166,9 @@ class EventPollTests(unittest.TestCase):
         gh_log = (self.tmp / "gh.log").read_text()
         self.assertIn("pr view 7 --json state,mergedAt", gh_log)
         self.assertNotIn("--head", gh_log)
-        notifications = [json.loads(path.read_text()) for path in self.notifications.glob("*.json")]
-        self.assertTrue(any(item.get("event") == "pr_merged" for item in notifications))
+        # pr_merged is status/journal state, not a member of the closed
+        # notification enum; it must not be re-labeled or forwarded.
+        self.assertEqual(list(self.notifications.glob("*.json")), [])
 
     def test_base_branch_falls_back_to_audit_when_no_default_branch_file(self) -> None:
         repo, linked = self.make_repo(with_default_branch=False)

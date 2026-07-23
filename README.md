@@ -2,102 +2,117 @@
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Version](https://img.shields.io/github/v/tag/bprateeek/fieldwork?label=version&sort=semver)](CHANGELOG.md)
-[![Platform](https://img.shields.io/badge/VPS-Ubuntu%2024.04-E95420)](docs/known-limitations.md)
 
-**Ship code from your phone without giving a coding agent your forge write token.**
+**Run a coding agent locally or on a VPS without giving it your forge write token.**
 
-Fieldwork runs Claude or Codex on your VPS, verifies the change, and opens a GitHub pull request or GitLab merge request for review. The agent never receives your GitHub or GitLab write token.
+Fieldwork puts the credential in a checkout-blind broker. The agent produces a
+clean Git commit, builds a non-thin Git pack, and uploads metadata plus that
+pack. The broker reconstructs it in quarantine, scans it, applies an
+operator-owned repository policy, and only then pushes the pinned commit and
+opens a pull or merge request.
 
-<p align="center">
-  <img src="docs/assets/hero.gif" alt="Fieldwork mobile to pull request demo" width="280">
-</p>
+## Choose a mode
 
-## Install Fieldwork
+### Local hard-boundary mode
+
+> **Unreleased acceptance gate:** the implementation is present for review,
+> but must not be represented as a supported security boundary until the
+> separately protected trusted builder is deployed and the documented real
+> macOS/Linux forge-and-reboot acceptance run has passed.
+
+Local mode runs the credential-bearing broker in hardened Docker containers and
+launches Claude as a dedicated OS user with root-owned managed policy.
+
+```sh
+sudo bash lib/local/install.sh
+sudo fieldwork-local up
+sudo fieldwork-local token
+sudo fieldwork-local wire my-repo owner/my-repo --base-branch main
+sudo fieldwork-local claude --login
+sudo fieldwork-local probe my-repo
+sudo fieldwork-local claude my-repo
+```
+
+Local hard-boundary mode is Claude-only in the planned release. Docker access is
+operator authority: anyone who controls the engine can read the forge token or
+rewrite policy. See [local mode](docs/local-mode.md).
+
+### VPS mode
+
+VPS mode runs root-owned system units on Ubuntu 24.04 and keeps the broker under
+a separate Linux identity.
 
 ```sh
 git clone https://github.com/bprateeek/fieldwork.git ~/fieldwork
 cd ~/fieldwork
 bash install.sh
-```
-
-### Try it locally
-
-No VPS. No GitHub token. Requires Docker. About 2 minutes. This spins up the broker shape in Docker so you can watch the pull request path end to end.
-
-```sh
-fieldwork eval up && fieldwork eval smoke
-```
-
-See [docs/evaluation.md](docs/evaluation.md).
-
-### Set up your VPS
-
-Requires a Mac or Linux workstation, an Ubuntu 24.04 VPS, a GitHub repo or GitLab project, and Claude Code or Codex Desktop access.
-
-```sh
 fieldwork setup
 ```
 
-`fieldwork setup` is the guided path: it checks your local tools, VPS access, remote install, agent login, and broker readiness, then tells you the next action.
-
-No VPS yet?
+No VPS yet:
 
 ```sh
 fieldwork provision hetzner
 fieldwork setup
 ```
 
-See [docs/first-time-infrastructure.md](docs/first-time-infrastructure.md) for provider setup and the manual VPS path.
+See the [quickstart](docs/quickstart.md) and [full setup guide](docs/setup.md).
 
-## How Fieldwork works
+### Credential-free evaluation
 
-<p align="center">
-  <img src="docs/assets/how-it-works.png" alt="Mobile task to agent on your VPS to verify to broker (owns the token) to hosted code review" width="100%">
-</p>
+```sh
+fieldwork eval up
+fieldwork eval smoke
+fieldwork eval down
+```
 
-- Your phone starts a task.
-- The agent works on your VPS.
-- The verify runner runs lint, typecheck, tests, gitleaks, and semgrep before delivery.
-- The broker owns the forge write token and opens the pull request or merge request.
-- You review and merge in GitHub or GitLab.
+The evaluation exercises protocol v2, Git quarantine, approval durability, and
+idempotent resume without a real credential or network write.
 
-Claude and Codex use different runtime paths, but both preserve the same token boundary. See [docs/architecture.md](docs/architecture.md) and [docs/threat-model.md](docs/threat-model.md) for details.
+## Delivery contract
 
-## Security model
+After verification and a clean commit, the upload phase is exactly two
+top-level calls:
 
-The core rule: the coding agent never receives the forge write token.
+```sh
+fieldwork-pr-build .fieldwork/local/pr-build-request.json
+/usr/local/bin/fieldwork-pr-upload <request-id>
+```
 
-- Repos clone with **read-only deploy keys**.
-- The agent submits structured, **tokenless** PR requests.
-- The **broker** owns the GitHub or GitLab write token and validates repo state, branch names, origins, replay IDs, changed paths, and PR body content before it pushes.
-- An optional **Telegram approval gate** adds a human tap before the broker pushes.
-- Fieldwork has no Fieldwork-operated telemetry; releases ship signed Git tags and SHA256 checksums ([docs/supply-chain.md](docs/supply-chain.md)).
+The first command is sandboxed and writes only `meta.json` and `pack` to a
+private per-UID spool. The second is a root-installed, subprocess-free uploader.
+It is the only delivery client excluded from the agent network sandbox.
 
-Read [SECURITY.md](SECURITY.md) and [docs/threat-model.md](docs/threat-model.md) before trusting Fieldwork with a serious repository.
+## Security properties
+
+- The broker never reads an agent checkout.
+- Repository destinations, base branches, approval mode, CA material, and
+  private-network opt-in are broker-owned policy.
+- `approval=require` performs no forge write before approval; deny and expiry
+  perform none.
+- Pending metadata is MAC-protected; packs and MAC keys are broker-only.
+- Forge DNS answers are classified and pinned; redirects are disabled.
+- GitHub and GitLab PR/MR creation use host-pinned REST, not `gh` or `glab`.
+- Boundary runners and adapters are root-owned system assets.
+- Telegram messages are rendered from a typed enum, never producer text.
+
+Read [the architecture](docs/architecture.md), [broker contract](docs/broker-contract.md),
+and [threat model](docs/threat-model.md) before using Fieldwork for a serious
+repository.
 
 ## Developer preview
 
-> [!IMPORTANT]
-> Fieldwork is a developer preview.
->
-> Supported today: Ubuntu 24.04 VPSes, GitHub, core GitLab, Claude Code, and Codex Desktop over SSH.
->
-> Not yet: hosted Fieldwork, Windows-only setup, Gitea, team RBAC, or automatic updates.
+Supported today: Ubuntu 24.04 VPS; GitHub; experimental self-managed GitLab;
+Claude; and VPS Codex over SSH. The local macOS/Linux implementation is present
+but remains behind the acceptance gate above.
 
-See [docs/known-limitations.md](docs/known-limitations.md) and [docs/developer-preview.md](docs/developer-preview.md) for the full list.
-
-## Read next
-
-- [Quickstart](docs/quickstart.md): short guided VPS path.
-- [Full setup](docs/setup.md): complete setup guide.
-- [Architecture](docs/architecture.md): full system map.
-- [Threat model](docs/threat-model.md): trust boundaries and defenses.
-
-Running the broker for a different agent? See the [advanced broker-only install](docs/broker-standalone.md).
+Deferred: local Codex hard-boundary mode, SHA-256 Git repositories, GHES,
+Gitea, team RBAC, and automatic upgrades. See [known limitations](docs/known-limitations.md).
 
 ## Contributing
 
-Fieldwork is security-sensitive infrastructure. Small, focused PRs are easiest to review. Start with [CONTRIBUTING.md](CONTRIBUTING.md).
+Fieldwork is security-sensitive infrastructure. Prefer small changes with
+focused adversarial tests. Start with [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 

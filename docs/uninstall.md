@@ -7,7 +7,7 @@ fieldwork uninstall
 ```
 
 It prints a plan first, then asks for confirmation. The default scope removes
-Fieldwork-managed local files, remote user services/scripts, the PR broker, and
+Fieldwork-managed local files, root-owned remote boundary services/scripts, the PR broker, and
 the approval bot when they are discovered.
 
 It does **not** remove repositories, GitHub pull requests, SSH keys, non-Fieldwork
@@ -31,14 +31,18 @@ fieldwork uninstall --local
 ```
 
 Removes only local Fieldwork-owned CLI, config, `.fieldwork`, and marked Claude discovery symlinks/files.
+The separate root-owned local-mode stack is removed with
+`sudo fieldwork-local uninstall`, which asks again before deleting its
+dedicated projects tree.
 
 ```sh
 fieldwork uninstall --remote
 ```
 
-Removes only remote user-level Fieldwork services, scripts, and synced checkout.
-It stops `fieldwork-agent@*.service` sessions and the verify/PR-prepare runner
-sockets, but keeps repo checkouts and worktrees.
+Removes the root-owned remote session boundary, its pinned Claude executable,
+managed policy, delivery clients, stale user-scoped units, scripts, and synced
+Fieldwork checkout. It stops `fieldwork-agent@*.service` sessions and the
+verify/PR-prepare runner sockets, but keeps repository checkouts and worktrees.
 
 ```sh
 fieldwork uninstall --broker
@@ -156,7 +160,7 @@ path is the ownership boundary.
 stop its remote session and remove its forge deploy key manually:
 
 ```sh
-ssh fieldwork-vps 'systemctl --user disable --now fieldwork-agent@<slug>'
+ssh -t fieldwork-vps 'sudo systemctl disable --now fieldwork-agent@<slug>'
 ```
 
 Keep or remove the VPS checkout under `~/projects/<slug>` yourself after copying

@@ -3,9 +3,9 @@
 This directory is a **no-VPS evaluation harness**. It is evaluation only and
 intentionally not a production deployment topology.
 
-It demonstrates the broker request contract, approval queue, fake GitHub PR
-creation, and broker audit log without a VPS, real GitHub PAT, Claude account,
-Telegram bot, or onboarded repository.
+It demonstrates the protocol-v2 metadata/pack contract, real Git quarantine,
+zero-write approval gate, durable auto mode, tombstones, and idempotent resume
+without a VPS, forge credential, Claude account, or Telegram bot.
 
 Run:
 
@@ -16,6 +16,6 @@ fieldwork eval logs
 fieldwork eval down
 ```
 
-The harness uses fake `gh` and `gitleaks` commands inside the container.
-Production Fieldwork still runs on a VPS with separate Unix identities and a
-real broker-owned GitHub token.
+The harness uses the fake `gitleaks` scanner inside the container. Production
+Fieldwork uses either the local Docker boundary or separate VPS identities and
+a broker-owned forge credential.

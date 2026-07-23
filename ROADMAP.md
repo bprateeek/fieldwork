@@ -21,11 +21,17 @@
 
 ## Next
 
-- Local shell evaluation mode.
+- Homebrew and Debian packages that absorb the signing-key/provenance bootstrap.
+- Local Codex mode when equivalent managed tool, network, and per-command
+  exclusion controls exist.
+- SHA-256 Git object format and binary pack framing.
+- GHES support; faithful fake self-managed GitLab HTTPS API and promotion of
+  GitLab local mode from experimental.
 - Gitea broker implementation and deeper GitLab parity (branch protection,
-  secret scanning, CodeQL/status surfaces, and event-poller MR merge detection).
+  CodeQL/status surfaces, and event-poller MR merge detection).
 - Additional approval transports such as Slack or a small web UI.
-- Codex journaling, resume-context, lifecycle notifications, and stronger Fieldwork-managed sandbox parity.
+- Desktop-notification approvals and local verify-runner parity.
+- Codex journaling, resume-context, and lifecycle notifications.
 - Additional Fieldwork-launched agent adapters.
-- Homebrew and Debian packaging.
 - Richer session history beyond broker events.
+- Wider slug character support after policy/storage ambiguity review.

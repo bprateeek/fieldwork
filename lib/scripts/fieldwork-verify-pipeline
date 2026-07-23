@@ -7,7 +7,7 @@
 # script an execution context where bwrap can create user namespaces — the
 # agent process sets PR_SET_NO_NEW_PRIVS and lives in its own userns, which
 # blocks the AppArmor profile transition bwrap needs. The runner runs under
-# the user manager (systemd --user), outside that confinement.
+# the root-owned system manager, outside that confinement.
 #
 # Each inner step is re-confined inside its own network-off bwrap sandbox
 # (fail-closed if bwrap cannot create the required namespaces), so a malicious

@@ -61,9 +61,10 @@ health_local_checks() {
   else
     printf 'cmd=missing\n'
   fi
-  if [ -x "$HOME/.fieldwork/scripts/fieldwork-pr-submit" ] \
-    && [ -x "$HOME/.fieldwork/scripts/fieldwork-verify" ] \
-    && [ -x "$HOME/.fieldwork/scripts/fieldwork-pr-prepare" ] \
+  if { [ -x /usr/local/bin/fieldwork-pr-build ] || [ -x "$HOME/.fieldwork/scripts/fieldwork-pr-build" ]; } \
+    && { [ -x /usr/local/bin/fieldwork-pr-upload ] || [ -x "$HOME/.fieldwork/scripts/fieldwork-pr-upload" ]; } \
+    && { [ -x /usr/local/bin/fieldwork-verify ] || [ -x "$HOME/.fieldwork/scripts/fieldwork-verify" ]; } \
+    && { [ -x /usr/local/bin/fieldwork-pr-prepare ] || [ -x "$HOME/.fieldwork/scripts/fieldwork-pr-prepare" ]; } \
     && [ -f "$HOME/.fieldwork/agents" ]; then
     printf 'helpers=ok\n'
   else

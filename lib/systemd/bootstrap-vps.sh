@@ -617,53 +617,16 @@ else
   ok "agent CLI bootstrap skipped"
 fi
 
-# ----- 8.5. Fieldwork user systemd units -----
-step "Fieldwork systemd units"
-mkdir -p "$HOME/.config/systemd/user"
-units_installed=0
-units=(
-  fieldwork-dashboard.service
-  fieldwork-event-poll.service
-  fieldwork-event-poll.timer
-  fieldwork-task-dispatcher.service
-  fieldwork-verify-runner.socket
-  fieldwork-verify-runner@.service
-  fieldwork-pr-prepare-runner.socket
-  fieldwork-pr-prepare-runner@.service
-)
-if bootstrap_agent_enabled claude; then
-  units=(fieldwork-agent@.service "${units[@]}")
-fi
-for unit in "${units[@]}"; do
-  src="$HOME/.fieldwork/infra/$unit"
-  if [ -f "$src" ]; then
-    run_quiet "$unit copied" cp "$src" "$HOME/.config/systemd/user/"
-    units_installed=$((units_installed + 1))
-  else
-    note "$src missing. Run Fieldwork install.sh, then re-run bootstrap-vps."
-  fi
-done
-if [ "$units_installed" -gt 0 ]; then
-  run_optional "user systemd daemon reloaded" systemctl --user daemon-reload || note "user systemd daemon-reload failed; retry after reconnecting"
-fi
-# Enable + restart the runner sockets and poll timer. The sockets are cheap
-# (no daemon process until first connect) and the agent's verify-before-pr skill
-# expects them to exist; failing here is fail-fast onboarding, not runtime
-# breakage. The restart after enable is what makes a re-bootstrap apply changed
-# unit settings (e.g. socket MaxConnections); enable --now alone does not re-read
-# an already-active unit. Already-accepted runner @ instances run as separate
-# units and are not stopped by restarting the listening socket.
-for unit in fieldwork-verify-runner.socket fieldwork-pr-prepare-runner.socket fieldwork-event-poll.timer fieldwork-task-dispatcher.service; do
-  if [ -f "$HOME/.config/systemd/user/$unit" ]; then
-    run_optional "$unit enabled" \
-      systemctl --user enable --now "$unit" \
-      || note "could not enable $unit; rerun: systemctl --user enable --now $unit"
-    run_optional "$unit restarted to apply current settings" \
-      systemctl --user restart "$unit" \
-      || note "could not restart $unit; rerun: systemctl --user restart $unit"
-  fi
-done
-ok "Fieldwork systemd units installed"
+# ----- 8.5. Root-owned Fieldwork boundary -----
+step "Fieldwork root-owned boundary"
+boundary_installer="$SCRIPT_DIR/install-boundary.sh"
+[ -f "$boundary_installer" ] || {
+  note "$boundary_installer is missing; reinstall the verified Fieldwork artifact"
+  exit 1
+}
+run_quiet "root-owned Fieldwork boundary installed" \
+  SUDO env FIELDWORK_REMOTE_USER="$USER" bash "$boundary_installer"
+ok "Fieldwork root-owned system units installed"
 
 # ----- post -----
 echo

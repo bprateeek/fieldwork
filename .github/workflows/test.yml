@@ -11,10 +11,10 @@ permissions:
 
 jobs:
   tests:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: static-checks.sh
         run: bash tests/static-checks.sh
@@ -32,10 +32,10 @@ jobs:
         run: bash tests/task-dispatcher-tests.sh
 
   shellcheck:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Install shellcheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
@@ -48,17 +48,104 @@ jobs:
           grep -rlE '^#!.*\b(bash|sh)\b' bin lib tests examples install.sh 2>/dev/null \
             | sort -u | tee /dev/stderr | xargs -r shellcheck -S error
 
-  eval-smoke:
-    runs-on: ubuntu-latest
+  macos-clients:
+    runs-on: macos-15
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - name: eval up + smoke
+      - name: Client syntax and macOS launchd contract
+        run: |
+          while IFS= read -r file; do bash -n "$file"; done \
+            < <(grep -rlE '^#!.*\b(bash|sh)\b' bin lib tests examples install.sh 2>/dev/null | sort -u)
+          python3 -m py_compile \
+            lib/scripts/fieldwork-pr-build lib/scripts/fieldwork-pr-upload \
+            lib/scripts/fieldwork-pr-prepare examples/broker-client.py \
+            lib/local/control/fieldwork-local-probe
+          python3 - <<'PY'
+          import xml.etree.ElementTree as ET
+          ET.parse("lib/local/com.fieldwork.spool-init.plist")
+          PY
+          python3 examples/broker-client.py --help >/dev/null
+
+      - name: LaunchDaemon bootstrap and volatile-path recreation simulation
+        run: |
+          probe_plist="$RUNNER_TEMP/com.fieldwork.spool-init.ci.plist"
+          installed_plist=/Library/LaunchDaemons/com.fieldwork.spool-init.ci.plist
+          cleanup() {
+            sudo launchctl bootout system/com.fieldwork.spool-init.ci >/dev/null 2>&1 || true
+            sudo rm -f "$installed_plist"
+          }
+          trap cleanup EXIT
+          cp lib/local/com.fieldwork.spool-init.plist "$probe_plist"
+          /usr/libexec/PlistBuddy -c 'Set :Label com.fieldwork.spool-init.ci' "$probe_plist"
+          /usr/libexec/PlistBuddy -c 'Set :ProgramArguments:0 /usr/bin/true' "$probe_plist"
+          sudo install -o root -g wheel -m 0644 "$probe_plist" "$installed_plist"
+          sudo launchctl bootstrap system "$installed_plist"
+          sudo launchctl bootout system/com.fieldwork.spool-init.ci
+
+          volatile_root="$RUNNER_TEMP/fieldwork-volatile"
+          rm -rf "$volatile_root"
+          install -d -m 0755 "$volatile_root"
+          test -d "$volatile_root"
+
+      - name: Hermetic client and broker validation
+        run: |
+          python3 tests/pr-prepare-validation-tests.py
+          python3 tests/broker-validation-tests.py
+
+  container-architectures:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: linux/amd64
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Build pinned local image on native architecture
+        run: |
+          docker buildx build \
+            --platform "${{ matrix.platform }}" \
+            --load \
+            --tag "fieldwork-local-ci:${{ matrix.arch }}" \
+            --file lib/local/Dockerfile .
+
+  local-smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Start the real local broker and query through the excluded uploader
+        run: |
+          docker compose -p fieldwork-local-ci -f lib/local/docker-compose.yml config >/dev/null
+          docker compose -p fieldwork-local-ci -f lib/local/docker-compose.yml up -d --build broker
+          token="$(docker compose -p fieldwork-local-ci -f lib/local/docker-compose.yml \
+            exec -T broker /usr/local/bin/fieldwork-local-entrypoint read-http-auth)"
+          install -d -m 700 "$HOME/.fieldwork"
+          umask 077
+          printf '%s\n' "$token" >"$HOME/.fieldwork/http-auth"
+          status=0
+          output="$(python3 -I lib/scripts/fieldwork-pr-upload \
+            --status 00000000-0000-4000-8000-000000000001 2>&1)" || status=$?
+          test "$status" -eq 1
+          grep -Fq unknown_request <<<"$output"
+
+      - name: Hermetic pack and approval smoke
         run: |
           bash bin/fieldwork eval up
           bash bin/fieldwork eval smoke
 
-      - name: eval down
+      - name: Tear down local and evaluation containers
         if: always()
-        run: bash bin/fieldwork eval down || true
+        run: |
+          bash bin/fieldwork eval down || true
+          docker compose -p fieldwork-local-ci -f lib/local/docker-compose.yml down -v --remove-orphans || true

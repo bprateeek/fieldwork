@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Root-only discrete maintenance-mode transaction for the VPS broker.
+set -euo pipefail
+[ "$(id -u)" -eq 0 ] || { echo "maintenance-mode must run as root" >&2; exit 1; }
+case "${1:-}" in start|stop) ;; *) echo "usage: fieldwork-pr-maintenance-mode start|stop" >&2; exit 2 ;; esac
+
+dropin_dir=/run/systemd/system/fieldwork-pr-broker.service.d
+dropin="$dropin_dir/maintenance.conf"
+units="fieldwork-pr-broker.service fieldwork-pr-broker.socket fieldwork-pr-approve.socket fieldwork-pr-broker-maintenance.socket"
+systemctl stop $units
+if [ "$1" = start ]; then
+  install -d -o root -g root -m 0755 "$dropin_dir"
+  temp="$dropin_dir/.maintenance.conf.$$"
+  printf '%s\n' '[Service]' 'Environment=FIELDWORK_BROKER_MAINTENANCE=1' >"$temp"
+  chown root:root "$temp"
+  chmod 0644 "$temp"
+  mv "$temp" "$dropin"
+else
+  rm -f "$dropin"
+  rmdir "$dropin_dir" 2>/dev/null || true
+fi
+systemctl daemon-reload
+if [ "$1" = start ]; then
+  # All sockets must be listening before the service starts so systemd passes
+  # the root-only maintenance fd into this exact broker process.
+  systemctl start fieldwork-pr-broker.socket fieldwork-pr-approve.socket fieldwork-pr-broker-maintenance.socket
+  systemctl start fieldwork-pr-broker.service
+  echo "Fieldwork broker maintenance mode started; normal submission and approval return 503."
+else
+  systemctl start fieldwork-pr-broker.socket fieldwork-pr-approve.socket
+  systemctl start fieldwork-pr-broker.service
+  echo "Fieldwork broker maintenance mode cleared by a clean restart; the maintenance socket is stopped."
+fi

@@ -7,7 +7,7 @@ Fieldwork is a developer-preview tool for running mobile-driven coding-agent wor
 - Make surgical changes that map directly to the task.
 - Preserve the Claude discovery tree under `.claude/` unless a change explicitly targets Claude behavior.
 - Fieldwork-owned repo state lives under `.fieldwork/`.
-- Delivery clients stay on `~/.local/bin`: `fieldwork-verify`, `fieldwork-pr-prepare`, and `fieldwork-pr-submit`.
+- Escape-side delivery clients are root-owned at `/usr/local/bin`: `fieldwork-verify`, `fieldwork-pr-prepare`, and `fieldwork-pr-upload`. `fieldwork-pr-build` remains sandboxed.
 - Never log secrets or put token-shaped values in examples.
 
 ## Verification
@@ -23,12 +23,15 @@ python3 tests/bot-tests.py
 
 ## Fieldwork Delivery Workflow
 
-When preparing a PR from an onboarded VPS checkout:
+When preparing a PR from an onboarded checkout, verify first and ensure every
+intended change is committed (use the root-owned prepare runner when the agent
+sandbox cannot commit). Then perform the upload phase as two separate top-level
+tool calls:
 
-1. Run `/home/fieldwork/.local/bin/fieldwork-verify "$PWD"`.
-2. Write `.fieldwork/local/pr-prepare-request.json`.
-3. Run `/home/fieldwork/.local/bin/fieldwork-pr-prepare .fieldwork/local/pr-prepare-request.json`.
-4. Write `.fieldwork/local/pr-request.json`.
-5. Run `/home/fieldwork/.local/bin/fieldwork-pr-submit .fieldwork/local/pr-request.json`.
+1. Run `fieldwork-pr-build .fieldwork/local/pr-build-request.json` and record the UUID it prints.
+2. Run `/usr/local/bin/fieldwork-pr-upload <request-id>` as a separate call.
 
-Use `fieldwork/...` branches only. Never push directly to GitHub; the broker and approval gate are part of the security boundary.
+The build input contains `slug`, a `fieldwork/...` branch, `title`, and `body`;
+the builder resolves `head_oid`, creates a non-thin pack, and refuses a dirty
+worktree. Never combine build and upload in one shell command, and never push
+directly—the checkout-blind broker reconstructs, scans, and policy-gates the pack.

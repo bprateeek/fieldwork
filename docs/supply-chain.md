@@ -1,53 +1,96 @@
-# Install Integrity And Releases
+# Supply-chain verification
 
-Fieldwork is security infrastructure, so the install path matters too.
+Fieldwork requires two independent chains before candidate code executes:
 
-Recommended developer preview install path:
+1. An operator-pinned SSH signing key verifies the Git tag.
+2. A separately protected, commit-pinned trusted builder attests the release
+   archive.
 
-```sh
-git clone https://github.com/bprateeek/fieldwork.git ~/fieldwork
-cd ~/fieldwork
-git fetch --tags
-git tag -v v0.1.0
-bash install.sh
+Neither chain substitutes for the other. The candidate repository cannot build
+an acceptable archive or schedule the authenticated hard-boundary probe runner.
+
+## External trusted-builder prerequisite
+
+Before a release, deploy a trusted workflow in a separately protected
+repository and pin all of these in the `trusted-builder-dispatch` environment:
+
+- `FIELDWORK_TRUSTED_BUILDER_REPOSITORY`
+- `FIELDWORK_TRUSTED_BUILDER_WORKFLOW`
+- `FIELDWORK_TRUSTED_BUILDER_REF`
+- `FIELDWORK_TRUSTED_BUILDER_WORKFLOW_SHA` (full 40-character commit)
+- secret `FIELDWORK_TRUSTED_BUILDER_DISPATCH_TOKEN`
+
+The workflow must independently verify the signed source tag, build with fixed
+`git archive` logic without executing candidate release scripts, attest the
+archive, and publish it. Its authenticated macOS/Linux probes run only on a
+restricted ephemeral runner group. The candidate `release.yml` can request
+that workflow but cannot mint provenance or target the runner.
+
+The dispatch inputs are untrusted hints: `source_repository`, `source_ref`,
+`source_event_oid`, and `expected_workflow_sha`. The trusted workflow must check
+its own immutable identity, fetch and verify the tag, and derive the peeled
+commit itself; it must never treat the candidate event OID as the provenance
+source digest.
+
+## First-install tag anchor
+
+Obtain the maintainer SSH signing public key through an independent channel.
+Store an allowed-signers file outside the downloaded repository, root-owned and
+not writable by the installing user. For example:
+
+```text
+fieldwork-release namespaces="git" ssh-ed25519 AAAA... independently-obtained-key
 ```
 
-When release archives are published, verify checksums before installing:
+Fetch tag objects without executing repository code, then verify:
 
 ```sh
-shasum -a 256 -c SHA256SUMS
+git -c gpg.format=ssh \
+  -c gpg.ssh.allowedSignersFile=/usr/local/etc/fieldwork/allowed_signers \
+  verify-tag vX.Y.Z
+commit="$(git rev-parse 'vX.Y.Z^{commit}')"
+test "$(git cat-file -t "$commit")" = commit
 ```
 
-Fieldwork does not recommend blind `curl | bash` installs. Review the tag,
-checkout, or release archive before running `install.sh`.
+Keep the allowed-signers file as the upgrade trust anchor. Key rotation is an
+explicit operator event confirmed through the same independent channel.
 
-Bootstrap installs host packages such as GitHub CLI, Claude Code support,
-Docker support, bubblewrap, gitleaks, semgrep, jq, git, curl, and systemd
-support tools using the host package manager or vendor install path documented
-by those projects. Developer preview releases document intentionally unpinned
-dependencies in release notes when they matter for reproducibility.
+## Archive provenance
 
-Dependency posture for developer preview:
+Download the archive and its attestation from the trusted builder. Pin both the
+workflow path and workflow commit:
 
-| Dependency area | Posture | Rationale |
-|---|---|---|
-| Fieldwork source | signed release tag and source archive checksum | users can verify the exact Fieldwork checkout or archive before install |
-| Codex CLI installed by setup | pinned npm package by default (`@openai/codex@0.137.0`, override with `FIELDWORK_CODEX_NPM_PACKAGE`) | keeps Codex setup reproducible while allowing operator override |
-| gitleaks | pinned release archive with upstream checksum verification | broker and verify paths rely on secret scanning |
-| Node.js, GitHub CLI, OS packages | distro/vendor apt repositories, not pinned per package | preview bootstrap favors supported update streams over snapshot management |
-| Claude Code and rootless Docker installers | vendor install path, not pinned by Fieldwork | these tools are external runtimes with their own release channels |
-| semgrep rules | live `p/owasp-top-ten` config when semgrep is installed | verify checks should catch current common web risks, not a stale local ruleset |
-| GitHub Actions runners/actions | `ubuntu-latest` and major-pinned actions | public CI stays simple; release gates also require local and VPS rehearsal |
+```sh
+gh attestation verify fieldwork-vX.Y.Z.tar.gz \
+  --repo bprateeek/fieldwork \
+  --signer-workflow owner/trusted-builder/.github/workflows/fieldwork-release.yml \
+  --signer-digest <trusted-builder-workflow-commit> \
+  --source-ref refs/tags/vX.Y.Z \
+  --source-digest "$commit"
+```
 
-Release checklist:
+The verification must bind the archive subject digest, source tag, peeled source
+commit, workflow identity, and workflow digest. A valid attestation from the
+candidate repository or a different trusted-builder commit is not acceptable.
 
-- worktree is clean
-- changelog has the release entry
-- tests pass
-- Docker eval smoke passes
-- clean VPS setup path has been rehearsed
-- Claude E2E passes
-- Codex E2E passes
-- signed tag exists
-- GitHub Release is published
-- checksums are published for archives and verified
+Only after both checks succeed:
+
+```sh
+mkdir fieldwork-vX.Y.Z
+tar -xzf fieldwork-vX.Y.Z.tar.gz -C fieldwork-vX.Y.Z --strip-components=1
+cd fieldwork-vX.Y.Z
+sudo bash lib/local/install.sh        # local mode
+# or run the documented VPS root installers
+```
+
+`gh`, Git, and SSH tooling are bootstrap dependencies only. The running broker
+uses Git plus host-pinned REST and does not invoke GitHub CLI.
+
+## Fail-closed rules
+
+- Never install from a source checkout whose tag was not verified.
+- Never accept provenance based only on repository or workflow filename.
+- Never use a mutable branch, tag, or short SHA for the trusted builder.
+- Never run candidate install or release scripts before both chains pass.
+- A changed Claude executable digest disables the hard-boundary claim until the
+  hostile probe is rerun.
