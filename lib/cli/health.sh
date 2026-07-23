@@ -231,7 +231,7 @@ _health_render_remote() {
   elif [ "$bsubmit" = bad ]; then
     _health_row needs "Broker" "preflight route failing"
   elif [ "$btool" != ok ]; then
-    _health_row needs "Broker" "rotate-pat tool missing. Run fieldwork setup."
+    _health_row needs "Broker" "control helper missing. Run fieldwork setup."
   else
     _health_row ok "Broker"
   fi

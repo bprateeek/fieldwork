@@ -97,6 +97,9 @@ grep -Fq 'f"--max-input-size={PACK_MAX_INPUT}"' lib/broker/server.py
 grep -Fq 'unexpected_objects' lib/broker/server.py
 grep -Fq 'allow_private_network' lib/broker/server.py
 grep -Fq 'hmac.compare_digest' lib/broker/server.py
+grep -Fq 'def broker_preflight(' lib/broker/server.py
+grep -Fq '"invalid_preflight_request"' lib/broker/server.py
+grep -Fq 'http://localhost/preflight' lib/scripts/fieldwork-onboard
 grep -Fq 'socket_type == "maintenance" and not MAINTENANCE' lib/broker/server.py
 grep -Fq '/usr/local/lib/fieldwork-pr-broker' lib/broker/policy_writer.py
 grep -Fq 'os.fchown' lib/broker/policy_writer.py
@@ -138,6 +141,8 @@ grep -Fq -- '--add-dir /usr/local/share/fieldwork-claude' lib/scripts/fieldwork-
 grep -Fq 'remote_claude_pin_current' lib/cli/setup.sh
 grep -Fq 'silent for up to 180 seconds' lib/scripts/fieldwork-session-probe-record
 grep -Fq 'FIELDWORK_SESSION_PROBE=1 /usr/local/lib/fieldwork/fieldwork-session-probe' bin/fieldwork
+grep -Fq 'test -x /usr/local/sbin/fieldwork-policy-write' \
+  bin/fieldwork lib/cli/setup.sh lib/scripts/fieldwork-setup-probe lib/scripts/fieldwork-onboard
 grep -Fq 'dashboard remains disabled' lib/systemd/install-boundary.sh
 grep -Fq '"$AGENT_HOME/.claude/settings.json" "$AGENT_HOME/.claude/CLAUDE.md"' lib/systemd/install-boundary.sh
 grep -Fq 'disabled="$path.user-scope-disabled"' lib/systemd/install-boundary.sh

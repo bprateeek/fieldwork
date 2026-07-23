@@ -1186,7 +1186,7 @@ broker_socket="/run/fieldwork-pr-broker/fieldwork-pr.sock"
 approve_socket="/run/fieldwork-pr-broker/fieldwork-pr-approve.sock"
 pending_dir="/var/lib/fieldwork-pr-broker/pending"
 
-if [ -S "$broker_socket" ] && printf '{}' | curl -sS --max-time 3 --unix-socket "$broker_socket" -H 'Content-Type: application/json' --data-binary @- http://localhost/preflight 2>/dev/null | grep -Fq 'preflight request missing required field: repo'; then
+if [ -S "$broker_socket" ] && printf '{}' | curl -sS --max-time 3 --unix-socket "$broker_socket" -H 'Content-Type: application/json' --data-binary @- http://localhost/preflight 2>/dev/null | grep -Fq '"error":"invalid_preflight_request"'; then
   emit BROKER_SUBMIT_STATUS ok
   emit BROKER_SUBMIT_DETAIL reachable
 elif [ -S "$broker_socket" ]; then
@@ -1484,7 +1484,7 @@ remote_projects_dir_exists() {
 }
 
 broker_preflight_contract_ok() {
-  ssh "$FIELDWORK_SSH_HOST" "printf '{}' | curl -sS --unix-socket /run/fieldwork-pr-broker/fieldwork-pr.sock -H 'Content-Type: application/json' --data-binary @- http://localhost/preflight 2>/dev/null | grep -Fq 'preflight request missing required field: repo'" >/dev/null 2>&1
+  ssh "$FIELDWORK_SSH_HOST" "printf '{}' | curl -sS --unix-socket /run/fieldwork-pr-broker/fieldwork-pr.sock -H 'Content-Type: application/json' --data-binary @- http://localhost/preflight 2>/dev/null | grep -Fq '\"error\":\"invalid_preflight_request\"'" >/dev/null 2>&1
 }
 
 fieldwork_sudoers_path() {
@@ -1975,7 +1975,12 @@ status_for prepare_runner sh -c 'test -f /etc/systemd/system/fieldwork-pr-prepar
 status_for claude_service test -f /etc/systemd/system/fieldwork-agent@.service
 broker_checks_start="$(timing_now)"
 status_for broker_socket sh -c 'test -S /run/fieldwork-pr-broker/fieldwork-pr.sock && test -w /run/fieldwork-pr-broker/fieldwork-pr.sock'
-status_for broker_pat_tool test -f /usr/local/sbin/rotate-pat
+status_for broker_pat_tool sh -c \
+  'test -f /usr/local/sbin/rotate-pat &&
+   test -x /usr/local/sbin/fieldwork-policy-write &&
+   test -f /usr/local/sbin/fieldwork-pr-maintenance-submit &&
+   test -f /usr/local/sbin/fieldwork-pr-maintenance-mode &&
+   test -f /usr/local/sbin/fieldwork-migrate-instructions'
 status_for broker_thin_client sh -c 'test -x /usr/local/bin/fieldwork-pr-build && test -x /usr/local/bin/fieldwork-pr-upload'
 status_for broker_pat_marker test -f "$HOME/.fieldwork/state/broker-pat-confirmed"
 status_for broker_pat_sudo broker_pat_sudo
@@ -3111,10 +3116,15 @@ EOF
 	      fi
 
 	      doctor_section "PR broker"
-	      [ "$explain" = "1" ] && doctor_info "purpose" "verify the separate broker that owns the GitHub write token"
-      ssh "$FIELDWORK_SSH_HOST" "test -f /usr/local/sbin/rotate-pat" \
+      [ "$explain" = "1" ] && doctor_info "purpose" "verify the separate broker that owns the GitHub write token"
+      ssh "$FIELDWORK_SSH_HOST" \
+        "test -f /usr/local/sbin/rotate-pat \
+          && test -x /usr/local/sbin/fieldwork-policy-write \
+          && test -f /usr/local/sbin/fieldwork-pr-maintenance-submit \
+          && test -f /usr/local/sbin/fieldwork-pr-maintenance-mode \
+          && test -f /usr/local/sbin/fieldwork-migrate-instructions" \
         && doctor_ok "PR broker installer ran" \
-        || doctor_manual "PR broker install needed" "fieldwork setup" "the broker daemon and rotate-pat helper are not installed yet" "the broker is the only component with the GitHub write token, so onboarding cannot open PRs without it" "run fieldwork setup and complete Install PR services" "yes"
+        || doctor_manual "PR broker install needed" "fieldwork setup" "one or more broker control helpers are missing" "the broker is the only component with the GitHub write token, so onboarding cannot open PRs without its policy writer and credential helpers" "run fieldwork setup and complete Install PR services" "yes"
       if ssh "$FIELDWORK_SSH_HOST" "test -S /run/fieldwork-pr-broker/fieldwork-pr.sock && test -w /run/fieldwork-pr-broker/fieldwork-pr.sock"; then
         doctor_ok "PR broker socket present and writable"
         broker_preflight_contract_ok \

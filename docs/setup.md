@@ -103,9 +103,11 @@ fieldwork onboard owner/app
 ```
 
 Onboarding creates a read-only deploy-key clone and repository instructions,
-then writes the broker policy through the privileged policy writer. Policy
-contains project, base branch, approval, fixed forge endpoints, CA reference,
-and private-network choice. Approval defaults to `require`.
+then writes the broker policy through the privileged policy writer. It performs
+a checkout-blind broker preflight against the policy slug before creating init
+artifacts, so a stale credential or missing repository grant fails early.
+Policy contains project, base branch, approval, fixed forge endpoints, CA
+reference, and private-network choice. Approval defaults to `require`.
 
 For self-managed GitLab, explicitly confirm the HTTPS API/Git host and private
 CA. Any access to private address space requires the policy opt-in.

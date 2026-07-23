@@ -75,6 +75,20 @@ Policy reads and writes use no-follow checks and per-slug locks. A digest of the
 full policy is recorded with pending work. Any change before a forge write
 moves the request to `needs_operator`.
 
+## Credential preflight
+
+Onboarding sends `POST /preflight {"slug":"example"}` after the privileged
+policy writer has wired the repository. The broker resolves the project and
+base branch only from that root-owned policy, obtains its broker-owned
+credential, and performs a bounded, DNS-pinned `git ls-remote` for the exact
+base-branch ref. It returns `{"ok":true,"slug":"example","state":"ready"}` only
+when the credential can read that ref. The request accepts no checkout path,
+forge URL, project, or branch from the agent.
+
+An empty object returns the fixed `invalid_preflight_request` error; setup
+health checks use that response to detect the current route contract without
+selecting a repository or exercising a credential.
+
 ## Quarantine
 
 The broker fetches only the named base branch, indexes the uploaded pack into a

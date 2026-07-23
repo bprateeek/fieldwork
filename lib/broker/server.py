@@ -1221,6 +1221,41 @@ def remote_branch_oid(policy: dict[str, object], req: ValidatedRequest, token_pa
     return oid
 
 
+def broker_preflight(value: object, deadline: Deadline) -> dict[str, object]:
+    """Verify one wired repository through the broker-owned credential.
+
+    Protocol v2 stays checkout-blind: the agent supplies only a policy slug,
+    and the root-owned policy selects the forge project and base branch.
+    """
+    if not isinstance(value, dict) or set(value) != {"slug"}:
+        raise RequestError("invalid_preflight_request")
+    slug = value["slug"]
+    if not isinstance(slug, str) or not SLUG_RE.fullmatch(slug):
+        raise RequestError("invalid_preflight_request")
+    try:
+        with policy_lock(POLICY_DIR, slug):
+            policy = read_policy(POLICY_DIR, slug)
+            url = f"{str(policy['git_base_url']).rstrip('/')}/{policy['project']}.git"
+            expected_ref = f"refs/heads/{policy['base_branch']}"
+            with credential(policy, deadline) as token_path:
+                result = network_git(
+                    policy, ["ls-remote", "--heads", url, expected_ref],
+                    url, token_path, deadline, timeout_cap=30,
+                )
+    except PolicyError as exc:
+        if str(exc) == "repo_not_wired":
+            raise RequestError("repo_not_wired", 404) from exc
+        raise RequestError("policy_invalid", 503, detail=str(exc)) from exc
+    try:
+        lines = bytes(result.stdout).decode("ascii", "strict").strip().splitlines()
+    except UnicodeDecodeError as exc:
+        raise RequestError("forge_invalid_ref", 502) from exc
+    fields = lines[0].split() if len(lines) == 1 else []
+    if len(fields) != 2 or not OID_RE.fullmatch(fields[0]) or fields[1] != expected_ref:
+        raise RequestError("base_branch_not_found", 404)
+    return {"ok": True, "slug": slug, "state": "ready"}
+
+
 def push_head(repo: Path, policy: dict[str, object], req: ValidatedRequest, token_path: Path, deadline: Deadline) -> None:
     url = f"{str(policy['git_base_url']).rstrip('/')}/{policy['project']}.git"
     network_git(
@@ -1764,6 +1799,10 @@ def handle(conn: socket.socket, socket_type: str = "agent") -> None:
         elif path == "/pr-status":
             result = pr_status(_json_body(body_path))
             request_id = str(result.get("request_id", request_id))
+        elif path == "/preflight":
+            if socket_type == "approve":
+                raise RequestError("route_not_available", 404)
+            result = broker_preflight(_json_body(body_path), deadline)
         else:
             raise RequestError("route_not_available", 404)
         audit_event("request_complete", request_id=request_id, transport=socket_type, status=200, state=result.get("state"))

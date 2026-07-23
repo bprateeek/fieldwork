@@ -1375,12 +1375,18 @@ EOF
     ssh "$FIELDWORK_SSH_HOST" "test -S /run/fieldwork-pr-broker/fieldwork-pr.sock && test -w /run/fieldwork-pr-broker/fieldwork-pr.sock" >/dev/null 2>&1
   }
   broker_pat_tool_installed() {
-    if fieldwork_setup_snapshot_is_ok broker_pat_tool; then
+    if [ "$FIELDWORK_SETUP_SNAPSHOT_DIRTY" != "1" ] \
+      && fieldwork_setup_snapshot_is_ok broker_pat_tool; then
       return 0
     elif [ "$FIELDWORK_SETUP_SNAPSHOT_READY" = "1" ] && [ "$FIELDWORK_SETUP_SNAPSHOT_DIRTY" != "1" ]; then
       return 1
     fi
-    ssh "$FIELDWORK_SSH_HOST" "test -f /usr/local/sbin/rotate-pat" >/dev/null 2>&1
+    ssh "$FIELDWORK_SSH_HOST" \
+      "test -f /usr/local/sbin/rotate-pat \
+        && test -x /usr/local/sbin/fieldwork-policy-write \
+        && test -f /usr/local/sbin/fieldwork-pr-maintenance-submit \
+        && test -f /usr/local/sbin/fieldwork-pr-maintenance-mode \
+        && test -f /usr/local/sbin/fieldwork-migrate-instructions" >/dev/null 2>&1
   }
   broker_thin_client_installed() {
     # Protocol-v2 delivery clients are immutable root-owned copies.
@@ -2250,7 +2256,7 @@ EOF
     broker_manual_flow=1
     info_heading "PR broker setup"
     label_line "Fieldwork will walk through three steps"
-    info_bullet "1. Install the broker daemon, socket, and rotate-pat helper."
+    info_bullet "1. Install the broker daemon, socket, policy writer, and credential helpers."
     info_bullet "2. Store the GitHub PAT with rotate-pat (the token paste is hidden)."
     info_bullet "3. Recheck socket access; if Linux group membership is stale, reconnect and rerun setup."
     local broker_install_done=0

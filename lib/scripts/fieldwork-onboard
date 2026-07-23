@@ -280,7 +280,7 @@ remote_fieldwork_env() {
 # bin/fieldwork (remote_sudo_passwordless / remote_sudo_prefix) so user-facing
 # command suggestions don't emit a "-p '[sudo] VPS Linux password for ...'" prompt
 # when /etc/sudoers.d/fieldwork-fieldwork makes sudo NOPASSWD for the agent user.
-remote_sudo_prefix() {
+remote_sudo_passwordless() {
   if [ -z "${FIELDWORK_REMOTE_SUDO_PASSWORDLESS:-}" ]; then
     if ssh -o BatchMode=yes "$SSH_HOST" "sudo -n true" >/dev/null 2>&1; then
       FIELDWORK_REMOTE_SUDO_PASSWORDLESS=1
@@ -288,7 +288,11 @@ remote_sudo_prefix() {
       FIELDWORK_REMOTE_SUDO_PASSWORDLESS=0
     fi
   fi
-  if [ "$FIELDWORK_REMOTE_SUDO_PASSWORDLESS" = "1" ]; then
+  [ "$FIELDWORK_REMOTE_SUDO_PASSWORDLESS" = "1" ]
+}
+
+remote_sudo_prefix() {
+  if remote_sudo_passwordless; then
     printf 'sudo'
   else
     printf "sudo -p '[sudo] VPS Linux password for %s: '" "$REMOTE_USER"
@@ -675,7 +679,63 @@ wire_broker_policy() {
     [ -z "${FIELDWORK_GITLAB_CA_BUNDLE_LOCAL:-}" ] || policy_args="$policy_args --ca-bundle /etc/fieldwork/gitlab-ca.pem"
     [ "$ALLOW_PRIVATE_NETWORK" != 1 ] || policy_args="$policy_args --allow-private-network"
   fi
-  ssh -t "$SSH_HOST" "$(remote_sudo_prefix) /usr/local/sbin/fieldwork-policy-write $policy_args"
+  if [ "${FIELDWORK_REMOTE_SUDO_PASSWORDLESS:-0}" = "1" ]; then
+    ssh "$SSH_HOST" "sudo -n /usr/local/sbin/fieldwork-policy-write $policy_args"
+  else
+    ssh -t "$SSH_HOST" "$(remote_sudo_prefix) /usr/local/sbin/fieldwork-policy-write $policy_args"
+  fi
+}
+
+broker_preflight() {
+  local payload response error
+  payload="$(jq -cn --arg slug "$SLUG" '{slug:$slug}')"
+  response="$(ssh "$SSH_HOST" "printf '%s' $(shell_quote "$payload") | curl -sS --max-time 35 --unix-socket /run/fieldwork-pr-broker/fieldwork-pr.sock -H 'Content-Type: application/json' --data-binary @- http://localhost/preflight")" || return
+  if printf '%s' "$response" | jq -e '.ok == true and .state == "ready"' >/dev/null 2>&1; then
+    return 0
+  fi
+  error="$(printf '%s' "$response" | jq -r '.error // "invalid broker response"' 2>/dev/null || printf 'invalid broker response')"
+  printf '%s\n' "$response" >&2
+  printf '[onboard] FAIL: broker credential preflight failed: %s\n' "$error" >&2
+  case "$error" in
+    git_forge_failed|forge_permission_denied|forge_not_found|credential_unavailable|github_app_unconfigured|github_app_token_invalid)
+      if [ "$FORGE" = github ]; then
+        cat >&2 <<EOF
+
+The broker credential cannot read $OWNER_REPO. Update its repository access
+or replace a PAT through the broker's hidden-input rotation command:
+  ssh -t $SSH_HOST "$(remote_sudo_prefix) env FIELDWORK_ROTATE_PAT_TTY=1 FIELDWORK_PAT_PROBE_REPO=$(shell_quote "$OWNER_REPO") FIELDWORK_FORGE=github /usr/local/sbin/rotate-pat"
+
+If the broker uses a GitHub App, grant that App installation access to
+$OWNER_REPO instead.
+
+Then rerun:
+  fieldwork onboard $OWNER_REPO
+EOF
+      else
+        cat >&2 <<EOF
+
+The broker credential cannot read $OWNER_REPO. Replace the GitLab token through
+the broker's hidden-input rotation command:
+  ssh -t $SSH_HOST "$(remote_sudo_prefix) env FIELDWORK_ROTATE_PAT_TTY=1 FIELDWORK_PAT_PROBE_REPO=$(shell_quote "$OWNER_REPO") FIELDWORK_FORGE=gitlab FIELDWORK_GITLAB_API=$(shell_quote "$FIELDWORK_GITLAB_API") /usr/local/sbin/rotate-pat"
+
+Then rerun:
+  fieldwork onboard $OWNER_REPO
+EOF
+      fi
+      ;;
+    repo_not_wired|policy_invalid)
+      cat >&2 <<EOF
+
+The root-owned broker policy was not accepted. Reinstall the current broker:
+  fieldwork sync-vps --force-install
+  ssh -t $SSH_HOST "$(remote_sudo_prefix) bash ~/.fieldwork/infra/fieldwork-pr-broker/install.sh"
+EOF
+      ;;
+    *)
+      printf '\nRun fieldwork doctor --remote --explain, then rerun onboarding.\n' >&2
+      ;;
+  esac
+  return 1
 }
 
 TMP_FILES=""
@@ -1045,15 +1105,20 @@ fi
 phase_section "Preflight"
 echo "  repo: $OWNER_REPO"
 
-# Protocol v2 is checkout-blind and has no repository-path preflight. Establish
-# only the public origin hint here. The actual default branch is derived from
-# the read-only clone, then a root-owned broker policy is written below.
+# Protocol v2 is checkout-blind. Establish the public origin hint here; after
+# the read-only clone resolves its default branch, the broker preflight uses
+# only the root-owned policy slug to validate credential access.
 if [ "$FORGE" = gitlab ]; then
   EXPECTED_ORIGIN="https://$(fieldwork_gitlab_api_host)/$OWNER_REPO.git"
 else
   EXPECTED_ORIGIN="https://github.com/$OWNER_REPO.git"
 fi
 echo "  broker policy: approval=$([ "$AUTO_APPROVE" = 1 ] && echo auto || echo require)"
+if ! ssh "$SSH_HOST" "test -x /usr/local/sbin/fieldwork-policy-write" >/dev/null 2>&1; then
+  echo "[onboard] FAIL: root-owned broker policy writer is missing." >&2
+  echo "Next action: run fieldwork setup, then rerun fieldwork onboard $OWNER_REPO" >&2
+  exit 1
+fi
 
 # 2. Clone (skip if already cloned).
 if fieldwork_status_check "checking VPS checkout" ssh "$SSH_HOST" "test -d $REMOTE_REPO_DIR/.git"; then
@@ -1112,10 +1177,21 @@ default_branch="$(ssh "$SSH_HOST" "git -C $(shell_quote "$REMOTE_REPO_DIR") symb
 DEFAULT_BRANCH="$default_branch"
 phase_section "Broker Policy"
 echo "  default branch: $DEFAULT_BRANCH"
-run_quiet \
-  "writing root-owned protocol-v2 broker policy" \
-  "broker policy wired for $SLUG" \
+if remote_sudo_passwordless; then
+  run_quiet \
+    "writing root-owned protocol-v2 broker policy" \
+    "broker policy wired for $SLUG" \
+    wire_broker_policy || exit 1
+else
+  fieldwork_status_cleanup
+  status_info_line "VPS sudo authentication is required to write the root-owned broker policy"
   wire_broker_policy || exit 1
+  status_ok_line "broker policy wired for $SLUG"
+fi
+run_quiet \
+  "checking broker credential access to $OWNER_REPO" \
+  "broker credential can read $OWNER_REPO" \
+  broker_preflight || exit 1
 state_add_local "preflight_passed"
 state_add_local "policy_wired"
 write_state

@@ -422,6 +422,47 @@ class BrokerV2Tests(unittest.TestCase):
         finally:
             left.close()
 
+    def test_preflight_is_checkout_blind_and_validates_broker_credential(self):
+        self.wire()
+        expected_ref = "refs/heads/main"
+
+        def reachable(_policy, args, url, token, _deadline, *, cwd=None, timeout_cap=120):
+            self.assertEqual(args, ["ls-remote", "--heads", url, expected_ref])
+            self.assertEqual(token, server.TOKEN_PATH)
+            self.assertIsNone(cwd)
+            return subprocess.CompletedProcess(args, 0, stdout=(("a" * 40) + f"\t{expected_ref}\n").encode(), stderr=b"")
+
+        with mock.patch.object(server, "credential", self.fake_credential), \
+             mock.patch.object(server, "network_git", reachable):
+            result = server.broker_preflight({"slug": "demo"}, server.Deadline.start())
+        self.assertEqual(result, {"ok": True, "slug": "demo", "state": "ready"})
+
+    def test_preflight_rejects_invalid_unwired_and_missing_base_requests(self):
+        for value in ({}, {"slug": "Bad"}, {"slug": "demo", "repo": "/tmp/demo"}):
+            with self.subTest(value=value), self.assertRaisesRegex(server.RequestError, "invalid_preflight_request"):
+                server.broker_preflight(value, server.Deadline.start())
+        with self.assertRaisesRegex(server.RequestError, "repo_not_wired"):
+            server.broker_preflight({"slug": "demo"}, server.Deadline.start())
+        self.wire()
+        missing = subprocess.CompletedProcess([], 0, stdout=b"", stderr=b"")
+        with mock.patch.object(server, "credential", self.fake_credential), \
+             mock.patch.object(server, "network_git", return_value=missing), \
+             self.assertRaisesRegex(server.RequestError, "base_branch_not_found"):
+            server.broker_preflight({"slug": "demo"}, server.Deadline.start())
+
+    def test_preflight_route_exposes_the_current_contract(self):
+        body = self.root / "preflight-contract-body"
+        body.write_text("{}")
+        left, right = socket.socketpair()
+        try:
+            with mock.patch.object(server, "read_http_request", return_value=("/preflight", {}, body)):
+                server.handle(right, "agent")
+            response = left.recv(4096)
+            self.assertIn(b"HTTP/1.1 400", response)
+            self.assertIn(b'"error":"invalid_preflight_request"', response)
+        finally:
+            left.close()
+
     def test_title_and_body_are_both_scanned(self):
         captured = {}
         def inspect(path, _deadline):
