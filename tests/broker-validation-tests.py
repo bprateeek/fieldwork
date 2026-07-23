@@ -651,6 +651,31 @@ class BrokerV2Tests(unittest.TestCase):
         self.assertEqual(result["state"], "done")
         push.assert_not_called(); create.assert_not_called()
 
+    def test_existing_pr_branch_accepts_only_fast_forward_updates(self):
+        existing_oid = "3" * 40
+        for fast_forward in (True, False):
+            with self.subTest(fast_forward=fast_forward):
+                req = self.durable_approved_request()
+                with mock.patch.object(server, "scan_title_body"), \
+                     mock.patch.object(server, "credential", self.fake_credential), \
+                     mock.patch.object(server, "quarantine", self.fake_quarantine), \
+                     mock.patch.object(server, "remote_branch_oid", return_value=existing_oid), \
+                     mock.patch.object(server, "branch_update_is_fast_forward", return_value=fast_forward) as check, \
+                     mock.patch.object(server, "find_pr", return_value="https://example.test/pr/1"), \
+                     mock.patch.object(server, "push_head") as push, \
+                     mock.patch.object(server, "create_pr") as create:
+                    result = server.process_record(req.request_id, server.Deadline.start())
+                check.assert_called_once()
+                if fast_forward:
+                    self.assertEqual(result["state"], "done")
+                    push.assert_called_once()
+                    create.assert_not_called()
+                else:
+                    self.assertEqual(result["state"], "failed")
+                    self.assertEqual(result["error_code"], "branch_conflict")
+                    push.assert_not_called()
+                    create.assert_not_called()
+
     def durable_approved_request(self):
         self.wire(approval="auto")
         pack = self.root / f"incoming-{uuid.uuid4().hex}.pack"; pack.write_bytes(b"PACK-test")

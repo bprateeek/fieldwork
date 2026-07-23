@@ -99,6 +99,7 @@ grep -Fq 'PACK_MAX_INPUT = 8 * 1024 * 1024' lib/broker/server.py
 grep -Fq 'f"--max-input-size={PACK_MAX_INPUT}"' lib/broker/server.py
 ! grep -Fq -- '--fix-thin' lib/broker/server.py
 grep -Fq 'unexpected_objects' lib/broker/server.py
+grep -Fq 'branch_update_is_fast_forward' lib/broker/server.py
 grep -Fq 'allow_private_network' lib/broker/server.py
 grep -Fq 'hmac.compare_digest' lib/broker/server.py
 grep -Fq 'def broker_preflight(' lib/broker/server.py

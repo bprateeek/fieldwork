@@ -127,7 +127,12 @@ key over the canonical record and pack digest. Approval revalidates the MAC,
 pack digest, policy, scans, quarantine, and base under the slug lock.
 
 Reconciliation checks the remote branch OID and existing PR before doing only
-the missing operation. It does not double-push or create a duplicate PR.
+the missing operation. An existing Fieldwork PR branch may advance only when
+the broker proves its current remote OID is an ancestor of the submitted head
+inside the validated quarantine repository; divergent or rewind updates fail
+with `branch_conflict`. The forge push is also non-forced, so a concurrent
+branch race fails closed. Reconciliation does not double-push or create a
+duplicate PR.
 Terminal results are durable tombstones. Tombstones default to 30-day
 retention; the replay ledger is permanent.
 

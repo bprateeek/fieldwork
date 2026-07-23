@@ -1205,20 +1205,21 @@ def _auth_headers(policy: dict[str, object], token_path: Path) -> dict[str, str]
 
 def remote_branch_oid(policy: dict[str, object], req: ValidatedRequest, token_path: Path, deadline: Deadline) -> str | None:
     url = f"{str(policy['git_base_url']).rstrip('/')}/{policy['project']}.git"
+    expected_ref = f"refs/heads/{req.branch}"
     result = network_git(
-        policy, ["ls-remote", "--heads", url, f"refs/heads/{req.branch}"],
+        policy, ["ls-remote", "--heads", url, expected_ref],
         url, token_path, deadline, timeout_cap=60,
     )
     try:
-        output = bytes(result.stdout).decode("ascii", "strict").strip()
+        lines = bytes(result.stdout).decode("ascii", "strict").strip().splitlines()
     except UnicodeDecodeError as exc:
         raise RequestError("forge_invalid_ref", 502) from exc
-    if not output:
+    if not lines:
         return None
-    oid = output.split()[0]
-    if not OID_RE.fullmatch(oid):
+    fields = lines[0].split() if len(lines) == 1 else []
+    if len(fields) != 2 or not OID_RE.fullmatch(fields[0]) or fields[1] != expected_ref:
         raise RequestError("forge_invalid_ref", 502)
-    return oid
+    return fields[0]
 
 
 def broker_preflight(value: object, deadline: Deadline) -> dict[str, object]:
@@ -1263,6 +1264,14 @@ def push_head(repo: Path, policy: dict[str, object], req: ValidatedRequest, toke
         ["push", "--no-verify", url, f"{req.head_oid}:refs/heads/{req.branch}"],
         url, token_path, deadline, cwd=repo,
     )
+
+
+def branch_update_is_fast_forward(repo: Path, existing_oid: str, req: ValidatedRequest, deadline: Deadline) -> bool:
+    result = run_git(
+        ["merge-base", "--is-ancestor", existing_oid, req.head_oid],
+        deadline, cwd=repo, timeout_cap=20, check=False,
+    )
+    return result.returncode == 0
 
 
 def find_pr(policy: dict[str, object], req: ValidatedRequest, token_path: Path, deadline: Deadline) -> str | None:
@@ -1348,8 +1357,12 @@ def process_record(request_id: str, deadline: Deadline) -> dict[str, object]:
                     if record["state"] == "approved":
                         existing_oid = remote_branch_oid(policy, req, token_path, deadline)
                         if existing_oid is not None and existing_oid != req.head_oid:
-                            return terminalize(record, "failed", error_code="branch_conflict")
-                        if existing_oid is None:
+                            if not branch_update_is_fast_forward(repo, existing_oid, req, deadline):
+                                return terminalize(record, "failed", error_code="branch_conflict")
+                            _fault("before_push")
+                            push_head(repo, policy, req, token_path, deadline)
+                            _fault("after_push")
+                        elif existing_oid is None:
                             _fault("before_push")
                             push_head(repo, policy, req, token_path, deadline)
                             _fault("after_push")
