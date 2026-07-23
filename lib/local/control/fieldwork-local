@@ -18,6 +18,22 @@ docker_cmd() {
     "$DOCKER" compose --project-directory "$ROOT" -f "$COMPOSE" -p fieldwork-local "$@"
 }
 
+wait_http_auth() {
+  fw_attempt=0
+  while [ "$fw_attempt" -lt 30 ]; do
+    token="$(docker_cmd exec -T broker /usr/local/bin/fieldwork-local-entrypoint read-http-auth 2>/dev/null || true)"
+    if [ -n "$token" ]; then
+      printf '%s\n' "$token"
+      return 0
+    fi
+    fw_attempt=$((fw_attempt + 1))
+    sleep 1
+  done
+  echo "local broker did not become ready within 30 seconds" >&2
+  docker_cmd logs --no-color --tail=50 broker >&2 || true
+  return 1
+}
+
 usage() {
   echo "usage: fieldwork-local up|down|status|logs|token|wire|telegram|approve|probe|maintenance-start|maintenance-stop|maintenance-submit|clean|claude|uninstall"
 }
@@ -26,7 +42,7 @@ command_name="${1:-}"; shift || true
 case "$command_name" in
   up)
     docker_cmd up -d --build broker
-    token="$(docker_cmd exec -T broker /usr/local/bin/fieldwork-local-entrypoint read-http-auth)"
+    token="$(wait_http_auth)"
     install -d -o fieldwork-agent -g "$AGENT_GROUP" -m 700 "$AGENT_HOME/.fieldwork"
     tmp="$AGENT_HOME/.fieldwork/.http-auth.$$"
     umask 077; printf '%s\n' "$token" >"$tmp"

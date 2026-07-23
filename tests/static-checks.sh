@@ -195,6 +195,8 @@ grep -Fq 'assert_root_asset' lib/local/control/fieldwork-local-claude
 grep -Fq 'inventory contains a symlink' lib/local/control/fieldwork-local-claude
 grep -Fq 'hard-boundary inventory contains a symlink' lib/local/control/fieldwork-local-probe
 grep -Fq 'fieldwork-pr-prepare" "$ROOT/lib/scripts/fieldwork-verify' lib/local/install.sh
+grep -Fq 'local broker did not become ready within 30 seconds' lib/local/control/fieldwork-local
+grep -Fq 'for fw_attempt in {1..30}' .github/workflows/test.yml
 test -f lib/local/managed/.claude/skills/pr-delivery/SKILL.md
 ! grep -Eq '(^|[[:space:]])local\)' bin/fieldwork
 python3 - <<'PY'

@@ -128,8 +128,14 @@ jobs:
         run: |
           docker compose -p fieldwork-local-ci -f lib/local/docker-compose.yml config >/dev/null
           docker compose -p fieldwork-local-ci -f lib/local/docker-compose.yml up -d --build broker
-          token="$(docker compose -p fieldwork-local-ci -f lib/local/docker-compose.yml \
-            exec -T broker /usr/local/bin/fieldwork-local-entrypoint read-http-auth)"
+          token=
+          for fw_attempt in {1..30}; do
+            token="$(docker compose -p fieldwork-local-ci -f lib/local/docker-compose.yml \
+              exec -T broker /usr/local/bin/fieldwork-local-entrypoint read-http-auth 2>/dev/null || true)"
+            test -z "$token" || break
+            sleep 1
+          done
+          test -n "$token"
           install -d -m 700 "$HOME/.fieldwork"
           umask 077
           printf '%s\n' "$token" >"$HOME/.fieldwork/http-auth"
