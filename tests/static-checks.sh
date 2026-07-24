@@ -190,6 +190,20 @@ check "split durable stores and bot least privilege"
 for name in pending-meta pending-sidecar pending-pack tombstones pending-mac.key; do
   grep -Fq "$name" lib/broker/install.sh || die "broker install omits $name"
 done
+grep -Fq 'install -d -o "$BROKER_USER" -g "$BROKER_BOT_GROUP" -m 710 "$STATE_DIR"' \
+  lib/broker/install.sh
+grep -Fq 'find "$STATE_DIR" -xdev \( -type d -o -type f \)' \
+  lib/broker/install.sh
+grep -Fq 'setfacl -b -k --' lib/broker/install.sh lib/cli/setup.sh
+grep -Fq 'install -o "$broker_user" -g fieldwork-bot -m 0710 -d "$broker_state"' \
+  lib/cli/setup.sh
+grep -Fq 'bot user can traverse and read pending metadata' \
+  lib/cli/verify-security.sh
+for name in pending-meta pending-sidecar notifications; do
+  grep -Fq "\"\$broker_state/$name\"" lib/cli/setup.sh \
+    || die "Telegram bot repair omits protocol-v2 $name"
+done
+! grep -Fq '"$broker_state/pending"' lib/cli/setup.sh
 bot_block="$(awk '/^  bot:/{flag=1} /^  telegram-config:/{flag=0} flag' lib/local/docker-compose.yml)"
 case "$bot_block" in *fieldwork-local-token*|*fieldwork-local-policy:*|*fieldwork-local-pack:*|*fieldwork-local-auth:*|*docker.sock*) die "bot has forbidden mount" ;; esac
 for mount in fieldwork-local-meta fieldwork-local-sidecar fieldwork-local-notifications fieldwork-local-approve fieldwork-local-bot-state; do

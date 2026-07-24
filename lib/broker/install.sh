@@ -45,10 +45,20 @@ if id "$AGENT_USER" | grep -qw "$BROKER_BOT_GROUP"; then
   exit 1
 fi
 
+# Protocol-v1 used named/default ACLs to share broker state with the agent.
+# Remove those upgrade artifacts before applying the protocol-v2 split-store
+# ownership below. find selects real directories/files, so symlinks are never
+# passed to setfacl.
+if [ -d "$STATE_DIR" ] && command -v setfacl >/dev/null 2>&1; then
+  find "$STATE_DIR" -xdev \( -type d -o -type f \) \
+    -exec setfacl -b -k -- {} +
+fi
+
 install -d -o "$BROKER_USER" -g "$BROKER_USER" -m 700 "$CONFIG_DIR"
 install -d -o root -g root -m 755 "$LIB_DIR"
+install -d -o "$BROKER_USER" -g "$BROKER_BOT_GROUP" -m 710 "$STATE_DIR"
 install -d -o "$BROKER_USER" -g "$BROKER_USER" -m 700 \
-  "$STATE_DIR" "$STATE_DIR/requests" "$STATE_DIR/pending-pack" \
+  "$STATE_DIR/requests" "$STATE_DIR/pending-pack" \
   "$STATE_DIR/tombstones" "$STATE_DIR/work" "$STATE_DIR/keys" "$STATE_DIR/ca"
 install -d -o "$BROKER_USER" -g "$BROKER_USER" -m 750 "$STATE_DIR/policy"
 install -d -o "$BROKER_USER" -g "$BROKER_BOT_GROUP" -m 750 "$STATE_DIR/pending-meta"
@@ -56,6 +66,24 @@ install -d -o "$BROKER_USER" -g "$BROKER_BOT_GROUP" -m 2770 \
   "$STATE_DIR/pending-sidecar" "$STATE_DIR/notifications"
 install -d -o root -g fieldwork-bot -m 0750 /etc/fieldwork-bot
 install -d -o fieldwork-bot -g fieldwork-bot -m 0700 /var/lib/fieldwork-bot
+
+# Clearing an extended ACL restores its underlying group bits. Reassert the
+# group-readable/writable modes required by the bot for any durable files that
+# already existed before this convergent install.
+find "$STATE_DIR/pending-meta" -xdev -mindepth 1 -maxdepth 1 -type f \
+  -exec chown "$BROKER_USER:$BROKER_BOT_GROUP" {} + \
+  -exec chmod 640 {} +
+for shared_dir in "$STATE_DIR/pending-sidecar" "$STATE_DIR/notifications"; do
+  find "$shared_dir" -xdev -mindepth 1 -maxdepth 1 -type f \
+    -exec chgrp "$BROKER_BOT_GROUP" {} + \
+    -exec chmod 660 {} +
+done
+audit_log="$STATE_DIR/audit.jsonl"
+if [ -f "$audit_log" ] && [ ! -L "$audit_log" ]; then
+  chown "$BROKER_USER:$BROKER_USER" "$audit_log"
+  chmod 640 "$audit_log"
+fi
+
 mac_key="$STATE_DIR/keys/pending-mac.key"
 if [ -L "$mac_key" ] || { [ -e "$mac_key" ] && ! [ -f "$mac_key" ]; }; then
   echo "refusing unsafe pending MAC-key path: $mac_key" >&2

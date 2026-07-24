@@ -2539,26 +2539,26 @@ install -o root -g root -m 644 "$bot_unit" /etc/systemd/system/fieldwork-bot.ser
 install -o fieldwork-bot -g fieldwork-bot -m 755 -d /var/lib/fieldwork-bot
 [ -f /var/log/fieldwork-bot.log ] || install -o fieldwork-bot -g fieldwork-bot -m 640 /dev/null /var/log/fieldwork-bot.log
 
-# Repair broker state created before the bot shared-dir permissions landed.
+# Repair the protocol-v2 broker traversal and shared-directory permissions.
+# The parent grants only group traversal; private sibling stores remain 0700.
 # Without this, the bot daemon crash-loops before it can poll Telegram.
 broker_state="/var/lib/fieldwork-pr-broker"
 if [ -d "$broker_state" ]; then
   broker_user="$(stat -c '%U' "$broker_state" 2>/dev/null || true)"
   [ -n "$broker_user" ] || { echo "cannot resolve owner for $broker_state" >&2; exit 1; }
   id "$broker_user" >/dev/null 2>&1 || { echo "broker state owner '$broker_user' is not a user" >&2; exit 1; }
-  install -o "$broker_user" -g fieldwork-bot -m 2770 -d "$broker_state/pending"
-  install -o "$agent_user" -g fieldwork-bot -m 2770 -d "$broker_state/notifications"
   if command -v setfacl >/dev/null 2>&1; then
-    setfacl -m "u:$broker_user:rwx" "$broker_state/notifications"
-    setfacl -d -m "u:$broker_user:rwx" "$broker_state/notifications"
-    # Explicit bot traverse on the broker state dir so the bot can reach
-    # pending/ + notifications/ without depending on the systemd StateDirectory
-    # 0755 window (broker install's 0700 transiently removes other-traverse and
-    # crash-loops the bot). Mirrors the broker installer's grant.
-    setfacl -m "u:fieldwork-bot:--x" "$broker_state"
-  else
-    echo "setfacl unavailable; broker lifecycle notifications need manual ACL setup for $broker_state/notifications" >&2
+    setfacl -b -k -- \
+      "$broker_state" \
+      "$broker_state/pending-meta" \
+      "$broker_state/pending-sidecar" \
+      "$broker_state/notifications"
   fi
+  install -o "$broker_user" -g fieldwork-bot -m 0710 -d "$broker_state"
+  install -o "$broker_user" -g fieldwork-bot -m 0750 -d \
+    "$broker_state/pending-meta"
+  install -o "$broker_user" -g fieldwork-bot -m 2770 -d \
+    "$broker_state/pending-sidecar" "$broker_state/notifications"
 fi
 
 # Grant the bot user enqueue-only access to the one_shot_job task spool so the
