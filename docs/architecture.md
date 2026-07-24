@@ -5,7 +5,7 @@ Local and VPS modes use the same checkout-blind broker protocol.
 
 ```text
 dedicated agent session
-  |  commit + fieldwork-pr-build (sandboxed)
+  |  commit + exact root-owned fieldwork-pr-build client
   v
 untrusted per-UID spool: meta.json + non-thin pack
   |  /usr/local/bin/fieldwork-pr-upload (excluded, no subprocess)

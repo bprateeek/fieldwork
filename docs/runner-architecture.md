@@ -19,9 +19,11 @@ Installed in `/usr/local/bin`:
 - `fieldwork-pr-build`
 - `fieldwork-pr-upload`
 
-The first, second, and fourth clients are isolated Python/socket clients.
-`fieldwork-pr-build` stays sandboxed because it must read Git objects from the
-checkout.
+All four are root-owned boundary clients. The managed Bash hook admits the
+builder only as
+`/usr/local/bin/fieldwork-pr-build .fieldwork/local/pr-build-request.json`;
+the builder scrubs Git configuration and accepts only validated request data
+before writing the untrusted spool.
 
 ## System units
 
@@ -86,9 +88,10 @@ checkout path.
 
 `fieldwork-agent-session` accepts a validated adapter name and resolves it only
 under `/usr/local/lib/fieldwork/agents`. An agent-writable adapter or symlink
-cannot influence hard-boundary startup. The Claude adapter launches with empty
-setting sources, strict MCP config, an empty MCP file, and the minimal tool
-allowlist, in addition to root-owned managed settings.
+cannot influence hard-boundary startup. The Claude adapter launches with only
+the remote-control daemon flags supported by the pinned CLI. Root-owned managed
+settings enforce the sandbox, customization lockdown, immutable delivery
+instructions, and exact boundary-client policy.
 
 ## Codex VPS note
 

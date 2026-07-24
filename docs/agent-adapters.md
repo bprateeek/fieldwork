@@ -71,8 +71,9 @@ Your adapter must:
    enforces the same prefix on every PR request. Anything else is rejected.
 
 3. **Never receive the forge write token.** Commit a clean `fieldwork/...`
-   branch, build protocol-v2 metadata plus a non-thin pack with
-   `fieldwork-pr-build`, then invoke the absolute root-owned
+   branch, build protocol-v2 metadata plus a non-thin pack with the exact
+   `/usr/local/bin/fieldwork-pr-build .fieldwork/local/pr-build-request.json`
+   client, then invoke the absolute root-owned
    `/usr/local/bin/fieldwork-pr-upload` as a separate top-level command. The
    broker socket is writable by the agent identity, but the credential, policy,
    pending packs, and MAC key are not.
@@ -223,12 +224,13 @@ the minimum viable adapter:
 exec "$HOME/.local/bin/claude" remote-control \
   --name "vps-$slug" \
   --remote-control-session-name-prefix "vps-$slug" \
-  --sandbox --spawn=worktree --capacity="$FIELDWORK_AGENT_CAPACITY"
+  --spawn=worktree --capacity="$FIELDWORK_AGENT_CAPACITY"
 ```
 
 That is the entire adapter. The Claude binary is the long-running foreground
-process; the slug becomes the remote-control instance name; sandbox/worktree
-flags constrain Claude to a fresh worktree per task, while
+process; the slug becomes the remote-control instance name; the root-owned
+managed settings enforce fail-closed Bash sandboxing, while the worktree flag
+constrains Claude to a fresh worktree per task and
 `FIELDWORK_AGENT_CAPACITY` bounds concurrent tasks for that repo service.
 Branch prefix and hook skipping are handled by the surrounding Fieldwork
 infrastructure, not the adapter.

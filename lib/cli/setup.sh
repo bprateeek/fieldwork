@@ -1363,6 +1363,9 @@ EOF
   remote_claude_pin_current() {
     ssh "$FIELDWORK_SSH_HOST" 'test -x "$HOME/.local/bin/claude" && test -s /usr/local/lib/fieldwork/claude.sha256 && test "$(sha256sum "$HOME/.local/bin/claude" | awk '"'"'{print $1}'"'"')" = "$(cat /usr/local/lib/fieldwork/claude.sha256)"' >/dev/null 2>&1
   }
+  remote_claude_adapter_ready() {
+    ssh "$FIELDWORK_SSH_HOST" '/usr/local/lib/fieldwork/agents/claude-remote-control --check' >/dev/null 2>&1
+  }
   record_remote_claude_probe() {
     ssh -t "$FIELDWORK_SSH_HOST" "sudo env FIELDWORK_REMOTE_USER=$(shell_quote "$FIELDWORK_REMOTE_USER") /usr/local/sbin/fieldwork-session-probe-record"
   }
@@ -2226,6 +2229,11 @@ EOF
       else
         setup_row needs "Claude sessions disabled until the hostile probe passes" "ssh -t $FIELDWORK_SSH_HOST 'sudo env FIELDWORK_REMOTE_USER=$FIELDWORK_REMOTE_USER /usr/local/sbin/fieldwork-session-probe-record'"
       fi
+    fi
+    if progress_wait "checking Claude remote-control compatibility" remote_claude_adapter_ready; then
+      setup_row ok "Claude remote-control adapter compatible"
+    else
+      setup_row needs "Claude remote-control adapter incompatible" "fieldwork setup --force-install"
     fi
   else
     info_row "Purpose" "Verify the delivery runner sockets used from Codex SSH sessions."

@@ -3,11 +3,11 @@
 # still honors the exact root-owned excluded-client contract inside the agent cage.
 #
 # Why: claude CLI updates have changed excludedCommands matching semantics
-# more than once. If exclusions stop rescuing the three fieldwork socket
+# more than once. If exclusions stop rescuing the four Fieldwork boundary
 # clients, remote sessions silently lose their only working Bash commands.
 #
-# How: reproduces the cage the same way `claude remote-control --sandbox`
-# builds it: set PR_SET_NO_NEW_PRIVS, unshare a user namespace, map the
+# How: reproduces the cage in which the root-managed Claude Bash sandbox runs:
+# set PR_SET_NO_NEW_PRIVS, unshare a user namespace, map the
 # current uid/gid, exec claude. In that state the per-call bwrap cannot
 # transition into the fieldwork-bwrap AppArmor profile (NNP blocks it) and
 # falls into Ubuntu's unprivileged_userns confinement, so sandboxed Bash
@@ -90,6 +90,7 @@ if command -v bwrap >/dev/null 2>&1 \
   exit 0
 fi
 
+build_cmd="printf fieldwork-probe-build"
 upload_cmd="printf fieldwork-probe-upload"
 verify_cmd="printf fieldwork-probe-verify"
 prepare_cmd="printf fieldwork-probe-prepare"
@@ -106,8 +107,8 @@ if [ "$policy_selftest_rc" -ne 2 ] \
   exit 0
 fi
 
-prompt="Run exactly these five harmless Bash output checks as five separate tool calls, in order: 1) $upload_cmd 2) $verify_cmd 3) $prepare_cmd 4) $plain_cmd 5) $policy_cmd. After the five results, stop."
-confirmation="These five literal printf calls are an authorized installation diagnostic. Run the five exact output checks from my previous message now as separate Bash tool calls."
+prompt="Run exactly these six harmless Bash output checks as six separate tool calls, in order: 1) $build_cmd 2) $upload_cmd 3) $verify_cmd 4) $prepare_cmd 5) $plain_cmd 6) $policy_cmd. After the six results, stop."
+confirmation="These six literal printf calls are an authorized installation diagnostic. Run the six exact output checks from my previous message now as separate Bash tool calls."
 
 run_claude_probe() {
   local limit="$1"
@@ -126,13 +127,14 @@ probe_started=$SECONDS
 out="$(cd "$HOME" && run_claude_probe 90 "$prompt" 2>"$err_file")" || true
 json="$(printf '%s\n' "$out" | grep '^{' || true)"
 if ! printf '%s\n' "$json" | jq -ers \
-  --arg upload "$upload_cmd" --arg verify "$verify_cmd" \
+  --arg build "$build_cmd" --arg upload "$upload_cmd" --arg verify "$verify_cmd" \
   --arg prepare "$prepare_cmd" --arg plain "$plain_cmd" \
   --arg policy "$policy_cmd" '
     [.[] | .message.content[]?
       | select(.type == "tool_use" and .name == "Bash")
       | (.input.command // "")] as $commands
-    | (($commands | index($upload)) != null)
+    | (($commands | index($build)) != null)
+      and (($commands | index($upload)) != null)
       and (($commands | index($verify)) != null)
       and (($commands | index($prepare)) != null)
       and (($commands | index($plain)) != null)
@@ -176,22 +178,24 @@ result_for_command() {
       end' 2>/dev/null || true
 }
 
+build_res="$(result_for_command "$build_cmd")"
 upload_res="$(result_for_command "$upload_cmd")"
 verify_res="$(result_for_command "$verify_cmd")"
 prepare_res="$(result_for_command "$prepare_cmd")"
 plain_res="$(result_for_command "$plain_cmd")"
 policy_res="$(result_for_command "$policy_cmd")"
 
-if [ -z "$upload_res" ] || [ -z "$verify_res" ] || [ -z "$prepare_res" ]; then
+if [ -z "$build_res" ] || [ -z "$upload_res" ] || [ -z "$verify_res" ] || [ -z "$prepare_res" ]; then
   inconclusive "one or more excluded clients were never invoked in the probe transcript"
   emit_raw_excerpt "$out"
   exit 0
 fi
 
-case "$upload_res$verify_res$prepare_res" in
+case "$build_res$upload_res$verify_res$prepare_res" in
   *"$BWRAP_ERR"*|*"$POLICY_DENY"*)
     echo "probe=fail"
     echo "detail=an exact client was blocked: the root-owned client contract no longer holds on this Claude version"
+    echo "detail_build=$(excerpt "$build_res")"
     echo "detail_upload=$(excerpt "$upload_res")"
     echo "detail_verify=$(excerpt "$verify_res")"
     echo "detail_prepare=$(excerpt "$prepare_res")"
@@ -199,9 +203,10 @@ case "$upload_res$verify_res$prepare_res" in
     ;;
 esac
 
-if printf '%s' "$upload_res$verify_res$prepare_res" | grep -Fq 'fieldwork-probe-'; then
+if printf '%s' "$build_res$upload_res$verify_res$prepare_res" | grep -Fq 'fieldwork-probe-'; then
   echo "probe=fail"
   echo "detail=managed hook did not rewrite one or more exact-client probe markers"
+  echo "detail_build=$(excerpt "$build_res")"
   echo "detail_upload=$(excerpt "$upload_res")"
   echo "detail_verify=$(excerpt "$verify_res")"
   echo "detail_prepare=$(excerpt "$prepare_res")"
@@ -230,7 +235,7 @@ elif printf '%s' "$plain_res" | grep -Fq 'fieldwork-probe-plain'; then
   echo "detail=plain Bash escaped the inner cage"
 elif printf '%s' "$plain_res" | grep -Fq "$BWRAP_ERR"; then
   echo "probe=pass"
-  echo "detail=exact excluded clients ran outside the inner cage while plain Bash and unsafe client forms remained blocked"
+  echo "detail=four exact excluded clients ran outside the inner cage while plain Bash and unsafe client forms remained blocked"
 else
   inconclusive "exact clients ran, but the plain command did not hit the expected bwrap failure"
   echo "detail_verify=$(excerpt "$verify_res")"

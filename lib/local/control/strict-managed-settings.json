@@ -4,8 +4,14 @@
   "allowManagedPermissionRulesOnly": true,
   "allowedMcpServers": [],
   "autoMemoryEnabled": false,
+  "claudeMd": "# Fieldwork hard-boundary delivery\n\nWork only in the current repository. Commit all intended changes before delivery. Run `/usr/local/bin/fieldwork-pr-build .fieldwork/local/pr-build-request.json` as an exact top-level tool call and note the request ID it prints. Then run `/usr/local/bin/fieldwork-pr-upload <request-id>` as a separate top-level tool call. Never combine those commands in one shell expression and never push directly. The broker rebuilds and scans the Git pack and may queue it for human approval.",
+  "claudeMdExcludes": [
+    "**/CLAUDE.md",
+    "**/CLAUDE.local.md"
+  ],
   "disableArtifact": true,
   "disableBypassPermissionsMode": "disable",
+  "disableBundledSkills": true,
   "disableClaudeAiConnectors": true,
   "disableSideloadFlags": true,
   "hooks": {
@@ -24,6 +30,7 @@
     ]
   },
   "strictKnownMarketplaces": [],
+  "strictPluginOnlyCustomization": true,
   "permissions": {
     "deny": [
       "WebFetch",
@@ -52,6 +59,7 @@
     "failIfUnavailable": true,
     "allowUnsandboxedCommands": false,
     "excludedCommands": [
+      "/usr/local/bin/fieldwork-pr-build *",
       "/usr/local/bin/fieldwork-pr-upload *",
       "/usr/local/bin/fieldwork-pr-prepare *",
       "/usr/local/bin/fieldwork-verify *"

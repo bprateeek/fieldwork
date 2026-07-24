@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Build a protocol-v2 PR metadata record and non-thin Git pack.
 
-This command is intentionally sandboxed.  It performs Git reads in the agent
-checkout and publishes only ``meta.json`` plus ``pack`` into the untrusted
-per-UID spool.  Upload is a separate top-level command.
+This root-owned client is allowed outside the Bash sandbox only for the fixed
+``.fieldwork/local/pr-build-request.json`` input enforced by the managed hook.
+It performs scrubbed local Git reads and publishes only ``meta.json`` plus
+``pack`` into the untrusted per-UID spool. Upload is a separate top-level
+command.
 """
 
 from __future__ import annotations

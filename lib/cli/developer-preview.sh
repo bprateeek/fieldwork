@@ -476,7 +476,8 @@ fieldwork_adapter() {
             setup_status_line manual "Claude Code CLI not found on this host"
           fi
           info_row "launch" "$path <repo-slug> <repo-dir>"
-          info_row "remote command" "claude remote-control --name vps-<slug> --remote-control-session-name-prefix vps-<slug> --sandbox --spawn=worktree --capacity=\$FIELDWORK_AGENT_CAPACITY"
+          info_row "remote command" "claude remote-control --name vps-<slug> --remote-control-session-name-prefix vps-<slug> --spawn=worktree --capacity=\$FIELDWORK_AGENT_CAPACITY"
+          info_row "sandbox" "enforced by root-owned Claude managed settings"
           ;;
         *)
           info_row "launch" "$path <repo-slug> <repo-dir>"

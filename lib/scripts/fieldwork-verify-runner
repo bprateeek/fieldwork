@@ -8,14 +8,13 @@
 # request, runs fieldwork-verify-pipeline, and writes a tagged stream of
 # stdout/stderr lines plus a final exit-code frame back to the same socket.
 #
-# Why this layer exists at all: the agent process that calls
-# /home/fieldwork/.local/bin/fieldwork-verify has PR_SET_NO_NEW_PRIVS set
-# and runs inside its own user namespace (claude remote-control --sandbox).
-# A bwrap child of that process cannot create the user namespace it needs,
-# because AppArmor's profile transition into fieldwork-bwrap is blocked by
-# NNP. Routing the verify call through this socket-activated unit puts the
-# real work under the root-owned system manager — outside the agent's
-# userns, with NNP clear, in a context where bwrap works.
+# Why this layer exists at all: the caller inherits PR_SET_NO_NEW_PRIVS from
+# the agent service, and ordinary Bash runs inside the root-managed Claude
+# user-namespace sandbox. A nested bwrap cannot create the user namespace it
+# needs because NNP blocks AppArmor's profile transition into fieldwork-bwrap.
+# Routing the verify call through this socket-activated unit puts the real
+# work under the root-owned system manager — outside that inherited
+# restriction, with NNP clear, in a context where bwrap works.
 #
 # Wire protocol (one direction in, one direction out, line-delimited):
 #

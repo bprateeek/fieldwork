@@ -24,11 +24,16 @@ MAX_INPUT = 1024 * 1024
 DENIAL = "fieldwork-excluded-client-policy: denied unsafe excluded-client command"
 UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"
 CLIENTS = (
+    "/usr/local/bin/fieldwork-pr-build",
     "/usr/local/bin/fieldwork-pr-upload",
     "/usr/local/bin/fieldwork-pr-prepare",
     "/usr/local/bin/fieldwork-verify",
 )
 ALLOWED = (
+    re.compile(
+        r"^/usr/local/bin/fieldwork-pr-build "
+        r"\.fieldwork/local/pr-build-request\.json$"
+    ),
     re.compile(rf"^/usr/local/bin/fieldwork-pr-upload (?:--status )?{UUID}$"),
     re.compile(rf"^/usr/local/bin/fieldwork-pr-prepare {UUID}$"),
     re.compile(r"^/usr/local/bin/fieldwork-pr-prepare not-a-uuid$"),
@@ -36,6 +41,10 @@ ALLOWED = (
     re.compile(r"^/usr/local/bin/fieldwork-verify /nonexistent-fieldwork-probe$"),
 )
 PROBE_REWRITES = {
+    "printf fieldwork-probe-build": (
+        "/usr/local/bin/fieldwork-pr-build "
+        ".fieldwork/local/pr-build-request.json"
+    ),
     "printf fieldwork-probe-upload": (
         "/usr/local/bin/fieldwork-pr-upload --status "
         "00000000-0000-4000-8000-000000000001"

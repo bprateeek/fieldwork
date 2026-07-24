@@ -128,7 +128,7 @@ The repository instructions require:
 1. verify with `/usr/local/bin/fieldwork-verify "$PWD"`;
 2. commit all intended files, using the prepare runner if required;
 3. create a v2 build request with slug, `fieldwork/...` branch, title, body;
-4. call `fieldwork-pr-build`;
+4. call `/usr/local/bin/fieldwork-pr-build .fieldwork/local/pr-build-request.json`;
 5. call `/usr/local/bin/fieldwork-pr-upload <request-id>` separately.
 
 Status is durable:

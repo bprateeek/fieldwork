@@ -373,7 +373,9 @@ Write and pass the documented request path only:
 
 Do not create a `.claude/local` mirror. Write the prepare request as the only
 file in the private per-UID spool entry, then pass its UUID. The later upload
-phase uses `fieldwork-pr-build` and `/usr/local/bin/fieldwork-pr-upload`.
+phase uses
+`/usr/local/bin/fieldwork-pr-build .fieldwork/local/pr-build-request.json`
+and `/usr/local/bin/fieldwork-pr-upload`.
 
 ## AppArmor, userns, Or bwrap Failures
 

@@ -1,6 +1,6 @@
 # Devcontainer security invariants
 
-This devcontainer is the **build/test runtime boundary**: `npm test`, `cargo build`, and similar isolated commands run here. **It is not the Claude execution boundary.** Claude itself runs on the host with `--sandbox` + `permissions.deny` as part of the Fieldwork host sandbox.
+This devcontainer is the **build/test runtime boundary**: `npm test`, `cargo build`, and similar isolated commands run here. **It is not the Claude execution boundary.** Claude itself runs on the host with root-owned, fail-closed managed sandbox settings plus `permissions.deny` as part of the Fieldwork host sandbox.
 
 If you ever want the container to be the actual Claude execution boundary, run `claude remote-control` *inside* the container instead. That's not the default; it requires extra plumbing (volume mounts for `~/.claude`, container lifecycle vs systemd, port plumbing).
 

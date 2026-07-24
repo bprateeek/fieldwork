@@ -37,6 +37,10 @@ def invoke(
 class BashPolicyTests(unittest.TestCase):
     def test_exact_excluded_client_forms_are_allowed(self) -> None:
         commands = (
+            (
+                "/usr/local/bin/fieldwork-pr-build "
+                ".fieldwork/local/pr-build-request.json"
+            ),
             f"/usr/local/bin/fieldwork-pr-upload {REQUEST_ID}",
             f"/usr/local/bin/fieldwork-pr-upload --status {REQUEST_ID}",
             f"/usr/local/bin/fieldwork-pr-prepare {REQUEST_ID}",
@@ -66,6 +70,10 @@ class BashPolicyTests(unittest.TestCase):
 
     def test_root_probe_mode_rewrites_exact_markers_and_denies_policy_marker(self) -> None:
         expected = {
+            "printf fieldwork-probe-build": (
+                "/usr/local/bin/fieldwork-pr-build "
+                ".fieldwork/local/pr-build-request.json"
+            ),
             "printf fieldwork-probe-upload": (
                 "/usr/local/bin/fieldwork-pr-upload --status "
                 f"{REQUEST_ID}"
@@ -97,7 +105,14 @@ class BashPolicyTests(unittest.TestCase):
 
     def test_every_composed_or_wrapped_client_form_is_denied(self) -> None:
         upload = f"/usr/local/bin/fieldwork-pr-upload {REQUEST_ID}"
+        build = (
+            "/usr/local/bin/fieldwork-pr-build "
+            ".fieldwork/local/pr-build-request.json"
+        )
         commands = (
+            f"{build} ; echo escaped",
+            "/usr/local/bin/fieldwork-pr-build request.json",
+            "/usr/local/bin/fieldwork-pr-build .fieldwork/local/../request.json",
             f"{upload} ; echo escaped",
             f"{upload} && echo escaped",
             f"{upload} || echo escaped",

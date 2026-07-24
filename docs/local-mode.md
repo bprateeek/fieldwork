@@ -19,7 +19,7 @@ not have Docker access.
 The dedicated Claude session loads only root-owned managed settings. Bash-child
 network access has an empty managed allowlist, outbound tools and unmanaged MCP
 are unavailable, Docker sockets and the local bearer are unreadable, and only
-the absolute root-owned upload/verify/prepare clients may escape the sandbox.
+the absolute root-owned build/upload/verify/prepare clients may escape the sandbox.
 The launcher refuses symlinked, writable, or digest-changed boundary assets.
 
 Local Codex is not a hard-boundary mode in this release.
@@ -75,7 +75,8 @@ sudo fieldwork-local claude app
 
 Commit all intended changes so the worktree is clean. The local Claude sandbox
 supports the normal Git commit path; the prepare runner is currently a VPS
-boundary service. Create a build request:
+boundary service. The root-owned builder is admitted only for the fixed request
+path below. Create that build request:
 
 ```json
 {
@@ -90,7 +91,7 @@ boundary service. Create a build request:
 Then make two separate top-level calls:
 
 ```sh
-fieldwork-pr-build .fieldwork/local/pr-build-request.json
+/usr/local/bin/fieldwork-pr-build .fieldwork/local/pr-build-request.json
 /usr/local/bin/fieldwork-pr-upload <printed-request-id>
 ```
 
