@@ -2555,7 +2555,7 @@ if [ -d "$broker_state" ]; then
       "$broker_state/notifications"
   fi
   install -o "$broker_user" -g fieldwork-bot -m 0710 -d "$broker_state"
-  install -o "$broker_user" -g fieldwork-bot -m 0750 -d \
+  install -o "$broker_user" -g fieldwork-bot -m 2750 -d \
     "$broker_state/pending-meta"
   install -o "$broker_user" -g fieldwork-bot -m 2770 -d \
     "$broker_state/pending-sidecar" "$broker_state/notifications"

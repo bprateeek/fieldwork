@@ -486,6 +486,21 @@ class BrokerV2Tests(unittest.TestCase):
         payloads = [json.loads(item.read_text()) for item in server.NOTIFICATIONS_DIR.glob("*.json")]
         self.assertEqual(payloads, [{"schema_version": 1, "event": "queued", "request_id": request_id, "slug": "demo"}])
 
+    def test_pending_metadata_preserves_setgid_group_inheritance(self):
+        requested_modes = []
+        real_mkdir = server._mkdir
+
+        def capture_mode(path, mode):
+            requested_modes.append((path, mode))
+            real_mkdir(path, mode)
+
+        with mock.patch.object(server, "_mkdir", side_effect=capture_mode):
+            server.initialize_state_dirs()
+        # The broker is not a member of the bot group on the VPS. New metadata
+        # files therefore depend on the directory's setgid bit to inherit the
+        # bot-readable group instead of the broker's primary group.
+        self.assertIn((server.PENDING_META_DIR, 0o2750), requested_modes)
+
     def test_object_scan_covers_tree_names_commit_identity_signature_and_flat_blobs(self):
         blob_oid, tree_oid, commit_oid = "a" * 40, "b" * 40, "c" * 40
         objects = {

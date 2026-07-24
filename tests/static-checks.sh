@@ -192,6 +192,11 @@ for name in pending-meta pending-sidecar pending-pack tombstones pending-mac.key
 done
 grep -Fq 'install -d -o "$BROKER_USER" -g "$BROKER_BOT_GROUP" -m 710 "$STATE_DIR"' \
   lib/broker/install.sh
+grep -Fq 'install -d -o "$BROKER_USER" -g "$BROKER_BOT_GROUP" -m 2750 "$STATE_DIR/pending-meta"' \
+  lib/broker/install.sh
+grep -Fq '(PENDING_META_DIR, 0o2750)' lib/broker/server.py
+grep -Fq '/data/pending-meta:2750:10001:10002' lib/local/entrypoint.sh
+grep -Fq 'install -o "$broker_user" -g fieldwork-bot -m 2750 -d' lib/cli/setup.sh
 grep -Fq 'find "$STATE_DIR" -xdev \( -type d -o -type f \)' \
   lib/broker/install.sh
 grep -Fq 'setfacl -b -k --' lib/broker/install.sh lib/cli/setup.sh
@@ -200,6 +205,10 @@ grep -Fq 'install -o "$broker_user" -g fieldwork-bot -m 0710 -d "$broker_state"'
 grep -Fq 'bot user can traverse and read pending metadata' \
   lib/cli/verify-security.sh
 grep -Fq 'pending_dir="/var/lib/fieldwork-pr-broker/pending-meta"' bin/fieldwork
+for file in bin/fieldwork lib/scripts/fieldwork-bot; do
+  grep -Fq 'record.get("project") or record.get("repo")' "$file" \
+    || die "protocol-v2 project fallback missing from $file"
+done
 grep -Fq 'sudo -n -u fieldwork-bot test -r "$candidate"' bin/fieldwork
 for file in lib/broker/install.sh lib/cli/setup.sh; do
   grep -Fq 'install -d -o fieldwork-bot -g fieldwork-bot -m 700 /var/lib/fieldwork-bot' "$file" \

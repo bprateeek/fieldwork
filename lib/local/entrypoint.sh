@@ -8,7 +8,7 @@ initialize_broker() {
     /data/policy-ca:0700:10001:10001 \
     /data/keys:0700:10001:10001 \
     /data/state:0700:10001:10001 \
-    /data/pending-meta:0750:10001:10002 \
+    /data/pending-meta:2750:10001:10002 \
     /data/pending-sidecar:2770:10001:10002 \
     /data/pending-pack:0700:10001:10001 \
     /data/auth:0700:10001:10001 \

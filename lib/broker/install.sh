@@ -61,7 +61,7 @@ install -d -o "$BROKER_USER" -g "$BROKER_USER" -m 700 \
   "$STATE_DIR/requests" "$STATE_DIR/pending-pack" \
   "$STATE_DIR/tombstones" "$STATE_DIR/work" "$STATE_DIR/keys" "$STATE_DIR/ca"
 install -d -o "$BROKER_USER" -g "$BROKER_USER" -m 750 "$STATE_DIR/policy"
-install -d -o "$BROKER_USER" -g "$BROKER_BOT_GROUP" -m 750 "$STATE_DIR/pending-meta"
+install -d -o "$BROKER_USER" -g "$BROKER_BOT_GROUP" -m 2750 "$STATE_DIR/pending-meta"
 install -d -o "$BROKER_USER" -g "$BROKER_BOT_GROUP" -m 2770 \
   "$STATE_DIR/pending-sidecar" "$STATE_DIR/notifications"
 install -d -o root -g fieldwork-bot -m 0750 /etc/fieldwork-bot

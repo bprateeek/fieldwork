@@ -280,13 +280,17 @@ EOF
 
     if [ "$bot_user_exists" = "1" ]; then
       if ssh "$FIELDWORK_SSH_HOST" "sudo -n -u fieldwork-bot true 2>/dev/null" >/dev/null 2>&1; then
-        if ssh "$FIELDWORK_SSH_HOST" "sudo -n -u fieldwork-bot sh -c 'test -x /var/lib/fieldwork-pr-broker && test -r /var/lib/fieldwork-pr-broker/pending-meta && test -x /var/lib/fieldwork-pr-broker/pending-meta' 2>/dev/null" >/dev/null 2>&1; then
+        local pending_meta_mode=""
+        pending_meta_mode="$(ssh "$FIELDWORK_SSH_HOST" "sudo -n stat -c '%U:%G %a' /var/lib/fieldwork-pr-broker/pending-meta 2>/dev/null" || true)"
+        if [ "$pending_meta_mode" != "fieldwork-pr-broker:fieldwork-bot 2750" ]; then
+          security_fail "pending metadata directory has wrong owner/mode ($pending_meta_mode, expected fieldwork-pr-broker:fieldwork-bot 2750)" "Run: fieldwork sync-vps, then fieldwork setup-notify --telegram-bot"
+        elif ssh "$FIELDWORK_SSH_HOST" "sudo -n -u fieldwork-bot sh -c 'test -x /var/lib/fieldwork-pr-broker && test -r /var/lib/fieldwork-pr-broker/pending-meta && test -x /var/lib/fieldwork-pr-broker/pending-meta && for path in /var/lib/fieldwork-pr-broker/pending-meta/*.json; do test ! -e \"\$path\" || test -r \"\$path\" || exit 1; done' 2>/dev/null" >/dev/null 2>&1; then
           security_ok "bot user can traverse and read pending metadata"
         else
           security_fail "bot user cannot traverse and read pending metadata" "Run: fieldwork sync-vps, then fieldwork setup-notify --telegram-bot"
         fi
       else
-        security_manual "pending metadata access needs manual sudo verification" "Run: ssh -t $FIELDWORK_SSH_HOST $(shell_double_quote "sudo -u fieldwork-bot sh -c 'test -x /var/lib/fieldwork-pr-broker && test -r /var/lib/fieldwork-pr-broker/pending-meta && test -x /var/lib/fieldwork-pr-broker/pending-meta'"). Expected: exit 0"
+        security_manual "pending metadata access needs manual sudo verification" "Run: ssh -t $FIELDWORK_SSH_HOST $(shell_double_quote "sudo stat -c '%U:%G %a' /var/lib/fieldwork-pr-broker/pending-meta && sudo -u fieldwork-bot sh -c 'for path in /var/lib/fieldwork-pr-broker/pending-meta/*.json; do test ! -e \"\$path\" || test -r \"\$path\" || exit 1; done'"). Expected: fieldwork-pr-broker:fieldwork-bot 2750, then exit 0"
       fi
     fi
 

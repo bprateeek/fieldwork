@@ -119,6 +119,7 @@ class BotPendingScanTests(unittest.TestCase):
             "queued_at": "2026-05-15T10:00:00Z",
             "expires_at": "2026-05-16T10:00:00Z",
             "slug": "example",
+            "project": "owner/example",
             "state": "queued",
         }
         Path(self.bot.PENDING_DIR, f"{rid}.json").write_text(json.dumps(record))
@@ -144,6 +145,7 @@ class BotPendingScanTests(unittest.TestCase):
         self.assertEqual(health["pending_count"], 1)
         self.assertGreaterEqual(health["oldest_pending_age_seconds"], 0)
         self.assertEqual(health["pending_requests"][0]["request_id"], rid)
+        self.assertEqual(health["pending_requests"][0]["repo"], "owner/example")
 
         # Second pass: sidecar present → no resend.
         sends.clear()

@@ -243,9 +243,9 @@ def answer_callback(token: str, callback_query_id: str, text: str = "") -> None:
 def write_sidecar(request_id: str, chats: list[tuple[int, int]]) -> None:
     """Records that we sent the approval prompt — survives a bot restart.
 
-    Stored as ``pending/<rid>.json.notified`` next to the broker's pending
-    file. Group-writable by fieldwork-bot via the dir's mode 0770 +
-    setgid. The broker removes both files on /approve / /deny.
+    Stored as ``pending-sidecar/<rid>.notified.json`` separately from the
+    broker-owned metadata. Group-writable by fieldwork-bot via the directory's
+    mode 2770. The broker removes both files on /approve / /deny.
     """
     path = Path(PENDING_SIDECAR_DIR) / f"{request_id}.notified.json"
     payload = {"sent_at": _utcnow_iso(), "chats": [[c, m] for c, m in chats]}
@@ -398,7 +398,7 @@ def pending_health_summary() -> tuple[int, int | None, list[dict]]:
         request_id = record.get("request_id", path.stem)
         if not isinstance(request_id, str):
             request_id = path.stem
-        repo = record.get("repo", "unknown")
+        repo = record.get("project") or record.get("repo") or record.get("slug") or "unknown"
         branch = record.get("branch", "?")
         age_seconds = _pending_age_seconds(record, path, now)
         summaries.append({

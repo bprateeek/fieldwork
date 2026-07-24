@@ -162,7 +162,7 @@ def _mkdir(path: Path, mode: int) -> None:
 
 def initialize_state_dirs() -> None:
     for path, mode in (
-        (POLICY_DIR, 0o750), (LEDGER_DIR, 0o700), (PENDING_META_DIR, 0o750),
+        (POLICY_DIR, 0o750), (LEDGER_DIR, 0o700), (PENDING_META_DIR, 0o2750),
         (PENDING_SIDECAR_DIR, 0o2770), (PENDING_PACK_DIR, 0o700),
         (TOMBSTONE_DIR, 0o700), (WORK_DIR, 0o700), (NOTIFICATIONS_DIR, 0o2770),
     ):

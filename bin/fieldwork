@@ -1361,10 +1361,11 @@ for path in entries:
             record = json.load(f)
     except Exception:
         continue
+    repo = record.get("project") or record.get("repo") or ""
     repo_path = record.get("repo_path") or ""
-    slug = os.path.basename(repo_path) if repo_path else os.path.basename(str(record.get("repo") or ""))
+    slug = record.get("slug") or (os.path.basename(repo_path) if repo_path else os.path.basename(str(repo)))
     items.append({
-        "repo": str(record.get("repo") or "unknown").replace("\t", " "),
+        "repo": str(repo or "unknown").replace("\t", " "),
         "branch": str(record.get("branch") or "?").replace("\t", " "),
         "request_id": str(record.get("request_id") or path.stem).replace("\t", " "),
         "age_seconds": age_for(record, path, now),
