@@ -214,7 +214,8 @@ EOF
   fi
 
   phase_section "Broker Service Hardening"
-  local directive
+  local directive broker_unit=""
+  broker_unit="$(ssh "$FIELDWORK_SSH_HOST" "systemctl cat fieldwork-pr-broker.service 2>/dev/null" || true)"
   for directive in \
     "NoNewPrivileges=true" \
     "PrivateTmp=true" \
@@ -226,7 +227,7 @@ EOF
     "CPUQuota=200%" \
     "LimitFSIZE=268435456" \
     "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6"; do
-    if ssh "$FIELDWORK_SSH_HOST" "systemctl cat fieldwork-pr-broker.service 2>/dev/null | grep -Fx '$directive' >/dev/null" >/dev/null 2>&1; then
+    if printf '%s\n' "$broker_unit" | grep -Fxq "$directive"; then
       security_ok "broker service has $directive"
     else
       security_fail "broker service missing $directive" "Run: fieldwork sync-vps --force-install, then $(remote_sudo_ssh_command "bash ~/.fieldwork/infra/fieldwork-pr-broker/install.sh")"

@@ -204,6 +204,8 @@ grep -Fq 'install -o "$broker_user" -g fieldwork-bot -m 0710 -d "$broker_state"'
   lib/cli/setup.sh
 grep -Fq 'bot user can traverse and read pending metadata' \
   lib/cli/verify-security.sh
+grep -Fq 'broker_unit="$(ssh "$FIELDWORK_SSH_HOST" "systemctl cat fieldwork-pr-broker.service 2>/dev/null" || true)"' \
+  lib/cli/verify-security.sh
 grep -Fq 'pending_dir="/var/lib/fieldwork-pr-broker/pending-meta"' bin/fieldwork
 for file in bin/fieldwork lib/scripts/fieldwork-bot; do
   grep -Fq 'record.get("project") or record.get("repo")' "$file" \
