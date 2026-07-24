@@ -1,36 +1,41 @@
-# Backup And Restore
+# Backup and restore
 
-Fieldwork state lives in a few places.
+Back up broker authority and lifecycle state as one consistency set:
 
-Back up:
+- credential and broker config;
+- policy and content-addressed CA store;
+- `keys/pending-mac.key`;
+- permanent request ledger;
+- pending metadata, sidecars, and packs;
+- tombstones;
+- audit log and bot state/config where applicable.
 
-- `/etc/fieldwork-pr-broker/gh-token`
-- `/etc/fieldwork-bot/config.toml`
-- `/etc/fieldwork-bot/secret`
-- `/var/lib/fieldwork-pr-broker/requests`
-- `/var/lib/fieldwork-pr-broker/pending`
-- `/var/lib/fieldwork-pr-broker/audit.jsonl`
-- `/var/lib/fieldwork-bot`
-- the onboarded repo checkouts under the configured projects directory
-- per-repo `.claude/` state in those checkouts
+On VPS these live under `/etc/fieldwork-pr-broker`,
+`/var/lib/fieldwork-pr-broker`, `/etc/fieldwork-bot`, and
+`/var/lib/fieldwork-bot`. Stop agent sessions and broker sockets before a
+filesystem-level backup so metadata, packs, and MACs are mutually consistent.
 
-Forge-side state is not on the VPS:
+Local mode stores the same classes in named Compose volumes. Use Docker's
+volume backup mechanism while `fieldwork-local down`; do not use
+`fieldwork-local clean` until the backup is verified.
 
-- broker token project selection and permissions
-- read-only deploy keys
-- branch protection
-- open PRs/MRs and branches
+## Restore
 
-Restore outline:
+1. Verify and install the exact compatible Fieldwork release.
+2. Keep agent intake stopped.
+3. Restore ownership and modes before starting services.
+4. Restore the original MAC key with its pending records.
+5. Start the broker and inspect reconciliation/status.
+6. Resolve any `needs_operator` records.
+7. Start approval transport and agent sessions.
 
-1. Rebuild the VPS and reinstall Fieldwork.
-2. Restore broker and bot config/secrets with the documented owners and modes.
-3. Restore or reclone onboarded repositories.
-4. If compromise or token exposure is possible, rotate the broker token instead
-   of restoring it.
-5. Run `fieldwork verify-security`.
-6. For GitHub repos, run `fieldwork smoke <owner>/<repo>` for each important repo. For GitLab projects, use a throwaway MR path because `fieldwork smoke` is GitHub-only.
+The MAC key is not interchangeable. Losing or rotating it makes pending
+metadata unverifiable. Drain pending work before an intentional key rotation.
+The replay ledger should remain permanent; deleting it re-enables UUID replay.
 
-If the VPS is lost while requests are pending, treat pending approvals as stale:
-restore the pending directory only if you understand the repo state it refers
-to. Otherwise delete pending requests and have the agent resubmit.
+## Credential incident
+
+If a forge token may have escaped, revoke it at the forge first. A backup is not
+a reason to restore a revoked credential. Install a new least-privilege token,
+validate it with the rotation helper, and review audit/remote branches for
+unexpected writes.

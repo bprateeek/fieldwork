@@ -1,0 +1,64 @@
+#!/usr/bin/python3 -I
+"""Create the Linux NoNewPrivs/user-namespace cage used by the release probe."""
+import ctypes
+import os
+import signal
+import sys
+
+PR_SET_PDEATHSIG = 1
+PR_SET_NO_NEW_PRIVS = 38
+CLONE_NEWUSER = 0x10000000
+
+if len(sys.argv) < 2:
+    print("usage: fieldwork-session-probe-cage command [args...]", file=sys.stderr)
+    raise SystemExit(2)
+
+libc = ctypes.CDLL(None, use_errno=True)
+uid, gid = os.getuid(), os.getgid()
+unshared_r, unshared_w = os.pipe()
+mapped_r, mapped_w = os.pipe()
+pid = os.fork()
+if pid == 0:
+    os.close(unshared_r)
+    os.close(mapped_w)
+    libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0)
+    if libc.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0:
+        print("cage: prctl(NO_NEW_PRIVS) failed", file=sys.stderr)
+        os._exit(97)
+    if libc.unshare(CLONE_NEWUSER) != 0:
+        error = ctypes.get_errno()
+        print(f"cage: unshare(CLONE_NEWUSER) failed: {os.strerror(error)}", file=sys.stderr)
+        os._exit(97)
+    os.write(unshared_w, b"u")
+    os.close(unshared_w)
+    if os.read(mapped_r, 1) != b"m":
+        os._exit(97)
+    os.close(mapped_r)
+    try:
+        os.execvp(sys.argv[1], sys.argv[1:])
+    except OSError as exc:
+        print(f"cage: exec failed: {exc}", file=sys.stderr)
+        os._exit(97)
+
+os.close(unshared_w)
+os.close(mapped_r)
+if os.read(unshared_r, 1) != b"u":
+    _, status = os.waitpid(pid, 0)
+    raise SystemExit(os.waitstatus_to_exitcode(status) if status else 97)
+os.close(unshared_r)
+try:
+    with open(f"/proc/{pid}/setgroups", "w", encoding="ascii") as handle:
+        handle.write("deny")
+    with open(f"/proc/{pid}/gid_map", "w", encoding="ascii") as handle:
+        handle.write(f"{gid} {gid} 1")
+    with open(f"/proc/{pid}/uid_map", "w", encoding="ascii") as handle:
+        handle.write(f"{uid} {uid} 1")
+except OSError as exc:
+    print(f"cage: id map write failed: {exc}", file=sys.stderr)
+    os.kill(pid, signal.SIGKILL)
+    os.waitpid(pid, 0)
+    raise SystemExit(97)
+os.write(mapped_w, b"m")
+os.close(mapped_w)
+_, status = os.waitpid(pid, 0)
+raise SystemExit(os.waitstatus_to_exitcode(status))

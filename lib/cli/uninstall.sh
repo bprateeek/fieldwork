@@ -33,8 +33,8 @@ usage: fieldwork uninstall [--dry-run] [--yes] [--quiet] [--local] [--remote] [-
 Guided teardown for Fieldwork-managed local files, remote user services,
 broker/system services, and approval-bot infrastructure.
 
-Default scope removes discovered Fieldwork-owned local assets, remote user
-services/scripts when SSH works, broker/system services when discovered, and
+Default scope removes discovered Fieldwork-owned local assets, the root-owned
+remote session boundary and scripts when SSH works, broker services when discovered, and
 approval-bot infrastructure when discovered.
 
 It never removes repositories, SSH keys, VPS user accounts, Docker, GitHub CLI,
@@ -120,6 +120,7 @@ EOF
   fi
 
   local remote_available=0
+  local boundary_discovered=0
   local broker_discovered=0
   local bot_discovered=0
   if [ "$do_remote" = "1" ] || [ "$do_broker" = "1" ] || [ "$do_bot" = "1" ]; then
@@ -132,6 +133,7 @@ EOF
 test -e /etc/systemd/system/fieldwork-pr-broker.service ||
 test -e /etc/systemd/system/fieldwork-pr-broker.socket ||
 test -e /etc/systemd/system/fieldwork-pr-approve.socket ||
+test -e /etc/systemd/system/fieldwork-pr-broker-maintenance.socket ||
 test -L /etc/systemd/system/multi-user.target.wants/fieldwork-pr-broker.service ||
 test -L /etc/systemd/system/sockets.target.wants/fieldwork-pr-broker.socket ||
 test -L /etc/systemd/system/sockets.target.wants/fieldwork-pr-approve.socket ||
@@ -142,6 +144,10 @@ test -f /usr/local/lib/fieldwork-pr-broker/server.py ||
 test -f /usr/local/lib/fieldwork-pr-broker/git-askpass ||
 test -f /usr/local/lib/fieldwork-pr-broker/pr-request.schema.json ||
 test -f /usr/local/sbin/rotate-pat ||
+test -f /usr/local/sbin/fieldwork-policy-write ||
+test -f /usr/local/sbin/fieldwork-pr-maintenance-submit ||
+test -f /usr/local/sbin/fieldwork-pr-maintenance-mode ||
+test -f /usr/local/sbin/fieldwork-migrate-instructions ||
 test -d /var/lib/fieldwork-pr-broker ||
 test -d /var/lib/fieldwork-pr-broker/requests ||
 test -d /var/lib/fieldwork-pr-broker/pending ||
@@ -155,6 +161,18 @@ id fieldwork-pr-broker >/dev/null 2>&1 ||
 getent group fieldwork-pr >/dev/null 2>&1
 '; then
       broker_discovered=1
+    fi
+  fi
+  if [ "$remote_available" = "1" ] && [ "$do_remote" = "1" ]; then
+    if uninstall_status_check "checking remote hard-boundary install state" ssh "$FIELDWORK_SSH_HOST" '
+test -e /etc/systemd/system/fieldwork-agent@.service ||
+test -e /etc/systemd/system/fieldwork-verify-runner.socket ||
+test -e /etc/systemd/system/fieldwork-pr-prepare-runner.socket ||
+test -d /usr/local/lib/fieldwork ||
+test -f /usr/local/bin/fieldwork-pr-upload ||
+test -f /usr/local/sbin/fieldwork-session-probe-record
+'; then
+      boundary_discovered=1
     fi
   fi
   if [ "$remote_available" = "1" ] && [ "$do_bot" = "1" ]; then
@@ -268,6 +286,14 @@ find /tmp -maxdepth 1 \( -name "fieldwork-install-bot-*.sh" -o -name "fieldwork-
 
   if [ "$do_remote" = "1" ]; then
     if [ "$remote_available" = "1" ]; then
+      if [ "$boundary_discovered" = "1" ]; then
+        if ! uninstall_remote_boundary "$purge"; then
+          system_cleanup_failed=1
+          uninstall_failed "root-owned session boundary cleanup" "sudo unavailable or command failed"
+        fi
+      else
+        uninstall_skipped "root-owned session boundary cleanup" "not present"
+      fi
       if ! uninstall_run_captured "cleaning remote user services" "remote user cleanup complete" "remote user cleanup failed" uninstall_remote_user "$purge" "$remove_remote_notify" "$((1 - defer_temporary_sudo))"; then
         :
       fi
@@ -390,16 +416,15 @@ print_uninstall_plan() {
   fi
 
   if [ "$do_remote" = "1" ]; then
-    phase_section "Remote user services"
+    phase_section "Remote session boundary"
     if [ "$remote_available" = "1" ]; then
-      echo "  - fieldwork-agent@*.service sessions and unit"
-      echo "  - fieldwork-verify-runner.socket/service"
-      echo "  - fieldwork-pr-prepare-runner.socket/service"
-      echo "  - fieldwork-event-poll.timer/service"
-      echo "  - fieldwork-dashboard.service"
-      echo "  - fieldwork-task-dispatcher.service"
+      echo "  - root-owned fieldwork-agent@*.service sessions and unit  requires sudo"
+      echo "  - root-owned verify/prepare sockets and runners          requires sudo"
+      echo "  - root-owned event poll/task dispatcher units            requires sudo"
+      echo "  - pinned Claude, managed policy, and boundary clients    requires sudo"
+      echo "  - stale user-scoped Fieldwork units"
       echo "  - remote Fieldwork scripts and synced checkout"
-      [ "$purge" = "1" ] && echo "  - remote Fieldwork cache/log state"
+      [ "$purge" = "1" ] && echo "  - remote Fieldwork queue/cache/log state                  requires sudo"
     else
       echo "  - skipped: SSH unavailable"
     fi
@@ -1255,6 +1280,80 @@ uninstall_local_ssh_alias() {
   uninstall_remove_local_ssh_alias || true
 }
 
+uninstall_remote_boundary() {
+  local purge="$1"
+  local command='bash -lc '"$(shell_quote "set -eu
+FIELDWORK_UNINSTALL_QUIET=${UNINSTALL_QUIET:-0}
+log_status() {
+  status=\"\$1\"; description=\"\$2\"; reason=\"\${3:-}\"
+  case \"\$status\" in
+    ok) [ \"\${FIELDWORK_UNINSTALL_QUIET:-0}\" = \"1\" ] && return 0; printf '  [ready] %s\\n' \"\$description\" ;;
+    skipped) [ \"\${FIELDWORK_UNINSTALL_QUIET:-0}\" = \"1\" ] && return 0; printf '  [info] %s (%s)\\n' \"\$description\" \"\$reason\" ;;
+    failed) printf '  [blocked] %s (%s)\\n' \"\$description\" \"\$reason\" ;;
+  esac
+}
+ok() { log_status ok \"\$1\"; }
+skipped() { log_status skipped \"\$1\" \"\$2\"; }
+failed() { log_status failed \"\$1\" \"\$2\"; }
+remove_file() {
+  description=\"\$1\"; path=\"\$2\"
+  if [ ! -e \"\$path\" ] && [ ! -L \"\$path\" ]; then skipped \"\$description\" \"not present\"; return 0; fi
+  if rm -f -- \"\$path\"; then ok \"\$description\"; else failed \"\$description\" \"rm failed\"; return 1; fi
+}
+remove_tree() {
+  description=\"\$1\"; path=\"\$2\"; prefix=\"\$3\"
+  case \"\$path\" in \"\$prefix\"/*) ;; *) failed \"\$description\" \"outside expected prefix\"; return 1 ;; esac
+  if [ ! -e \"\$path\" ]; then skipped \"\$description\" \"not present\"; return 0; fi
+  if rm -rf -- \"\$path\"; then ok \"\$description\"; else failed \"\$description\" \"rm failed\"; return 1; fi
+}
+
+agent_units=\$(systemctl list-units --all --plain --no-legend 'fieldwork-agent@*.service' 2>/dev/null | awk '{print \$1}' || true)
+if [ -n \"\$agent_units\" ]; then
+  for unit in \$agent_units; do
+    case \"\$unit\" in fieldwork-agent@*.service) systemctl disable --now \"\$unit\" >/dev/null 2>&1 || true ;; esac
+  done
+  ok \"root-owned agent sessions\"
+else
+  skipped \"root-owned agent sessions\" \"not active\"
+fi
+if systemctl disable --now fieldwork-event-poll.timer fieldwork-task-dispatcher.service fieldwork-verify-runner.socket fieldwork-pr-prepare-runner.socket >/dev/null 2>&1; then
+  ok \"root-owned boundary units\"
+else
+  boundary_present=0
+  for path in /etc/systemd/system/fieldwork-agent@.service /etc/systemd/system/fieldwork-event-poll.timer /etc/systemd/system/fieldwork-task-dispatcher.service /etc/systemd/system/fieldwork-verify-runner.socket /etc/systemd/system/fieldwork-pr-prepare-runner.socket; do
+    [ ! -e \"\$path\" ] || boundary_present=1
+  done
+  if [ \"\$boundary_present\" = 1 ]; then failed \"root-owned boundary units\" \"systemctl failed\"; else skipped \"root-owned boundary units\" \"not present\"; fi
+fi
+for unit in fieldwork-agent@.service fieldwork-event-poll.service fieldwork-event-poll.timer fieldwork-task-dispatcher.service fieldwork-verify-runner.socket fieldwork-verify-runner@.service fieldwork-pr-prepare-runner.socket fieldwork-pr-prepare-runner@.service; do
+  remove_file \"system unit \$unit\" \"/etc/systemd/system/\$unit\"
+done
+remove_tree \"root-owned Fieldwork boundary library\" /usr/local/lib/fieldwork /usr/local/lib
+remove_tree \"root-owned Fieldwork delivery instructions\" /usr/local/share/fieldwork-claude /usr/local/share
+for path in /usr/local/bin/fieldwork-verify /usr/local/bin/fieldwork-pr-prepare /usr/local/bin/fieldwork-pr-build /usr/local/bin/fieldwork-pr-upload /usr/local/bin/fieldwork-bash-policy /usr/local/sbin/fieldwork-session-probe-record; do
+  remove_file \"root-owned boundary client \$path\" \"\$path\"
+done
+managed=/etc/claude-code/managed-settings.json
+if [ -f \"\$managed\" ] && grep -Fq '/usr/local/bin/fieldwork-pr-upload' \"\$managed\" && grep -Fq 'disableBypassPermissionsMode' \"\$managed\"; then
+  remove_file \"Fieldwork Claude managed policy\" \"\$managed\"
+  rmdir /etc/claude-code 2>/dev/null || true
+else
+  skipped \"Claude managed policy\" \"not Fieldwork-owned or not present\"
+fi
+if systemctl daemon-reload >/dev/null 2>&1; then ok \"systemd daemon-reload\"; else failed \"systemd daemon-reload\" \"systemctl failed\"; fi
+systemctl reset-failed >/dev/null 2>&1 || true
+if [ '$purge' = 1 ]; then
+  remove_tree \"verify runner state\" /var/lib/fieldwork-verify /var/lib
+  remove_tree \"prepare runner state\" /var/lib/fieldwork-pr-prepare /var/lib
+  remove_tree \"task queue state\" /var/lib/fieldwork-tasks /var/lib
+else
+  skipped \"root-owned queue state\" \"kept without --purge\"
+fi")"
+  uninstall_status_note "cleaning root-owned session boundary (sudo), entering interactive SSH"
+  uninstall_status_cleanup
+  ssh -t "$FIELDWORK_SSH_HOST" "$(remote_sudo_command "$command")"
+}
+
 uninstall_remote_user() {
   local purge="$1"
   local remove_notify="$2"
@@ -1682,11 +1781,11 @@ remove_group() {
   fi
 }
 units_present=0
-for path in /etc/systemd/system/fieldwork-pr-broker.socket /etc/systemd/system/fieldwork-pr-approve.socket /etc/systemd/system/fieldwork-pr-broker.service /etc/systemd/system/sockets.target.wants/fieldwork-pr-broker.socket /etc/systemd/system/sockets.target.wants/fieldwork-pr-approve.socket /etc/systemd/system/multi-user.target.wants/fieldwork-pr-broker.service; do
+for path in /etc/systemd/system/fieldwork-pr-broker.socket /etc/systemd/system/fieldwork-pr-approve.socket /etc/systemd/system/fieldwork-pr-broker-maintenance.socket /etc/systemd/system/fieldwork-pr-broker.service /etc/systemd/system/sockets.target.wants/fieldwork-pr-broker.socket /etc/systemd/system/sockets.target.wants/fieldwork-pr-approve.socket /etc/systemd/system/multi-user.target.wants/fieldwork-pr-broker.service; do
   [ -e \"\$path\" ] || [ -L \"\$path\" ] || continue
   units_present=1
 done
-if systemctl disable --now fieldwork-pr-broker.socket fieldwork-pr-approve.socket fieldwork-pr-broker.service >/dev/null 2>&1; then
+if systemctl disable --now fieldwork-pr-broker.socket fieldwork-pr-approve.socket fieldwork-pr-broker-maintenance.socket fieldwork-pr-broker.service >/dev/null 2>&1; then
   ok \"broker systemd units\"
 elif [ \"\$units_present\" = \"1\" ]; then
   failed \"broker systemd units\" \"systemctl failed\"
@@ -1695,16 +1794,23 @@ else
 fi
 remove_file \"broker submit socket unit\" /etc/systemd/system/fieldwork-pr-broker.socket
 remove_file \"broker approve socket unit\" /etc/systemd/system/fieldwork-pr-approve.socket
+remove_file \"broker maintenance socket unit\" /etc/systemd/system/fieldwork-pr-broker-maintenance.socket
 remove_file \"broker service unit\" /etc/systemd/system/fieldwork-pr-broker.service
 remove_file \"broker submit socket enable link\" /etc/systemd/system/sockets.target.wants/fieldwork-pr-broker.socket
 remove_file \"broker approve socket enable link\" /etc/systemd/system/sockets.target.wants/fieldwork-pr-approve.socket
 remove_file \"broker service enable link\" /etc/systemd/system/multi-user.target.wants/fieldwork-pr-broker.service
+remove_file \"broker runtime maintenance marker\" /run/systemd/system/fieldwork-pr-broker.service.d/maintenance.conf
+rmdir /run/systemd/system/fieldwork-pr-broker.service.d >/dev/null 2>&1 || true
 if systemctl daemon-reload >/dev/null 2>&1; then ok \"systemd daemon-reload\"; else failed \"systemd daemon-reload\" \"systemctl failed\"; fi
 remove_tree \"broker config\" /etc/fieldwork-pr-broker /etc
 remove_tree \"broker library\" /usr/local/lib/fieldwork-pr-broker /usr/local/lib
 remove_tree \"broker state\" /var/lib/fieldwork-pr-broker /var/lib
 remove_tree \"broker runtime\" /run/fieldwork-pr-broker /run
 remove_file \"broker rotate-pat helper\" /usr/local/sbin/rotate-pat
+remove_file \"broker policy writer\" /usr/local/sbin/fieldwork-policy-write
+remove_file \"broker maintenance submit helper\" /usr/local/sbin/fieldwork-pr-maintenance-submit
+remove_file \"broker maintenance mode helper\" /usr/local/sbin/fieldwork-pr-maintenance-mode
+remove_file \"broker instruction migrator\" /usr/local/sbin/fieldwork-migrate-instructions
 if [ '$purge' = '1' ]; then
   remove_file \"broker log\" /var/log/fieldwork-pr-broker.log
   remove_tree \"Fieldwork install logs\" /var/log/fieldwork /var/log

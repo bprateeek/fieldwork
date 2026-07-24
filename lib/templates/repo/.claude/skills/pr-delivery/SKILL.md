@@ -1,124 +1,90 @@
 ---
 name: pr-delivery
-description: Open a PR via the fieldwork-pr-broker. Runs verify-before-pr, calls the prepare runner to branch + stage + commit outside the agent's sandbox cage, writes the broker request file, and invokes the broker thin client. Step order is load-bearing. Broker rejects dirty worktrees.
+description: Verify, commit, and deliver a Fieldwork change through the checkout-blind protocol-v2 broker.
 ---
 
 # /pr-delivery
 
-Opens a PR through the broker path. Can be run from `main` with a dirty worktree. The prepare runner creates the new branch and the commit.
+Open or update a PR without exposing forge credentials to the agent checkout.
+Never run `git push` or use a removed `fieldwork-pr-submit` client.
 
-## Before step 1
+Before changing Git state, print the complete list of dirty paths and one short
+paragraph explaining why they belong in this delivery. Then continue through
+the steps below without a second chat confirmation; the broker's
+`approval=require` policy is the authoritative human gate.
 
-Print the list of paths that will be committed and a one-paragraph rationale for the change. The user sees this BEFORE any state changes and can interrupt if the scope is wrong. Then proceed straight through steps 1–4 without asking for further confirmation. The broker submit in step 4 is already gated by the `permissions.ask` rule on `Bash(/home/fieldwork/.local/bin/fieldwork-pr-submit *)`, and a second confirmation in chat duplicates it. The prepare runner is unattended (no prompt).
+## 1. Verify
 
-## Step order (load-bearing)
+Run this as its own top-level Bash call, exactly:
 
-The broker rejects dirty worktrees, so the prepare runner (which leaves a clean tree on a fresh branch) must precede the broker submit. The prepare runner refuses if the target branch already exists, so pick a fresh branch name per delivery.
-
-The runner invocations in steps 3 and 5 must be typed exactly as shown: absolute path, single argument, nothing before it. The sandbox exclusion that lets them run is a literal prefix match on the command string; any prefix (`cd ... &&`, `env ...`, quoting the binary path, `;` chains) re-enables the per-call sandbox and the call fails with `bwrap: No permissions to create new namespace`. In Fieldwork remote sessions every other plain Bash command is expected to fail that way by design; if a helper command is denied or bwrap-fails, continue the flow using the Read and Write tools instead. Do not hand the PR back to the user.
-
-### 1. Run verify-before-pr
-
-```
-/verify-before-pr
+```bash
+/usr/local/bin/fieldwork-verify "$PWD"
 ```
 
-If it fails, **stop**. Nothing is committed or pushed.
+If it fails, stop and report the output. Do not bypass or replace the verifier.
 
-### 2. Write the prepare request
+## 2. Prepare the commit when the sandbox cannot commit
 
-Build `<repo>/.fieldwork/local/pr-prepare-request.json`:
+Create a fresh UUID. Under
+`/run/user/<uid>/fieldwork/spool/<prepare-request-id>/`, write the only file,
+`request.json`, mode 0600:
 
 ```json
 {
-  "request_id": "<fresh uuid v4; read /proc/sys/kernel/random/uuid with the Read tool>",
-  "created_at": "<UTC timestamp in YYYY-MM-DDTHH:MM:SSZ form; construct it from the session's known current date, the runner validates shape only>",
+  "request_id": "<fresh uuid v4>",
+  "created_at": "<UTC YYYY-MM-DDTHH:MM:SSZ>",
   "repo_path": "/home/fieldwork/projects/<slug>",
   "branch": "fieldwork/<short-feature-name>",
-  "paths": ["<repo-relative path>", "<repo-relative path>", "..."],
-  "message": "<commit message body, ≤8KiB>"
+  "paths": ["<every dirty repo-relative path, and no others>"],
+  "message": "<commit message>"
 }
 ```
 
-Field rules (full schema: `schema/pr-prepare-request.schema.json`):
-
-- `branch` regex: `^fieldwork/[a-z0-9][a-z0-9/_-]{1,80}$`. Must not already exist locally; the runner refuses if it does.
-- `paths` must list **every** modified or untracked file in the worktree, and only those. The runner refuses if the worktree has unexpected dirty files. No `..` segments, no absolute paths, no NUL/newline in path strings, ≤100 entries, each ≤256 bytes.
-- `message` is the commit message body (title line + blank line + body, ≤8KiB). The runner spools it to a tmpfile and passes `-F` to `git commit` — no need to escape quotes or newlines.
-- `request_id` must be a fresh UUID for every submit. The runner stores accepted IDs and rejects duplicates as replay attempts.
-
-Recommended commit message format (derived from task-intake template fields):
-
-```
-<short imperative summary, ≤72 chars>
-
-Why: <one paragraph on the motivation>
-Changes: <bulleted list of what moves>
-
-Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
-```
-
-### 3. Invoke the prepare runner
+The branch must not already exist when using the prepare runner. Paths may not
+be absolute or contain `..`. Invoke the root-owned prepare client as a separate
+top-level Bash call with the UUID—not a file path:
 
 ```bash
-/home/fieldwork/.local/bin/fieldwork-pr-prepare .fieldwork/local/pr-prepare-request.json
+/usr/local/bin/fieldwork-pr-prepare <prepare-request-id>
 ```
 
-The runner creates the branch, stages exactly `paths`, commits with `message`, and leaves the worktree clean. On success it prints one JSON line: `{"head":"<sha>","branch":"<branch>","request_id":"<id>"}`.
+If the intended branch already exists, commit normally only when the active
+sandbox permits it. Otherwise stop for operator guidance; never bypass the
+runner by weakening the sandbox.
 
-The runner runs `git -c core.hooksPath=/dev/null` so repo-controlled hooks (`pre-commit`, `commit-msg`, …) do **not** execute during prepare. Verify in step 1 has already run lint/typecheck/tests/gitleaks/semgrep, so the gate is enforced earlier in the flow.
+## 3. Build the protocol-v2 request
 
-### 4. Write the broker request file
-
-Build `<repo>/.fieldwork/local/pr-request.json`:
+Ensure every intended change is committed and the worktree is clean. Write
+`.fieldwork/local/pr-build-request.json`:
 
 ```json
 {
-  "request_id": "<fresh uuid v4, distinct from the prepare request_id>",
-  "created_at": "<UTC timestamp>",
-  "repo_path": "/home/fieldwork/projects/<slug>",
-  "branch": "fieldwork/<same branch from step 2>",
-  "title": "<≤200 chars, no newlines>",
-  "body":  "<inline markdown body, ≤64KB, no secrets>"
+  "schema_version": 2,
+  "slug": "<slug>",
+  "branch": "fieldwork/<same branch>",
+  "title": "<PR title>",
+  "body": "<summary and verification>"
 }
 ```
 
-`title` and `body` are the **PR** title and body shown on GitHub — separate from the commit message. The broker scans `body` with gitleaks and rejects on hit; use `<env-var-name>` placeholders for credentials, not the values.
-
-### 5. Invoke the broker thin client
+Run the sandboxed builder:
 
 ```bash
-/home/fieldwork/.local/bin/fieldwork-pr-submit .fieldwork/local/pr-request.json
+/usr/local/bin/fieldwork-pr-build .fieldwork/local/pr-build-request.json
 ```
 
-The user is prompted to confirm (because of the `permissions.ask` rule). On approval, the client forwards the request to the broker, which validates the request, pushes the branch, opens the PR, and applies the `ready for review` label.
+Record the UUID it prints.
 
-## On runner rejection
+## 4. Upload in a separate call
 
-`fieldwork-pr-prepare` exit codes and what to do:
+Run the excluded uploader as a new top-level Bash call:
 
-| Exit | Reason | Fix |
-|---|---|---|
-| `10` | branch already exists | Pick a different `branch` name and re-issue with a fresh `request_id`. |
-| `11` | worktree state mismatch | Either the worktree has dirty files not in `paths`, or `paths` lists files that aren't dirty. Reconcile and retry. |
-| `12` | git checkout/add/commit failed | Inspect stderr; the worktree has been rolled back to the pre-call HEAD. Commit message empty, or git ident missing, are common causes. |
-| `13` | path safety rejected | A `paths` entry escapes the repo (`..`), is absolute, or contains NUL/newline. |
-| `20` | schema / setup error | Request shape rejected, or repo isn't onboarded. Re-validate against `schema/pr-prepare-request.schema.json`. |
-| `21` | duplicate request_id (replay) | Generate a new UUID and retry. |
+```bash
+/usr/local/bin/fieldwork-pr-upload <request-id>
+```
 
-Rollback is automatic and uses `git reset --hard` to the pre-call HEAD. The new commit object remains in the reflog (recoverable via `git reflog`) until git GC.
-
-## On broker rejection
-
-Common reasons + fixes:
-
-| Reason | Fix |
-|---|---|
-| `worktree not clean` | The prepare runner left dirty state somehow. Inspect with `git status` and re-stage what's missing. Usually means step 3 was skipped. |
-| `expected-origin missing` | Add `.fieldwork/expected-origin` with the HTTPS URL. |
-| `expected-origin not HTTPS` | Rewrite to `https://github.com/...`. |
-| `body contains secret` | Replace credential-shaped strings with placeholders. |
-| `branch matches main` | Branch must be `fieldwork/...`, never `main`/`master`/`develop`. |
-| `rate limit (>6/hr)` | Wait, or split fewer larger PRs instead of many small. |
-
-If the broker is down, do NOT bypass it with manual `git push` — the broker exists to keep the PAT off this user's filesystem. File an issue and use a different machine if urgent.
+Report `queued`, `done`, or the fixed broker error code. A queued request must
+be approved through the isolated approval path before any branch push occurs.
+The broker reconstructs and scans the non-thin pack, checks the operator-owned
+policy/base, and opens or updates the PR. Never combine build and upload in one
+shell command.

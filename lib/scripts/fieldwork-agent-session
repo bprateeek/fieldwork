@@ -8,9 +8,72 @@
 # the seam that lets Fieldwork run agents other than Claude Code without
 # touching the systemd unit, onboarding, or the broker: only the adapter
 # changes. The adapter is chosen by FIELDWORK_AGENT_ADAPTER (default
-# claude-remote-control) and resolved from ~/.fieldwork/infra/agents/<name>.
+# claude-remote-control) and resolved from the root-owned adapter inventory.
 
 set -euo pipefail
+
+assert_root_asset() {
+  local path="$1" mode
+  [ -f "$path" ] && [ ! -L "$path" ] || { echo "[fieldwork-agent-session] boundary asset missing or symlinked: $path" >&2; exit 1; }
+  [ "$(stat -c '%u' "$path")" = 0 ] || { echo "[fieldwork-agent-session] boundary asset is not root-owned: $path" >&2; exit 1; }
+  mode="$(stat -c '%a' "$path")"
+  [ $((8#$mode & 8#22)) -eq 0 ] || { echo "[fieldwork-agent-session] boundary asset is group/other writable: $path" >&2; exit 1; }
+}
+
+for boundary_asset in \
+  /usr/local/lib/fieldwork/fieldwork-agent-session \
+  /usr/local/lib/fieldwork/fieldwork-task-dispatcher \
+  /usr/local/lib/fieldwork/fieldwork-task-run \
+  /usr/local/lib/fieldwork/fieldwork-event-poll \
+  /usr/local/lib/fieldwork/fieldwork-verify-runner \
+  /usr/local/lib/fieldwork/fieldwork-verify-pipeline \
+  /usr/local/lib/fieldwork/fieldwork-pr-prepare-runner \
+  /usr/local/lib/fieldwork/fieldwork-pr-prepare-impl \
+  /usr/local/lib/fieldwork/fieldwork-session-probe \
+  /usr/local/lib/fieldwork/fieldwork-session-probe-cage \
+  /usr/local/sbin/fieldwork-session-probe-record \
+  /usr/local/lib/fieldwork/notify.sh \
+  /etc/claude-code/managed-settings.json \
+  /usr/local/lib/fieldwork/empty-mcp.json \
+  /usr/local/bin/fieldwork-bash-policy \
+  /usr/local/bin/fieldwork-verify \
+  /usr/local/bin/fieldwork-pr-prepare \
+  /usr/local/bin/fieldwork-pr-build \
+  /usr/local/bin/fieldwork-pr-upload \
+  /etc/systemd/system/fieldwork-agent@.service \
+  /etc/systemd/system/fieldwork-event-poll.service \
+  /etc/systemd/system/fieldwork-event-poll.timer \
+  /etc/systemd/system/fieldwork-task-dispatcher.service \
+  /etc/systemd/system/fieldwork-verify-runner.socket \
+  /etc/systemd/system/fieldwork-verify-runner@.service \
+  /etc/systemd/system/fieldwork-pr-prepare-runner.socket \
+  /etc/systemd/system/fieldwork-pr-prepare-runner@.service; do
+  assert_root_asset "$boundary_asset"
+done
+if [ -e /usr/local/lib/fieldwork/claude-pinned ]; then
+  for boundary_asset in \
+    /usr/local/lib/fieldwork/claude-pinned \
+    /usr/local/lib/fieldwork/claude.sha256 \
+    /usr/local/lib/fieldwork/claude.probe.sha256; do
+    assert_root_asset "$boundary_asset"
+  done
+fi
+for boundary_asset in /usr/local/lib/fieldwork/agents/*; do
+  assert_root_asset "$boundary_asset"
+done
+managed_asset_seen=0
+if find /usr/local/share/fieldwork-claude -type l -print -quit | grep -q .; then
+  echo "[fieldwork-agent-session] root-owned delivery instructions contain a symlink" >&2
+  exit 1
+fi
+while IFS= read -r boundary_asset; do
+  assert_root_asset "$boundary_asset"
+  managed_asset_seen=1
+done < <(find /usr/local/share/fieldwork-claude -type f -print)
+[ "$managed_asset_seen" = 1 ] || {
+  echo "[fieldwork-agent-session] root-owned delivery instructions are missing" >&2
+  exit 1
+}
 
 slug="${1:-}"
 [ -n "$slug" ] || { echo "usage: fieldwork-agent-session <repo-slug>" >&2; exit 2; }
@@ -108,11 +171,11 @@ case "$adapter_name" in
     exit 2
     ;;
 esac
-adapter="$HOME/.fieldwork/infra/agents/$adapter_name"
+adapter="/usr/local/lib/fieldwork/agents/$adapter_name"
 [ -x "$adapter" ] || {
   echo "[fieldwork-agent-session] agent adapter not found or not executable: $adapter" >&2
   echo "[fieldwork-agent-session] available adapters:" >&2
-  ls -1 "$HOME/.fieldwork/infra/agents" 2>/dev/null | sed 's/^/  /' >&2 || true
+  ls -1 /usr/local/lib/fieldwork/agents 2>/dev/null | sed 's/^/  /' >&2 || true
   exit 1
 }
 

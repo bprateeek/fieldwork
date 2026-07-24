@@ -32,7 +32,7 @@ fieldwork_eval() {
 Fieldwork eval
 
 Evaluation-only Docker harness for trying the broker flow locally.
-Uses fake GitHub behavior and no real PAT.
+Uses deterministic protocol-v2 forge stubs and no real credential.
 EOF
   }
 
@@ -150,7 +150,7 @@ EOF
             cat <<'EOF'
 usage: fieldwork eval smoke [--verbose] [--json]
 
-Runs the Docker evaluation smoke flow against fake GitHub behavior. Default
+Runs the Docker evaluation smoke flow against deterministic forge stubs. Default
 output is human-readable; --verbose shows the event timeline; --json prints
 the structured smoke result.
 EOF
@@ -216,12 +216,10 @@ EOF
 import json
 import os
 import sys
-from datetime import datetime, timezone
 
 data = json.loads(sys.argv[1])
 verbose = os.environ.get("SMOKE_VERBOSE") == "1"
-events = data.get("events", [])
-by_event = {event.get("event"): event for event in events}
+tests = data.get("tests", [])
 
 def row(mark, label, detail=""):
     if detail:
@@ -229,56 +227,28 @@ def row(mark, label, detail=""):
     else:
         print(f"  {mark}  {label}")
 
-def short_request(value):
-    return (value or "")[:8]
-
-def event_time(event):
-    value = event.get("ts", "")
-    try:
-        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").strftime("%H:%M:%S")
-    except Exception:
-        return "--:--:--"
-
-def expires_detail(event):
-    value = event.get("expires_at", "")
-    try:
-        dt = datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-        return "expires " + dt.strftime("%Y-%m-%d %H:%M UTC")
-    except Exception:
-        return ""
-
 print("Fieldwork eval smoke")
 print()
 print("Evaluation mode only.")
 print("No real GitHub PAT is used. No real PR is created.")
 print()
 print("Preparing")
-row("✓", "throwaway repo ready")
-row("✓", "switched branch", data.get("branch", ""))
+row("✓", "evaluation container")
+row("✓", "protocol-v2 fixtures")
 
 if verbose:
     print()
-    print("Timeline")
-    timeline = [
-        ("request_received", "request received", lambda e: e.get("transport", "")),
-        ("request_queued", "request queued", expires_detail),
-        ("request_approved", "request approved", lambda e: e.get("transport", "")),
-        ("push_attempted", "push attempted", lambda e: e.get("transport", "")),
-        ("pr_opened", "PR opened", lambda e: e.get("pr_url", "")),
-    ]
-    for key, label, detail_fn in timeline:
-        event = by_event.get(key, {})
-        detail = detail_fn(event)
-        timestamp = event_time(event)
-        print(f"  ✓  {timestamp}  {label:<18} {detail}".rstrip())
+    print("Checks")
+    for name in tests:
+        row("✓", name.removeprefix("test_").replace("_", " "))
 else:
     print()
-    print("Broker flow")
-    row("✓", "request received")
-    row("✓", "request queued")
-    row("✓", "approval accepted", data.get("decision", ""))
-    row("✓", "push attempted", by_event.get("push_attempted", {}).get("transport", ""))
-    row("✓", "PR opened")
+    print("Broker boundary")
+    row("✓", "real Git quarantine")
+    row("✓", "approval durability")
+    row("✓", "resume + idempotence")
+    row("✓", "SSRF + redirects")
+    row("✓", "scanner fails closed")
 
 print()
 print("Result")
@@ -287,16 +257,10 @@ if data.get("ok"):
 else:
     row("!", "smoke test failed")
 print()
-print(f"  {'repo':<10} {data.get('repo', '')}")
-print(f"  {'branch':<10} {data.get('branch', '')}")
-request = data.get("request_id", "")
-print(f"  {'request':<10} {request if verbose else short_request(request)}")
-if verbose:
-    print(f"  {'transport':<10} {by_event.get('push_attempted', {}).get('transport', '')}")
-else:
-    print(f"  {'PR':<10} {data.get('pr_url', '')}")
-if verbose and data.get("pr_url"):
-    print(f"  {'PR':<10} {data.get('pr_url', '')}")
+print(f"  {'mode':<16} {data.get('mode', '')}")
+print(f"  {'protocol':<16} {data.get('protocol', '')}")
+print(f"  {'checkout blind':<16} {'yes' if data.get('checkout_blind') else 'no'}")
+print(f"  {'checks':<16} {len(tests)}")
 
 if not verbose:
     print()
@@ -446,12 +410,12 @@ Fieldwork eval
 Usage
   fieldwork eval <command> [options]
 
-Docker-backed, no-VPS evaluation harness. It uses fake GitHub behavior and is
+Docker-backed, no-VPS evaluation harness. It uses deterministic forge stubs and is
 explicitly not a supported deployment topology.
 
 Commands
   up                 start the Docker evaluation harness
-  smoke              run the fake PR broker flow
+  smoke              run the hermetic protocol-v2 broker flow
   logs               stream raw evaluation logs
   down               stop evaluation containers
   clean              remove evaluation containers and volumes

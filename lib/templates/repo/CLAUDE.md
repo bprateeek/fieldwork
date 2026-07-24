@@ -38,7 +38,7 @@
 - `/deepplan` triggers 2 rounds of clarifying questions before plan write.
 - Branching: do NOT run `git checkout -b` in Fieldwork remote sessions; the `/pr-delivery` prepare runner creates the `fieldwork/<short-feature>` branch and the commit, then leaves the worktree clean. Editing on the current checkout is fine.
 - `/verify-before-pr` then `/pr-delivery` to ship. Both run locally before broker push.
-- In Fieldwork remote sessions, plain Bash commands fail with a bwrap sandbox error by design. Explore with Read/Grep/Glob; the only working shell commands are the three `fieldwork-*` clients the skills invoke verbatim. A failing `ls` or `git status` is not a malfunction and not a reason to abandon the PR flow.
+- In Fieldwork remote sessions, plain Bash commands fail with a bwrap sandbox error by design. Explore with Read/Grep/Glob; use the four root-owned protocol-v2 clients exactly as `/verify-before-pr` and `/pr-delivery` describe. A failing `ls` or `git status` is not a malfunction and not a reason to abandon the PR flow.
 
 ## Files Claude should know about
 

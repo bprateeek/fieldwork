@@ -1,54 +1,54 @@
-name: release
+name: request trusted release
 
-# Publishes a GitHub release with a source archive and SHA256SUMS when a
-# version tag is pushed. The tag itself is created and signed manually
-# (`git tag -s vX.Y.Z`); this workflow only verifies and publishes.
-
+# Candidate-controlled workflow code never builds, attests, or publishes a
+# release. It can only request the separately protected builder, which must
+# independently verify the signed tag and its own pinned workflow identity.
 on:
   push:
     tags:
       - 'v*'
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  release:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+  request-trusted-builder:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    environment: trusted-builder-dispatch
+    env:
+      BUILDER_REPOSITORY: ${{ vars.FIELDWORK_TRUSTED_BUILDER_REPOSITORY }}
+      BUILDER_WORKFLOW: ${{ vars.FIELDWORK_TRUSTED_BUILDER_WORKFLOW }}
+      BUILDER_REF: ${{ vars.FIELDWORK_TRUSTED_BUILDER_REF }}
+      BUILDER_WORKFLOW_SHA: ${{ vars.FIELDWORK_TRUSTED_BUILDER_WORKFLOW_SHA }}
+      DISPATCH_TOKEN: ${{ secrets.FIELDWORK_TRUSTED_BUILDER_DISPATCH_TOKEN }}
     steps:
-      - uses: actions/checkout@v6
-
-      - name: Run tests
+      - name: Validate pinned builder configuration
+        shell: bash
         run: |
-          bash tests/static-checks.sh
-          python3 tests/broker-validation-tests.py
-          python3 tests/bot-tests.py
-          python3 tests/pr-prepare-validation-tests.py
-          bash tests/task-dispatcher-tests.sh
+          set -euo pipefail
+          [[ "$BUILDER_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
+          [[ "$BUILDER_WORKFLOW" =~ ^[A-Za-z0-9_.-]+\.ya?ml$ ]]
+          [[ "$BUILDER_REF" =~ ^[A-Za-z0-9._/-]+$ ]]
+          [[ "$BUILDER_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ -n "$DISPATCH_TOKEN" ]]
 
-      - name: Build source archive and checksums
+      - name: Request the separately protected builder
+        shell: bash
         run: |
-          tag="${GITHUB_REF_NAME}"
-          archive="fieldwork-${tag}.tar.gz"
-          git archive --format=tar.gz --prefix="fieldwork-${tag}/" -o "$archive" HEAD
-          sha256sum "$archive" > SHA256SUMS
-          sha256sum -c SHA256SUMS
-
-      - name: Create GitHub release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          tag="${GITHUB_REF_NAME}"
-          {
-            echo "Developer preview release ${tag}."
-            echo
-            echo "Verify the signed tag: git tag -v ${tag}"
-            echo "Verify the archive: shasum -a 256 -c SHA256SUMS"
-            echo
-            echo "See CHANGELOG.md for changes and migration notes."
-          } > release-notes.md
-          gh release create "$tag" \
-            --title "$tag" \
-            --notes-file release-notes.md \
-            "fieldwork-${tag}.tar.gz" SHA256SUMS
+          set -euo pipefail
+          payload="$(jq -cn \
+            --arg ref "$BUILDER_REF" \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg source_ref "refs/tags/$GITHUB_REF_NAME" \
+            --arg source_event_oid "$GITHUB_SHA" \
+            --arg workflow_sha "$BUILDER_WORKFLOW_SHA" \
+            '{ref:$ref,inputs:{source_repository:$repository,source_ref:$source_ref,source_event_oid:$source_event_oid,expected_workflow_sha:$workflow_sha}}')"
+          curl --fail-with-body --silent --show-error \
+            --proto '=https' --tlsv1.2 \
+            --request POST \
+            --header 'Accept: application/vnd.github+json' \
+            --header "Authorization: Bearer $DISPATCH_TOKEN" \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            --data "$payload" \
+            "https://api.github.com/repos/$BUILDER_REPOSITORY/actions/workflows/$BUILDER_WORKFLOW/dispatches"

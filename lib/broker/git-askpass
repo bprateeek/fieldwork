@@ -1,13 +1,51 @@
 #!/usr/bin/env bash
-# Git askpass helper for the broker. Git invokes this with one argument:
-# a prompt string like "Username for ..." or "Password for ...". Echo the
-# right value; git reads it from stdout.
-#
-# Token is read from disk ONLY when git asks for it. It is not in env, not in
-# argv. It briefly exists in the helper's stdout pipe to git — same uid as the
-# broker, so no /proc cross-uid exposure.
-case "$1" in
-  Username*) echo "x-access-token" ;;
-  Password*) cat "${FIELDWORK_BROKER_TOKEN_PATH:-/etc/fieldwork-pr-broker/gh-token}" ;;
-  *)         exit 1 ;;
+# Root-installed broker askpass. Release a token only for the DNS-pinned host
+# selected by the broker for this exact Git invocation.
+set -euo pipefail
+
+prompt="${1:-}"
+allowed="${FIELDWORK_BROKER_ALLOWED_HOST:-}"
+token_path="${FIELDWORK_BROKER_TOKEN_PATH:-/etc/fieldwork-pr-broker/gh-token}"
+
+prompt_host() {
+  authority="${prompt#*https://}"
+  authority="${authority%%/*}"
+  authority="${authority#\'}"
+  authority="${authority#*@}"
+  case "$authority" in
+    \[*\]*) host="${authority#\[}"; host="${host%%\]*}" ;;
+    *) host="${authority%%:*}"; host="${host%\'}" ;;
+  esac
+  printf '%s\n' "$host"
+}
+
+case "$allowed" in
+  ""|*[!A-Za-z0-9.:-]*)
+    logger -t fieldwork-pr-broker "askpass refused invalid pinned host" 2>/dev/null || true
+    exit 1
+    ;;
+esac
+
+case "$prompt" in
+  Username*https://*)
+    [ "$(prompt_host)" = "$allowed" ] || exit 1
+    if [ "${FIELDWORK_BROKER_ASKPASS_FORGE:-github}" = "gitlab" ]; then
+      printf '%s\n' oauth2
+    else
+      printf '%s\n' x-access-token
+    fi
+    ;;
+  Password*https://*)
+    host="$(prompt_host)"
+    if [ "$host" != "$allowed" ]; then
+      logger -t fieldwork-pr-broker "askpass refused credential request for non-pinned host" 2>/dev/null || true
+      exit 1
+    fi
+    [ -f "$token_path" ] && [ ! -L "$token_path" ] || exit 1
+    /bin/cat "$token_path"
+    ;;
+  *)
+    logger -t fieldwork-pr-broker "askpass refused unrecognized prompt" 2>/dev/null || true
+    exit 1
+    ;;
 esac

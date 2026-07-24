@@ -95,13 +95,12 @@ SNAP_OLD=$'fieldwork_checkout=ok\nbootstrap_ready=ok\ngh_cli=ok\ngh_live=ok\ncon
 render valid "" "$SNAP_OLD" "$BOT_OK" "$LOCAL_OK"
 contains "older remote agent unknown" "$OUT" "older remote probe"
 
-# --- guard: fingerprint lists in bin/fieldwork and static-checks match ---------
+# --- guard: runtime inventory is non-empty and static checks consume it ---------
 bin_list="$(sed -n 's/^FIELDWORK_FINGERPRINT_FILES="\(.*\)"$/\1/p' "$ROOT/bin/fieldwork")"
-test_list="$(sed -n 's/^FIELDWORK_TEST_FINGERPRINT_FILES="\(.*\)"$/\1/p' "$ROOT/tests/static-checks.sh")"
 check "fingerprint list non-empty" "$([ -n "$bin_list" ] && echo 1 || echo 0)" "1"
-check "fingerprint lists match"    "$bin_list" "$test_list"
 contains "fingerprint has messaging.sh" "$bin_list" "lib/cli/messaging.sh"
 contains "fingerprint has health.sh"    "$bin_list" "lib/cli/health.sh"
+contains "static checks read runtime fingerprint" "$(cat "$ROOT/tests/static-checks.sh")" +  'runtime_list="$(sed -n'
 
 # --- guard: the 7 probe keys are emitted by BOTH probe copies ------------------
 probe_standalone="$ROOT/lib/scripts/fieldwork-setup-probe"

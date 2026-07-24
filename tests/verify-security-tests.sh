@@ -63,7 +63,19 @@ ssh() {
     *test\ -w*fieldwork-pr.sock*) return 0 ;;
     *id\ -gn*) printf 'fieldwork' ;;
     *SocketGroup*) printf '' ;;
-    *systemctl\ cat*grep*) return 0 ;;
+    *systemctl\ cat*)
+      printf '%s\n' \
+        'NoNewPrivileges=true' \
+        'PrivateTmp=true' \
+        'PrivateDevices=true' \
+        'ProtectSystem=strict' \
+        'ProtectHome=yes' \
+        'MemoryMax=1G' \
+        'TasksMax=128' \
+        'CPUQuota=200%' \
+        'LimitFSIZE=268435456' \
+        'RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6'
+      ;;
     *test\ -f\ /etc/systemd/system/fieldwork-bot.service*) return 1 ;;
     *ufw\ status*) printf 'Status: inactive\n' ;;
     *notify.env*) return 0 ;;

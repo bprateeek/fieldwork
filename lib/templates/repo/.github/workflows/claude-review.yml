@@ -31,14 +31,30 @@ jobs:
         with:
           fetch-depth: 0  # need history for `git diff main...HEAD`
 
+      - name: Install Claude Code from its signed apt repository
+        if: ${{ env.ANTHROPIC_API_KEY != '' }}
+        run: |
+          set -euo pipefail
+          key_file="$(mktemp)"
+          trap 'rm -f "$key_file"' EXIT
+          curl -fsSL https://downloads.claude.ai/keys/claude-code.asc -o "$key_file"
+          fingerprint="$(
+            gpg --batch --show-keys --with-colons "$key_file" \
+              | awk -F: '$1 == "fpr" { print $10; exit }'
+          )"
+          test "$fingerprint" = "31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE"
+
+          sudo install -d -m 0755 /etc/apt/keyrings
+          sudo install -m 0644 "$key_file" /etc/apt/keyrings/claude-code.asc
+          echo "deb [signed-by=/etc/apt/keyrings/claude-code.asc] https://downloads.claude.ai/claude-code/apt/stable stable main" \
+            | sudo tee /etc/apt/sources.list.d/claude-code.list >/dev/null
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y claude-code
+
       - name: Run /security-review
         if: ${{ env.ANTHROPIC_API_KEY != '' }}
         run: |
           set -euo pipefail
-          curl -fsSL https://claude.ai/install.sh | sh
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          export PATH="$HOME/.local/bin:$PATH"
-
           claude -p "/security-review" \
             --max-turns 5 \
             --max-budget-usd 2 \

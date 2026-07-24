@@ -4,7 +4,7 @@
 # for a GitHub repo. Idempotent: each step preflights its own "already done?" gate.
 #
 # Usage:
-#   fieldwork onboard <owner>/<repo> [--branch <name>] [--no-workflows] [--with-approval-gate] [--status] [--reset-state] [--reseed-templates]
+#   fieldwork onboard <owner>/<repo> [--branch <name>] [--no-workflows] [--auto-approve] [--allow-private-network] [--status] [--reset-state] [--reseed-templates]
 #   fieldwork onboard --help
 #
 # --reseed-templates forces re-application of fieldwork-managed template
@@ -35,7 +35,6 @@ fieldwork_load_config
 
 SSH_HOST="$FIELDWORK_SSH_HOST"
 REMOTE_USER="$FIELDWORK_REMOTE_USER"
-BROKER_USER="${FIELDWORK_BROKER_USER:-fieldwork-pr-broker}"
 PROJECTS_DIR="$FIELDWORK_PROJECTS_DIR"
 DEFAULT_BRANCH="$FIELDWORK_DEFAULT_BRANCH"
 FORGE="${FIELDWORK_FORGE:-github}"
@@ -143,6 +142,8 @@ SLUG_OVERRIDE=""
 BRANCH="fieldwork/init"
 NO_WORKFLOWS=0
 WITH_APPROVAL_GATE=0
+AUTO_APPROVE=0
+ALLOW_PRIVATE_NETWORK=0
 STATUS_ONLY=0
 RESET_STATE=0
 RESEED_TEMPLATES=0
@@ -154,6 +155,8 @@ while [ $# -gt 0 ]; do
     --slug=*)  SLUG_OVERRIDE="${1#--slug=}"; shift ;;
     --no-workflows) NO_WORKFLOWS=1; shift ;;
     --with-approval-gate) WITH_APPROVAL_GATE=1; shift ;;
+    --auto-approve) AUTO_APPROVE=1; shift ;;
+    --allow-private-network) ALLOW_PRIVATE_NETWORK=1; shift ;;
     --status) STATUS_ONLY=1; shift ;;
     --reset-state) RESET_STATE=1; shift ;;
     --reseed-templates) RESEED_TEMPLATES=1; shift ;;
@@ -208,8 +211,12 @@ fi
   exit 2
 }
 
-[[ "$BROKER_USER" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || {
-  echo "[onboard] FAIL: broker user '$BROKER_USER' is not a safe Linux user name" >&2
+[ "$AUTO_APPROVE" != 1 ] || [ "$WITH_APPROVAL_GATE" != 1 ] || {
+  echo "[onboard] FAIL: --auto-approve conflicts with --with-approval-gate" >&2
+  exit 2
+}
+[ "$FORGE" = gitlab ] || [ "$ALLOW_PRIVATE_NETWORK" != 1 ] || {
+  echo "[onboard] FAIL: --allow-private-network is only valid for self-managed GitLab" >&2
   exit 2
 }
 
@@ -226,20 +233,13 @@ fieldwork_slug_valid "$SLUG" || {
   exit 2
 }
 
-# Two distinct paths matter:
-#   REMOTE_REPO_DIR is what ssh commands see — `$HOME` is expanded by the VPS shell.
-#   BROKER_REPO_PATH is what goes into the JSON request to the broker, which validates it
-#   against ^/home/fieldwork/projects/[a-z0-9][a-z0-9-]{0,30}$ (server.py REPO_PATH_RE) and
-#   does NOT expand $HOME.
 REMOTE_REPO_DIR="$PROJECTS_DIR/$SLUG"
-BROKER_REPO_PATH="$PROJECTS_DIR/$SLUG"
 STATE_FILE="$REMOTE_REPO_DIR/.fieldwork/local/fieldwork-onboard-state.json"
-STATE_DISPLAY_FILE="$BROKER_REPO_PATH/.fieldwork/local/fieldwork-onboard-state.json"
+STATE_DISPLAY_FILE="$REMOTE_REPO_DIR/.fieldwork/local/fieldwork-onboard-state.json"
 PR_URL=""
 PR_STATE=""
 PR_REQUEST_ID=""
 PR_EXPIRES_AT=""
-PREFLIGHT_JSON=""
 EXPECTED_ORIGIN=""
 if [ "$NO_WORKFLOWS" = "1" ]; then
   WORKFLOW_MODE="skipped (--no-workflows)"
@@ -259,7 +259,7 @@ fi
 if [ "$WITH_APPROVAL_GATE" = "1" ]; then
   INIT_PR_BODY="$INIT_PR_BODY
 
-This repo also opts in to the broker approval gate via .fieldwork/approval-gate — every PR request from this repo will be queued for a Telegram approval before the broker pushes."
+This repo includes a .fieldwork/approval-gate human hint. The authoritative approval requirement is the root-owned broker policy."
 fi
 say() { echo "[onboard] $*"; }
 
@@ -280,7 +280,7 @@ remote_fieldwork_env() {
 # bin/fieldwork (remote_sudo_passwordless / remote_sudo_prefix) so user-facing
 # command suggestions don't emit a "-p '[sudo] VPS Linux password for ...'" prompt
 # when /etc/sudoers.d/fieldwork-fieldwork makes sudo NOPASSWD for the agent user.
-remote_sudo_prefix() {
+remote_sudo_passwordless() {
   if [ -z "${FIELDWORK_REMOTE_SUDO_PASSWORDLESS:-}" ]; then
     if ssh -o BatchMode=yes "$SSH_HOST" "sudo -n true" >/dev/null 2>&1; then
       FIELDWORK_REMOTE_SUDO_PASSWORDLESS=1
@@ -288,7 +288,11 @@ remote_sudo_prefix() {
       FIELDWORK_REMOTE_SUDO_PASSWORDLESS=0
     fi
   fi
-  if [ "$FIELDWORK_REMOTE_SUDO_PASSWORDLESS" = "1" ]; then
+  [ "$FIELDWORK_REMOTE_SUDO_PASSWORDLESS" = "1" ]
+}
+
+remote_sudo_prefix() {
+  if remote_sudo_passwordless; then
     printf 'sudo'
   else
     printf "sudo -p '[sudo] VPS Linux password for %s: '" "$REMOTE_USER"
@@ -468,7 +472,7 @@ persist_manual_step_marker() {
 }
 
 remote_service_active() {
-  ssh "$SSH_HOST" "systemctl --user is-active --quiet 'fieldwork-agent@$SLUG'" >/dev/null 2>&1
+  ssh "$SSH_HOST" "systemctl is-active --quiet 'fieldwork-agent@$SLUG'" >/dev/null 2>&1
 }
 
 run_quiet() {
@@ -664,60 +668,71 @@ EOF
   fi
 }
 
-grant_broker_checkout_read_access() {
-  ssh "$SSH_HOST" "repo=\"$REMOTE_REPO_DIR\"; projects=\"$PROJECTS_DIR\"; parent=\"\$(dirname \"\$projects\")\"; broker_user='$BROKER_USER'; chmod o+x \"\$parent\" \"\$projects\" 2>/dev/null || true; if command -v setfacl >/dev/null 2>&1 && id \"\$broker_user\" >/dev/null 2>&1; then setfacl -m \"u:\$broker_user:--x\" \"\$parent\" \"\$projects\" 2>/dev/null || true; setfacl -R -m \"u:\$broker_user:rX\" \"\$repo\" 2>/dev/null || true; else chmod -R o+rX \"\$repo\" 2>/dev/null || true; fi"
+wire_broker_policy() {
+  local approval=require
+  local policy_args
+  [ "$AUTO_APPROVE" != 1 ] || approval=auto
+  policy_args="--slug $(shell_quote "$SLUG") --forge $(shell_quote "$FORGE") --project $(shell_quote "$OWNER_REPO") --base-branch $(shell_quote "$DEFAULT_BRANCH") --approval $(shell_quote "$approval")"
+  if [ "$FORGE" = gitlab ]; then
+    local git_base="${FIELDWORK_GITLAB_API%/api/v4}"
+    policy_args="$policy_args --api-base-url $(shell_quote "$FIELDWORK_GITLAB_API") --git-base-url $(shell_quote "$git_base")"
+    [ -z "${FIELDWORK_GITLAB_CA_BUNDLE_LOCAL:-}" ] || policy_args="$policy_args --ca-bundle /etc/fieldwork/gitlab-ca.pem"
+    [ "$ALLOW_PRIVATE_NETWORK" != 1 ] || policy_args="$policy_args --allow-private-network"
+  fi
+  if [ "${FIELDWORK_REMOTE_SUDO_PASSWORDLESS:-0}" = "1" ]; then
+    ssh "$SSH_HOST" "sudo -n /usr/local/sbin/fieldwork-policy-write $policy_args"
+  else
+    ssh -t "$SSH_HOST" "$(remote_sudo_prefix) /usr/local/sbin/fieldwork-policy-write $policy_args"
+  fi
 }
 
-broker_pat_preflight() {
-  local payload raw http_code body error
-  payload="$(jq -nc --arg repo "$OWNER_REPO" '{repo: $repo}')"
-  raw="$(ssh "$SSH_HOST" "printf '%s' '$payload' | curl -sS --unix-socket /run/fieldwork-pr-broker/fieldwork-pr.sock -H 'Content-Type: application/json' --data-binary @- -w '\n%{http_code}' http://localhost/preflight 2>&1")" || {
-    cat >&2 <<EOF
-[onboard] FAIL: could not contact the PR broker socket.
-$raw
-
-Next action:
-  fieldwork doctor --remote --explain
-EOF
-    return 1
-  }
-
-  http_code="$(printf '%s\n' "$raw" | tail -n 1)"
-  body="$(printf '%s\n' "$raw" | sed '$d')"
-  if [ "$http_code" = "200" ] && printf '%s' "$body" | jq -e '.ok == true' >/dev/null 2>&1; then
-    PREFLIGHT_JSON="$body"
+broker_preflight() {
+  local payload response error
+  payload="$(jq -cn --arg slug "$SLUG" '{slug:$slug}')"
+  response="$(ssh "$SSH_HOST" "printf '%s' $(shell_quote "$payload") | curl -sS --max-time 35 --unix-socket /run/fieldwork-pr-broker/fieldwork-pr.sock -H 'Content-Type: application/json' --data-binary @- http://localhost/preflight")" || return
+  if printf '%s' "$response" | jq -e '.ok == true and .state == "ready"' >/dev/null 2>&1; then
     return 0
   fi
-
-  error="$(printf '%s' "$body" | jq -r '.error // empty' 2>/dev/null || true)"
-  [ -n "$error" ] || error="$body"
-  cat >&2 <<EOF
-[onboard] FAIL: broker preflight failed for $OWNER_REPO.
-Reason: ${error:-HTTP $http_code from broker}
-EOF
+  error="$(printf '%s' "$response" | jq -r '.error // "invalid broker response"' 2>/dev/null || printf 'invalid broker response')"
+  printf '%s\n' "$response" >&2
+  printf '[onboard] FAIL: broker credential preflight failed: %s\n' "$error" >&2
   case "$error" in
-    *"missing required field: request_id"*|*"unexpected field: repo"*)
-      print_stale_broker_contract_steps
+    git_forge_failed|forge_permission_denied|forge_not_found|credential_unavailable|github_app_unconfigured|github_app_token_invalid)
+      if [ "$FORGE" = github ]; then
+        cat >&2 <<EOF
+
+The broker credential cannot read $OWNER_REPO. Update its repository access
+or replace a PAT through the broker's hidden-input rotation command:
+  ssh -t $SSH_HOST "$(remote_sudo_prefix) env FIELDWORK_ROTATE_PAT_TTY=1 FIELDWORK_PAT_PROBE_REPO=$(shell_quote "$OWNER_REPO") FIELDWORK_FORGE=github /usr/local/sbin/rotate-pat"
+
+If the broker uses a GitHub App, grant that App installation access to
+$OWNER_REPO instead.
+
+Then rerun:
+  fieldwork onboard $OWNER_REPO
+EOF
+      else
+        cat >&2 <<EOF
+
+The broker credential cannot read $OWNER_REPO. Replace the GitLab token through
+the broker's hidden-input rotation command:
+  ssh -t $SSH_HOST "$(remote_sudo_prefix) env FIELDWORK_ROTATE_PAT_TTY=1 FIELDWORK_PAT_PROBE_REPO=$(shell_quote "$OWNER_REPO") FIELDWORK_FORGE=gitlab FIELDWORK_GITLAB_API=$(shell_quote "$FIELDWORK_GITLAB_API") /usr/local/sbin/rotate-pat"
+
+Then rerun:
+  fieldwork onboard $OWNER_REPO
+EOF
+      fi
       ;;
-    *"GitHub App"*|*"install the GitHub App"*)
-      print_broker_app_install_steps
-      ;;
-    *"selected repositories"*|*"cannot reach"*)
-      print_broker_pat_widening_steps
-      ;;
-    *"not stored"*|*"empty"*|*"rotate-pat"*)
+    repo_not_wired|policy_invalid)
       cat >&2 <<EOF
 
-Next action:
-  fieldwork setup
+The root-owned broker policy was not accepted. Reinstall the current broker:
+  fieldwork sync-vps --force-install
+  ssh -t $SSH_HOST "$(remote_sudo_prefix) bash ~/.fieldwork/infra/fieldwork-pr-broker/install.sh"
 EOF
       ;;
     *)
-      cat >&2 <<EOF
-
-Next action:
-  fieldwork doctor --remote --explain
-EOF
+      printf '\nRun fieldwork doctor --remote --explain, then rerun onboarding.\n' >&2
       ;;
   esac
   return 1
@@ -942,9 +957,9 @@ print_onboard_state() {
     fi
   fi
 
-  state_has_step "preflight_passed" \
-    && status_row 1 "$FORGE and broker credential preflight passed" \
-    || status_row 0 "$FORGE and broker credential preflight not confirmed"
+  state_has_step "policy_wired" \
+    && status_row 1 "root-owned protocol-v2 broker policy wired" \
+    || status_row 0 "broker policy not wired"
   [ "$STATE_READY" = "1" ] \
     && status_row 1 "repo cloned on VPS" \
     || status_row 0 "repo not cloned on VPS"
@@ -974,7 +989,7 @@ print_onboard_state() {
     if state_has_step "systemd_unit_active"; then
       status_row 1 "remote Claude session service enabled and active"
     else
-      status_row 0 "remote Claude session service not confirmed" "ssh $SSH_HOST 'systemctl --user restart fieldwork-agent@$SLUG'"
+      status_row 0 "remote Claude session service not confirmed" "ssh -t $SSH_HOST 'sudo systemctl restart fieldwork-agent@$SLUG'"
     fi
   elif agent_enabled codex; then
     printf '  %-7s %s\n' "info" "Codex Desktop connects over SSH; no session service to start"
@@ -1090,26 +1105,20 @@ fi
 phase_section "Preflight"
 echo "  repo: $OWNER_REPO"
 
-# 1. Broker-side preflight: the broker token reaches the forge and returns the
-# forge-neutral metadata contract. GitLab intentionally has no agent-side API.
-run_quiet \
-  "checking broker credential reach through broker socket" \
-  "broker credential can reach repo" \
-  broker_pat_preflight || exit 1
-
-default_branch="$(printf '%s' "$PREFLIGHT_JSON" | jq -r '.default_branch // .defaultBranch // empty')"
-visibility="$(printf '%s' "$PREFLIGHT_JSON"     | jq -r '.visibility // empty')"
-EXPECTED_ORIGIN="$(printf '%s' "$PREFLIGHT_JSON" | jq -r '.expected_origin // empty')"
-echo "  default branch: ${default_branch:-?}, visibility: ${visibility:-?}"
-
-[ -n "$default_branch" ] || default_branch="$DEFAULT_BRANCH"
-[[ "$default_branch" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$ ]] || {
-  echo "[onboard] FAIL: default branch '$default_branch' has an unsupported name." >&2
-  exit 2
-}
-DEFAULT_BRANCH="$default_branch"
-state_add_local "preflight_passed"
-write_state
+# Protocol v2 is checkout-blind. Establish the public origin hint here; after
+# the read-only clone resolves its default branch, the broker preflight uses
+# only the root-owned policy slug to validate credential access.
+if [ "$FORGE" = gitlab ]; then
+  EXPECTED_ORIGIN="https://$(fieldwork_gitlab_api_host)/$OWNER_REPO.git"
+else
+  EXPECTED_ORIGIN="https://github.com/$OWNER_REPO.git"
+fi
+echo "  broker policy: approval=$([ "$AUTO_APPROVE" = 1 ] && echo auto || echo require)"
+if ! ssh "$SSH_HOST" "test -x /usr/local/sbin/fieldwork-policy-write" >/dev/null 2>&1; then
+  echo "[onboard] FAIL: root-owned broker policy writer is missing." >&2
+  echo "Next action: run fieldwork setup, then rerun fieldwork onboard $OWNER_REPO" >&2
+  exit 1
+fi
 
 # 2. Clone (skip if already cloned).
 if fieldwork_status_check "checking VPS checkout" ssh "$SSH_HOST" "test -d $REMOTE_REPO_DIR/.git"; then
@@ -1156,6 +1165,36 @@ else
 fi
 STATE_READY=1
 mark_step "clone_deploy_key_completed"
+
+# Resolve the clone's remote HEAD without involving the credential-bearing
+# broker, then atomically wire a broker-owned policy under root authority.
+default_branch="$(ssh "$SSH_HOST" "git -C $(shell_quote "$REMOTE_REPO_DIR") symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##'" 2>/dev/null || true)"
+[ -n "$default_branch" ] || default_branch="$DEFAULT_BRANCH"
+[[ "$default_branch" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$ ]] || {
+  echo "[onboard] FAIL: default branch '$default_branch' has an unsupported name." >&2
+  exit 2
+}
+DEFAULT_BRANCH="$default_branch"
+phase_section "Broker Policy"
+echo "  default branch: $DEFAULT_BRANCH"
+if remote_sudo_passwordless; then
+  run_quiet \
+    "writing root-owned protocol-v2 broker policy" \
+    "broker policy wired for $SLUG" \
+    wire_broker_policy || exit 1
+else
+  fieldwork_status_cleanup
+  status_info_line "VPS sudo authentication is required to write the root-owned broker policy"
+  wire_broker_policy || exit 1
+  status_ok_line "broker policy wired for $SLUG"
+fi
+run_quiet \
+  "checking broker credential access to $OWNER_REPO" \
+  "broker credential can read $OWNER_REPO" \
+  broker_preflight || exit 1
+state_add_local "preflight_passed"
+state_add_local "policy_wired"
+write_state
 
 # 3. Manual priming checkpoints — Claude Code only. No way to drive
 # workspace-trust / remote-control automatically. Codex has no Fieldwork-driven
@@ -1292,11 +1331,6 @@ run_quiet \
   ssh "$SSH_HOST" "cd $REMOTE_REPO_DIR && git add -A && (git diff --cached --quiet || git -c user.email=fieldwork@vps -c user.name='Fieldwork VPS' commit -m 'chore(fieldwork): bootstrap Fieldwork config')"
 mark_step "init_commit_created"
 
-run_quiet \
-  "granting broker read access to checkout" \
-  "broker can read checkout" \
-  grant_broker_checkout_read_access
-
 # 6. Open init PR via broker (skip if one already open for this branch).
 existing_pr=""
 existing_pr_status=0
@@ -1312,6 +1346,18 @@ else
   status_info_line "GitLab MR lookup is broker-side; skipping agent-side gh check"
 fi
 existing_pr="$(printf '%s' "$existing_pr" | tr -d '[:space:]')"
+
+# An existing PR is only a no-op when its remote branch already matches the
+# checkout. Reseeding can create a new local commit after the PR opened; that
+# commit must still pass through a fresh broker request and approval.
+if [ -n "$existing_pr" ]; then
+  local_init_head="$(ssh "$SSH_HOST" "git -C $REMOTE_REPO_DIR rev-parse HEAD" 2>/dev/null || true)"
+  remote_init_head="$(ssh "$SSH_HOST" "git -C $REMOTE_REPO_DIR ls-remote --heads origin 'refs/heads/$BRANCH' | awk 'NR == 1 { print \$1 }'" 2>/dev/null || true)"
+  if [ -z "$local_init_head" ] || [ "$local_init_head" != "$remote_init_head" ]; then
+    status_info_line "init PR #$existing_pr has new local commits; submitting its update through the broker"
+    existing_pr=""
+  fi
+fi
 
 # 6a. When no PR is open yet, detect the already-onboarded case: if the init
 # branch has no commits ahead of the default branch, the init PR was already
@@ -1349,8 +1395,6 @@ else
 set -euo pipefail
 cd $REMOTE_REPO_DIR
 mkdir -p .fieldwork/local
-request_id="\$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen)"
-created_at="\$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 body_file="\$(mktemp)"
 trap 'rm -f "\$body_file"' EXIT
 cat > "\$body_file" <<'BODY_EOF'
@@ -1358,23 +1402,22 @@ $INIT_PR_BODY
 BODY_EOF
 body="\$(cat "\$body_file")"
 jq -n \\
-  --arg request_id "\$request_id" \\
-  --arg created_at "\$created_at" \\
-  --arg repo_path "$BROKER_REPO_PATH" \\
+  --arg slug "$SLUG" \\
   --arg branch "$BRANCH" \\
   --arg title "chore(fieldwork): bootstrap Fieldwork config" \\
   --arg body "\$body" \\
-  '{request_id: \$request_id, created_at: \$created_at, repo_path: \$repo_path, branch: \$branch, title: \$title, body: \$body}' \\
-  > .fieldwork/local/pr-request.json
+  '{schema_version: 2, slug: \$slug, branch: \$branch, title: \$title, body: \$body}' \\
+  > .fieldwork/local/pr-build-request.json
 if [ -n "\$(git status --short -- ':!.fieldwork/local/')" ]; then
   echo 'tree dirty — broker requires a clean worktree. Dirty paths:' >&2
   git status --short -- ':!.fieldwork/local/' >&2
   exit 1
 fi
-~/.local/bin/fieldwork-pr-submit .fieldwork/local/pr-request.json
+request_id="\$(/usr/local/bin/fieldwork-pr-build .fieldwork/local/pr-build-request.json)"
+/usr/local/bin/fieldwork-pr-upload "\$request_id"
 EOF
-  # Outer heredoc (unquoted) expands $REMOTE_REPO_DIR, $BROKER_REPO_PATH, $BRANCH,
-  # and $INIT_PR_BODY locally. The inner 'BODY_EOF' heredoc is quoted so the body
+  # Outer heredoc (unquoted) expands the trusted slug/branch values and body.
+  # The inner 'BODY_EOF' heredoc is quoted so the body
   # lands on the VPS verbatim, and jq builds the request JSON — that keeps newlines
   # and other JSON-special characters in the body properly escaped instead of
   # breaking the request the way a naive "body": "$INIT_PR_BODY" string interpolation
@@ -1385,13 +1428,10 @@ EOF
     scp -q "$local_script" "$SSH_HOST:$remote_script"
   broker_status=0
   run_capture broker_response \
-    "opening init PR through broker" \
-    "init PR opened through broker" \
+    "submitting init branch through broker" \
+    "init branch accepted by broker" \
     ssh "$SSH_HOST" "bash $remote_script; status=\$?; rm -f $remote_script; exit \$status" || broker_status=$?
-  # fieldwork-pr-submit prints the broker's JSON response on the first stdout
-  # line, then (for the approval-gate path) appends a human-readable "queued"
-  # notice. Parse only the JSON line. The body is printed even on a non-200
-  # status, so parse it before treating a non-zero exit as a hard failure.
+  # The uploader prints the broker's structured JSON response on stdout.
   broker_json="$(printf '%s\n' "$broker_response" | awk '/^\{.*\}$/ { print; exit }')"
   if [ -n "$broker_json" ] && printf '%s' "$broker_json" | jq -e '.already_pending == true' >/dev/null 2>&1; then
     # Idempotent re-run: the broker already has a queued request for this branch.
@@ -1453,14 +1493,14 @@ if agent_enabled claude; then
   run_capture w2_output \
     "starting remote Claude session service" \
     "remote Claude session service checked" \
-    ssh "$SSH_HOST" "
-  systemctl --user enable --now 'fieldwork-agent@$SLUG' &&
+    ssh -t "$SSH_HOST" "
+  sudo systemctl enable --now 'fieldwork-agent@$SLUG' &&
   sleep 4 &&
-  state=\$(systemctl --user is-active 'fieldwork-agent@$SLUG' || true) &&
+  state=\$(systemctl is-active 'fieldwork-agent@$SLUG' || true) &&
   echo \"\$state\" &&
   if [ \"\$state\" = active ]; then
-    ( journalctl --user -u 'fieldwork-agent@$SLUG' -n 30 --no-pager | grep -iE 'permission denied' && echo '[onboard] WARN: permission-denied lines above — extend ReadWritePaths' || true )
-  elif journalctl --user -u 'fieldwork-agent@$SLUG' -n 30 --no-pager | grep -q 'refusing to serve sessions from the init branch'; then
+    ( journalctl -u 'fieldwork-agent@$SLUG' -n 30 --no-pager | grep -iE 'permission denied' && echo '[onboard] WARN: permission-denied lines above — extend ReadWritePaths' || true )
+  elif journalctl -u 'fieldwork-agent@$SLUG' -n 30 --no-pager | grep -q 'refusing to serve sessions from the init branch'; then
     echo GATED_UNTIL_INIT_MERGE
   else
     exit 1
@@ -1549,27 +1589,13 @@ if agent_enabled claude; then
   echo "    fieldwork doctor --remote --session-probe"
 fi
 
-# Reflect the repo's ACTUAL approval-gate state, not just the CLI flag. The
-# .fieldwork/approval-gate marker may already be committed from an earlier
-# onboard (e.g. a Claude --with-approval-gate run). PR_STATE=queued is the broker
-# telling us the gate is live; otherwise check the marker on the branch directly.
-approval_gate_active=0
-if [ "$WITH_APPROVAL_GATE" = "1" ] || [ "$PR_STATE" = "queued" ]; then
-  approval_gate_active=1
-elif ssh "$SSH_HOST" "cd $REMOTE_REPO_DIR && git cat-file -e '$BRANCH:.fieldwork/approval-gate'" >/dev/null 2>&1; then
-  approval_gate_active=1
-fi
-
-if [ "$approval_gate_active" = "1" ]; then
+if [ "$AUTO_APPROVE" != "1" ]; then
   phase_section "Approval gate"
-  echo "  Enabled for this repo (.fieldwork/approval-gate) — every PR request is"
-  echo "  queued for Telegram approval before the broker pushes."
+  echo "  Broker-owned policy requires approval — every PR request is queued"
+  echo "  before the broker pushes. Install the Telegram bot for mobile approval."
 else
-  phase_section "Optional"
-  echo "  Telegram approval bot (not enabled for this repo) — queue each PR for"
-  echo "  mobile approval before the broker pushes."
-  echo "    One-time install:  fieldwork setup-notify --telegram-bot"
-  echo "    Opt in this repo:  fieldwork onboard $OWNER_REPO --with-approval-gate"
+  phase_section "Approval policy"
+  echo "  Broker-owned policy is auto; accepted requests write to the forge immediately."
 fi
 
 phase_section "Work Session Ready"

@@ -33,7 +33,7 @@ esac
 # Fieldwork cage: remote agent sessions run inside a user namespace with
 # NoNewPrivs, where every sandboxed Bash call fails with a bwrap error by
 # design. Deny plain Bash with steering guidance instead of letting the model
-# hit cryptic bwrap failures and conclude the Bash tool is broken. All three
+# hit cryptic bwrap failures and conclude the Bash tool is broken. All
 # conditions are required so local macOS, CI, cloud, and plain Linux sessions
 # never match (cloud can have NoNewPrivs=1 but never the Fieldwork runner
 # socket). FIELDWORK_GUARD_UNAME / FIELDWORK_GUARD_PROC_STATUS are test seams.
@@ -48,10 +48,11 @@ if [ "$uname_s" = "Linux" ] \
     # verbatim absolute-path invocation with arguments skips the sandbox, so
     # only that form may pass. A cd/env/&& prefix would re-enable the per-call
     # sandbox and die on bwrap; denying it here is the kinder failure.
-    "$HOME/.local/bin/fieldwork-verify "*) ;;
-    "$HOME/.local/bin/fieldwork-pr-prepare "*) ;;
-    "$HOME/.local/bin/fieldwork-pr-submit "*) ;;
-    *) deny "Plain Bash is disabled in this Fieldwork remote session: the agent runs in a sandbox cage where every sandboxed Bash call fails by design. This is expected, not a malfunction. Explore with the Read, Grep, and Glob tools instead. To run checks use /verify-before-pr; to commit and open a PR use /pr-delivery. Those skills invoke the only permitted Bash commands, which must be typed verbatim by absolute path with no cd, env, quoting, or && prefix: $HOME/.local/bin/fieldwork-verify <dir>, $HOME/.local/bin/fieldwork-pr-prepare <request.json>, $HOME/.local/bin/fieldwork-pr-submit <request.json>. Do not abandon the PR flow or ask the user to open the PR manually.";;
+    "/usr/local/bin/fieldwork-verify "*) ;;
+    "/usr/local/bin/fieldwork-pr-prepare "*) ;;
+    "/usr/local/bin/fieldwork-pr-build "*) ;;
+    "/usr/local/bin/fieldwork-pr-upload "*) ;;
+    *) deny "Plain Bash is disabled in this Fieldwork remote session: the agent runs in a sandbox cage where every sandboxed Bash call fails by design. This is expected, not a malfunction. Explore with the Read, Grep, and Glob tools instead. To run checks use /verify-before-pr; to commit and deliver a PR use /pr-delivery. That skill uses the four root-owned protocol-v2 clients as separate absolute-path calls: fieldwork-verify, fieldwork-pr-prepare, fieldwork-pr-build, and fieldwork-pr-upload. Do not use the removed fieldwork-pr-submit client, combine build and upload, bypass the broker, or ask the user to push manually.";;
   esac
 fi
 

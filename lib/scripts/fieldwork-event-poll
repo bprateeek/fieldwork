@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # fieldwork-event-poll - local event/artifact poller for Fieldwork repos.
 #
-# Runs as the agent user from a systemd user timer. It reads canonical repos
+# Runs as the agent user from a root-owned system timer. It reads canonical repos
 # under FIELDWORK_PROJECTS_ROOT, discovers linked worktrees via
 # `git worktree list --porcelain`, writes ~/.fieldwork/state artifacts, appends
 # git-derived journal entries, and drops versioned notification envelopes.
 
 set -euo pipefail
 
-python3 - <<'PY'
+/usr/bin/python3 -I - <<'PY'
 from __future__ import annotations
 
 import json
@@ -297,43 +297,16 @@ def drop_notification(payload: dict) -> None:
 
 
 def notify_git_state(slug: str, path: str, fp: dict) -> None:
-    short_rev = str(fp.get("rev") or "")[:12]
-    branch = str(fp.get("branch") or "-")
-    text = (
-        f"{slug} @ {branch} updated: {short_rev} "
-        f"ahead={fp.get('ahead_of_base', 0)} staged={fp.get('staged_count', 0)} "
-        f"dirty={fp.get('dirty_count', 0)} untracked={fp.get('untracked_count', 0)}"
-    )
-    drop_notification({
-        "schema": 1,
-        "kind": "repo_state",
-        "source": "event_poller",
-        "event": "git_state_changed",
-        "repo_slug": slug,
-        "request_id": None,
-        "branch": branch,
-        "dedupe_key": f"git_state_changed:{slug}:{path}:{branch}:{fp.get('rev')}:{fp.get('staged_count')}:{fp.get('dirty_count')}:{fp.get('untracked_count')}",
-        "text": text,
-    })
+    # The closed Telegram contract has no free-form repository-state event.
+    # State remains available in the local status snapshot without crossing
+    # the producer/rendering boundary.
+    return
 
 
 def notify_pr_merged(slug: str, branch: str, pr: dict) -> None:
-    number = pr.get("number")
-    url = pr.get("url") or ""
-    text = f"{slug} PR #{number} merged"
-    if url:
-        text = f"{text}: {url}"
-    drop_notification({
-        "schema": 1,
-        "kind": "repo_state",
-        "source": "event_poller",
-        "event": "pr_merged",
-        "repo_slug": slug,
-        "request_id": None,
-        "branch": branch,
-        "dedupe_key": f"pr_merged:{slug}:{branch}:{number}:{pr.get('merged_at')}",
-        "text": text,
-    })
+    # Merge events are not part of the closed PR lifecycle enum. Keep them in
+    # the status journal; do not mis-render them as newly-created PRs.
+    return
 
 
 def open_pr_lines(repo: Path, state: dict, changed: bool) -> list[str]:

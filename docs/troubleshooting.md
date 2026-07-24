@@ -125,7 +125,7 @@ ssh -t fieldwork-vps "sudo -p '[sudo] VPS Linux password for fieldwork: ' bash ~
 
 Symptoms:
 
-- `fieldwork-pr-submit` reports broker socket missing.
+- `/usr/local/bin/fieldwork-pr-upload` reports broker socket missing.
 - `fieldwork smoke` cannot connect.
 - `fieldwork status <slug>` shows Broker warning.
 
@@ -249,7 +249,7 @@ Run the priming commands from onboarding:
 ```sh
 ssh -t fieldwork-vps 'cd ~/projects/<slug> && ~/.local/bin/claude'
 ssh -t fieldwork-vps 'cd ~/projects/<slug> && ~/.local/bin/claude remote-control'
-ssh fieldwork-vps 'systemctl --user restart fieldwork-agent@<slug>'
+ssh -t fieldwork-vps 'sudo systemctl restart fieldwork-agent@<slug>'
 ```
 
 Then:
@@ -329,16 +329,16 @@ Symptoms:
 Repair:
 
 ```sh
-ssh fieldwork-vps 'systemctl --user daemon-reload'
-ssh fieldwork-vps 'systemctl --user enable --now fieldwork-verify-runner.socket'
-ssh fieldwork-vps 'systemctl --user status fieldwork-verify-runner.socket --no-pager'
+ssh -t fieldwork-vps 'sudo systemctl daemon-reload'
+ssh -t fieldwork-vps 'sudo systemctl enable --now fieldwork-verify-runner.socket'
+ssh fieldwork-vps 'systemctl status fieldwork-verify-runner.socket --no-pager'
 ```
 
 If the unit files are missing:
 
 ```sh
 fieldwork sync-vps --force-install
-ssh -t fieldwork-vps 'cd ~/fieldwork && ./bin/fieldwork bootstrap-vps'
+ssh -t fieldwork-vps 'cd ~/fieldwork && sudo env FIELDWORK_REMOTE_USER=$(id -un) bash lib/systemd/install-boundary.sh'
 ```
 
 ## PR-Prepare Runner Socket Missing
@@ -351,17 +351,16 @@ Symptoms:
 Repair:
 
 ```sh
-ssh fieldwork-vps 'systemctl --user daemon-reload'
-ssh fieldwork-vps 'systemctl --user enable --now fieldwork-pr-prepare-runner.socket'
-ssh fieldwork-vps 'systemctl --user status fieldwork-pr-prepare-runner.socket --no-pager'
+ssh -t fieldwork-vps 'sudo systemctl daemon-reload'
+ssh -t fieldwork-vps 'sudo systemctl enable --now fieldwork-pr-prepare-runner.socket'
+ssh fieldwork-vps 'systemctl status fieldwork-pr-prepare-runner.socket --no-pager'
 ```
 
 ## PR-Prepare Request Path Rejected
 
 Symptoms:
 
-- `fieldwork-pr-prepare` says the request must live under
-  `<repo>/.fieldwork/local/`.
+- `fieldwork-pr-prepare` says the request UUID or spool entry is invalid.
 - Codex tries to mirror request JSON into `.claude/local`.
 
 Repair:
@@ -369,12 +368,12 @@ Repair:
 Write and pass the documented request path only:
 
 ```sh
-/home/fieldwork/.local/bin/fieldwork-pr-prepare .fieldwork/local/pr-prepare-request.json
+/usr/local/bin/fieldwork-pr-prepare <prepare-request-id>
 ```
 
-Do not create a `.claude/local` mirror. Fieldwork-owned delivery state lives
-under `.fieldwork/local`, and `fieldwork-pr-submit` uses the same directory for
-`.fieldwork/local/pr-request.json`.
+Do not create a `.claude/local` mirror. Write the prepare request as the only
+file in the private per-UID spool entry, then pass its UUID. The later upload
+phase uses `fieldwork-pr-build` and `/usr/local/bin/fieldwork-pr-upload`.
 
 ## AppArmor, userns, Or bwrap Failures
 

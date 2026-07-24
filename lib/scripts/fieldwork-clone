@@ -117,7 +117,6 @@ DEST="$PROJECTS_DIR/$SLUG"
 KEY="$HOME/.ssh/id_ed25519_$SLUG"
 HOST_ALIAS="$FORGE-$SLUG"
 CONFIG="$HOME/.ssh/config"
-BROKER_USER="${FIELDWORK_BROKER_USER:-fieldwork-pr-broker}"
 if [ "$FORGE" = "gitlab" ]; then
   FORGE_HOST="$(fieldwork_gitlab_api_bare_host)" || { echo "[fieldwork-clone] FAIL: FIELDWORK_GITLAB_API must be https://host/api/v4" >&2; exit 2; }
   EXPECTED_ORIGIN="https://$(fieldwork_gitlab_api_host)/$OWNER_REPO.git"
@@ -158,19 +157,6 @@ EOC
     [ "$verbose" = "1" ] && say "SSH host alias $HOST_ALIAS already present"
   fi
   return 0
-}
-
-grant_broker_read_access() {
-  [ -d "$DEST/.git" ] || return 0
-  chmod o+x "$HOME" "$PROJECTS_DIR" 2>/dev/null || true
-  if command -v setfacl >/dev/null 2>&1 && id "$BROKER_USER" >/dev/null 2>&1; then
-    setfacl -m "u:$BROKER_USER:--x" "$HOME" "$PROJECTS_DIR" 2>/dev/null || true
-    setfacl -R -m "u:$BROKER_USER:rX" "$DEST" 2>/dev/null || true
-  else
-    # Fallback for hosts without ACL support. The broker runs as a separate
-    # system user, so it needs read/traverse access to validate and push.
-    chmod -R o+rX "$DEST" 2>/dev/null || true
-  fi
 }
 
 clone_after_deploy_key() {
@@ -217,8 +203,6 @@ clone_after_deploy_key() {
     exit 1
   fi
   rm -f "$log"
-  grant_broker_read_access
-
   # Tell gh which repo this clone represents — the deploy-key alias URL hides the
   # real github.com host so gh's auto-detection fails without this hint.
   [ "$FORGE" != "github" ] || (cd "$DEST" && gh repo set-default "$OWNER_REPO" >/dev/null 2>&1) || {

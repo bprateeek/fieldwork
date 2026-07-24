@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3 -I
 """fieldwork-task-run - execute one one_shot_job task end to end.
 
 Invoked by fieldwork-task-dispatcher as:
@@ -18,9 +18,8 @@ runner only accept that path - never a worktree). The flow:
      key in this process env only.
   3. detect the diff; refuse control-path edits (.fieldwork/**, .claude/**) and
      .git tampering; track task-created ignored files.
-  4. commit via fieldwork-pr-prepare, verify via fieldwork-verify, submit via
-     fieldwork-pr-submit (generic title/message - never the raw prompt; the
-     broker scans the body only).
+  4. commit via fieldwork-pr-prepare, verify, then perform the protocol-v2
+     upload phase as two calls: fieldwork-pr-build and fieldwork-pr-upload.
   5. hold the checkout on-branch until the broker reaches a terminal state
      (pr_opened / request_denied) or the submit expires_at + grace elapses;
      then restore the checkout to base and scrub task-created ignored files.
@@ -47,19 +46,17 @@ from pathlib import Path
 HOME = Path(os.environ.get("HOME", str(Path.home())))
 PROJECTS_ROOT = Path(os.environ.get("FIELDWORK_PROJECTS_ROOT", str(HOME / "projects")))
 TASKS_DIR = Path(os.environ.get("FIELDWORK_TASKS_DIR", "/var/lib/fieldwork-tasks"))
-LOCAL_BIN = HOME / ".local" / "bin"
-ADAPTERS_DIR = HOME / ".fieldwork" / "infra" / "agents"
+TEST_MODE = os.environ.get("FIELDWORK_TASK_TEST_MODE") == "1"
+LOCAL_BIN = Path(os.environ["FIELDWORK_TASK_TEST_CLIENT_BIN"]) if TEST_MODE else Path("/usr/local/bin")
+ADAPTERS_DIR = Path(os.environ["FIELDWORK_TASK_TEST_ADAPTERS_DIR"]) if TEST_MODE else Path("/usr/local/lib/fieldwork/agents")
 BRANCH_PREFIX = os.environ.get("FIELDWORK_BRANCH_PREFIX", "fieldwork")
 ADAPTER_NAME = os.environ.get("FIELDWORK_AGENT_ADAPTER", "aider")
 AIDER_CONF = HOME / ".fieldwork" / "aider.conf"
 BWRAP = os.environ.get("FIELDWORK_BWRAP", "bwrap")
 TIMEOUT = int(os.environ.get("FIELDWORK_TASK_TIMEOUT", "1800") or "1800")
 APPROVAL_GRACE = int(os.environ.get("FIELDWORK_TASK_APPROVAL_GRACE", "120") or "120")
-AUDIT_LOG = Path(os.environ.get("FIELDWORK_BROKER_AUDIT_LOG", "/var/lib/fieldwork-pr-broker/audit.jsonl"))
-NOTIFY_DIR = os.environ.get("FIELDWORK_NOTIFICATIONS_DIR", "/var/lib/fieldwork-pr-broker/notifications")
 
 DEFAULT_BRANCH_FILE = ".fieldwork/default-branch"
-APPROVAL_GATE_MARKER = ".fieldwork/approval-gate"
 CONTROL_PATH_RE = re.compile(r"^(\.git/|\.fieldwork/|\.claude/)")
 SECRETISH_RE = re.compile(r"(^|/)(\.env(\.|$)|.*\.pem$|.*secret.*|.*credential.*|.*\.key$)", re.IGNORECASE)
 GIT_CRITICAL = ("config", "hooks", "info")
@@ -160,35 +157,10 @@ class Task:
         os.replace(tmp, self.dir / "state.json")
 
 
-def notify(task: Task, event: str, text: str) -> None:
-    drop = Path(NOTIFY_DIR)
-    if not (drop.is_dir() and os.access(drop, os.W_OK)):
-        return
-    uid = uuid.uuid4().hex
-    payload = {
-        "schema": 1,
-        "kind": "task_lifecycle",
-        "source": "dispatcher",
-        "event": event,
-        "repo_slug": task.slug,
-        "request_id": task.state.get("request_id"),
-        "branch": task.branch,
-        "profile": task.profile,
-        "actor": task.actor,
-        "dedupe_key": f"task:{task.id}:{event}",
-        "text": text,
-    }
-    tmp = drop / f".tmp-{uid}"
-    out = drop / f"{uid}.json"
-    try:
-        tmp.write_text(json.dumps(payload, sort_keys=True) + "\n")
-        os.chmod(tmp, 0o660)
-        os.replace(tmp, out)
-    except OSError:
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
+def notify(task: Task, event: str, _text: str = "") -> None:
+    # PR lifecycle notifications are emitted by the broker after it has
+    # validated the typed request. The agent uid never receives queue access.
+    return
 
 
 def redact(text: str, secrets: list[str]) -> str:
@@ -350,8 +322,22 @@ def changed_paths(repo: Path) -> list[str]:
     return out
 
 
-def write_prepare_request(task: Task, paths: list[str]) -> Path:
-    local = task.repo / ".fieldwork" / "local"
+def spool_dir(request_id: str) -> Path:
+    uid = os.getuid()
+    if TEST_MODE:
+        root = Path(os.environ["FIELDWORK_TASK_TEST_SPOOL_ROOT"])
+    elif sys.platform == "darwin":
+        root = Path("/private/var/run/fieldwork", str(uid), "spool")
+    else:
+        root = Path("/run/user", str(uid), "fieldwork", "spool")
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(root, 0o700)
+    path = root / request_id
+    path.mkdir(mode=0o700)
+    return path
+
+
+def write_prepare_request(task: Task, paths: list[str]) -> str:
     msg = (
         f"Fieldwork task {task.id[:12]}\n\n"
         f"Automated one_shot_job change for {task.slug}. "
@@ -365,26 +351,27 @@ def write_prepare_request(task: Task, paths: list[str]) -> Path:
         "paths": paths,
         "message": msg,
     }
-    path = local / "pr-prepare-request.json"
+    request_id = str(req["request_id"])
+    path = spool_dir(request_id) / "request.json"
     path.write_text(json.dumps(req))
-    return path
+    os.chmod(path, 0o600)
+    return request_id
 
 
-def write_pr_request(task: Task) -> Path:
-    local = task.repo / ".fieldwork" / "local"
+def write_pr_request(task: Task, common_base_oid: str) -> Path:
     body = (
         f"Automated change from a Fieldwork one_shot_job ({ADAPTER_NAME}).\n\n"
         f"- repo: {task.slug}\n- task: {task.id[:12]}\n"
     )
     req = {
-        "request_id": str(uuid.uuid4()),
-        "created_at": now(),
-        "repo_path": str(task.repo),
+        "schema_version": 2,
+        "slug": task.slug,
         "branch": task.branch,
         "title": f"Fieldwork task: {task.slug} ({task.id[:8]})",
         "body": body,
+        "common_base_oid": common_base_oid,
     }
-    path = local / "pr-request.json"
+    path = task.dir / "pr-build-request.json"
     path.write_text(json.dumps(req))
     return path
 
@@ -404,28 +391,21 @@ def wait_for_terminal(request_id: str, expires_at: str) -> str:
     except (TypeError, ValueError):
         pass
     while time.time() < deadline:
-        ev = scan_audit(request_id)
-        if ev:
-            return ev
+        result = run(
+            [str(LOCAL_BIN / "fieldwork-pr-upload"), "--status", request_id],
+            timeout=30,
+        )
+        if result.returncode == 0:
+            try:
+                state = json.loads(result.stdout).get("state")
+            except (AttributeError, json.JSONDecodeError):
+                state = None
+            if state == "done":
+                return "pr_opened"
+            if state in {"denied", "expired", "failed", "needs_operator"}:
+                return "request_denied" if state == "denied" else str(state)
         time.sleep(5)
-    # One last scan, then treat as expired: a late approval is rejected by the
-    # broker because the pending entry has expired.
-    return scan_audit(request_id) or "expired"
-
-
-def scan_audit(request_id: str) -> str | None:
-    try:
-        with open(AUDIT_LOG) as f:
-            for line in f:
-                try:
-                    rec = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if rec.get("request_id") == request_id and rec.get("event") in ("pr_opened", "request_denied"):
-                    return rec["event"]
-    except OSError:
-        return None
-    return None
+    return "expired"
 
 
 # ---- restore + finish -------------------------------------------------------
@@ -517,8 +497,8 @@ def execute(task: Task) -> int:
         return finish(task, "failed", f"refused: secret-shaped ignored files {secretish[:5]}")
 
     task.set_phase("committed")
-    prep = write_prepare_request(task, paths)
-    r = call_client("fieldwork-pr-prepare", str(prep), repo)
+    prep_request_id = write_prepare_request(task, paths)
+    r = call_client("fieldwork-pr-prepare", prep_request_id, repo)
     if r.returncode != 0:
         save_patch(task, repo)
         restore(repo, base, base_head, task.branch, new_ignored)
@@ -532,12 +512,19 @@ def execute(task: Task) -> int:
         return finish(task, "failed", f"verify failed: {r.stderr.strip()[:200]}")
 
     task.set_phase("submitted")
-    prr = write_pr_request(task)
-    r = call_client("fieldwork-pr-submit", str(prr), repo)
+    prr = write_pr_request(task, base_head)
+    r = call_client("fieldwork-pr-build", str(prr), repo)
     if r.returncode != 0:
         save_patch(task, repo)
         restore(repo, base, base_head, task.branch, new_ignored)
-        return finish(task, "failed", f"broker rejected: {r.stderr.strip()[:200]}")
+        return finish(task, "failed", "PR pack build failed")
+    built_lines = (r.stdout or "").splitlines()
+    request_id = built_lines[-1].strip() if built_lines else ""
+    r = call_client("fieldwork-pr-upload", request_id, repo)
+    if r.returncode != 0:
+        save_patch(task, repo)
+        restore(repo, base, base_head, task.branch, new_ignored)
+        return finish(task, "failed", "broker rejected the PR request")
 
     resp = {}
     first = (r.stdout or "").splitlines()
@@ -546,7 +533,7 @@ def execute(task: Task) -> int:
             resp = json.loads(first[0])
         except json.JSONDecodeError:
             resp = {}
-    request_id = resp.get("request_id", "")
+    request_id = resp.get("request_id", request_id)
 
     if resp.get("queued") is True:
         task.set_phase("awaiting_approval", request_id=request_id, expires_at=resp.get("expires_at"))

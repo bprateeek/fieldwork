@@ -27,7 +27,9 @@ Options:
   --branch fieldwork/init     pass through to onboard
   --slug slug                 pass through to onboard
   --no-workflows              pass through to onboard
-  --with-approval-gate        pass through to onboard
+  --auto-approve              wire explicit broker auto-approval (default: require)
+  --allow-private-network     explicit self-managed GitLab private-network opt-in
+  --with-approval-gate        legacy repo-hint flag; broker policy still controls approval
   --reseed-templates          pass through to onboard
   --dry-run                   read-only preflight; do not mutate or update ledgers
   --status                    show quickstart phase state without changing it
@@ -235,7 +237,7 @@ quickstart_fieldwork() {
         onboard_args+=("$1")
         shift
         ;;
-      --no-workflows|--with-approval-gate|--reseed-templates)
+      --no-workflows|--auto-approve|--allow-private-network|--with-approval-gate|--reseed-templates)
         onboard_args+=("$1")
         shift
         ;;

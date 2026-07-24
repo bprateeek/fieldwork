@@ -157,7 +157,7 @@ source "$FIELDWORK_ROOT/lib/cli/task.sh"
 # Resolve the control-plane config object (host, user, projects root, default
 # branch, notify provider, forge, identity). Owns the defaults; see lib/cli/config.sh.
 fieldwork_load_config
-FIELDWORK_FINGERPRINT_FILES="bin/fieldwork install.sh AGENTS.md lib/cli/config.sh lib/cli/messaging.sh lib/cli/health.sh lib/cli/ssh-config.sh lib/cli/setup.sh lib/cli/onboard.sh lib/cli/quickstart.sh lib/cli/provision.sh lib/cli/verify-security.sh lib/cli/uninstall.sh lib/cli/developer-preview.sh lib/cli/task.sh lib/systemd/bootstrap-vps.sh lib/apparmor/fieldwork-bwrap lib/broker/install.sh lib/broker/standalone-install.sh lib/broker/fieldwork-pr-broker.service lib/broker/fieldwork-pr-broker.socket lib/broker/fieldwork-pr-approve.socket lib/broker/server.py schema/pr-request.schema.json schema/pr-prepare-request.schema.json lib/scripts/fieldwork-project.sh lib/scripts/fieldwork-status lib/scripts/fieldwork-status-snapshot lib/scripts/fieldwork-dashboard-server lib/scripts/fieldwork-pr-submit lib/scripts/fieldwork-clone lib/scripts/fieldwork-init lib/scripts/fieldwork-launch lib/scripts/fieldwork-agent-session lib/scripts/fieldwork-task-enqueue lib/scripts/fieldwork-task-run lib/scripts/fieldwork-task-dispatcher lib/scripts/fieldwork-event-poll lib/scripts/fieldwork-setup-probe lib/scripts/fieldwork-session-probe lib/scripts/fieldwork-codex-sandbox lib/scripts/fieldwork-bot lib/scripts/fieldwork-pr-prepare lib/scripts/fieldwork-pr-prepare-runner lib/scripts/fieldwork-pr-prepare-impl lib/agents/claude-remote-control lib/agents/aider lib/templates/repo/AGENTS.md lib/templates/repo/CLAUDE.md lib/templates/repo/.gitignore lib/templates/repo/.fieldwork/expected-origin lib/systemd/fieldwork-agent@.service lib/systemd/fieldwork-dashboard.service lib/systemd/fieldwork-event-poll.service lib/systemd/fieldwork-event-poll.timer lib/systemd/fieldwork-task-dispatcher.service lib/systemd/fieldwork-bot.service lib/systemd/fieldwork-pr-prepare-runner.socket lib/systemd/fieldwork-pr-prepare-runner@.service lib/systemd/fieldwork-verify-runner.socket lib/systemd/fieldwork-verify-runner@.service examples/eval/docker-compose.yml examples/eval/Dockerfile examples/eval/eval-smoke.sh examples/eval/fake-gh examples/eval/fake-gitleaks examples/eval/gh examples/eval/gitleaks examples/eval/README.md"
+FIELDWORK_FINGERPRINT_FILES="bin/fieldwork install.sh AGENTS.md lib/cli/config.sh lib/cli/messaging.sh lib/cli/health.sh lib/cli/ssh-config.sh lib/cli/setup.sh lib/cli/onboard.sh lib/cli/quickstart.sh lib/cli/provision.sh lib/cli/verify-security.sh lib/cli/uninstall.sh lib/cli/developer-preview.sh lib/cli/task.sh lib/systemd/bootstrap-vps.sh lib/systemd/install-boundary.sh lib/apparmor/fieldwork-bwrap lib/broker/install.sh lib/broker/standalone-install.sh lib/broker/fieldwork-pr-broker.service lib/broker/fieldwork-pr-broker.socket lib/broker/fieldwork-pr-approve.socket lib/broker/fieldwork-pr-broker-maintenance.socket lib/broker/server.py lib/broker/originnorm.py lib/broker/policy_writer.py lib/broker/git-askpass lib/broker/rotate-pat lib/broker/maintenance-submit lib/broker/maintenance-mode lib/broker/migrate-instructions schema/pr-request.schema.json schema/pr-prepare-request.schema.json lib/scripts/fieldwork-project.sh lib/scripts/fieldwork-status lib/scripts/fieldwork-status-snapshot lib/scripts/fieldwork-dashboard-server lib/scripts/fieldwork-clone lib/scripts/fieldwork-init lib/scripts/fieldwork-launch lib/scripts/fieldwork-agent-session lib/scripts/fieldwork-task-enqueue lib/scripts/fieldwork-task-run lib/scripts/fieldwork-task-dispatcher lib/scripts/fieldwork-event-poll lib/scripts/fieldwork-setup-probe lib/scripts/fieldwork-session-probe lib/scripts/fieldwork-session-probe-cage lib/scripts/fieldwork-session-probe-record lib/scripts/fieldwork-bash-policy lib/scripts/fieldwork-codex-sandbox lib/scripts/fieldwork-bot lib/scripts/fieldwork-pr-build lib/scripts/fieldwork-pr-upload lib/scripts/fieldwork-pr-prepare lib/scripts/fieldwork-pr-prepare-runner lib/scripts/fieldwork-pr-prepare-impl lib/scripts/fieldwork-verify lib/scripts/fieldwork-verify-runner lib/scripts/fieldwork-verify-pipeline lib/scripts/notify.sh lib/agents/claude-remote-control lib/agents/aider lib/templates/repo/AGENTS.md lib/templates/repo/CLAUDE.md lib/templates/repo/.gitignore lib/templates/repo/.fieldwork/expected-origin lib/systemd/fieldwork-agent@.service lib/systemd/fieldwork-dashboard.service lib/systemd/fieldwork-event-poll.service lib/systemd/fieldwork-event-poll.timer lib/systemd/fieldwork-task-dispatcher.service lib/systemd/fieldwork-bot.service lib/systemd/fieldwork-pr-prepare-runner.socket lib/systemd/fieldwork-pr-prepare-runner@.service lib/systemd/fieldwork-verify-runner.socket lib/systemd/fieldwork-verify-runner@.service lib/local/Dockerfile lib/local/docker-compose.yml lib/local/entrypoint.sh lib/local/rotate-token lib/local/local-admin lib/local/install.sh lib/local/com.fieldwork.spool-init.plist lib/local/control/fieldwork-local lib/local/control/fieldwork-local-claude lib/local/control/fieldwork-local-probe lib/local/control/fieldwork-policy-helper lib/local/control/spool-init lib/local/control/managed-settings.json lib/local/control/strict-managed-settings.json lib/local/control/empty-mcp.json lib/local/managed/CLAUDE.md lib/local/managed/.claude/skills/pr-delivery/SKILL.md examples/broker-client.py examples/eval/docker-compose.yml examples/eval/Dockerfile examples/eval/eval-smoke.sh examples/eval/fake-gitleaks examples/eval/gitleaks examples/eval/README.md"
 FIELDWORK_UI_COLOR=0
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
   FIELDWORK_UI_COLOR=1
@@ -1184,9 +1184,9 @@ emit SERVICE_STATE "$service_state"
 
 broker_socket="/run/fieldwork-pr-broker/fieldwork-pr.sock"
 approve_socket="/run/fieldwork-pr-broker/fieldwork-pr-approve.sock"
-pending_dir="/var/lib/fieldwork-pr-broker/pending"
+pending_dir="/var/lib/fieldwork-pr-broker/pending-meta"
 
-if [ -S "$broker_socket" ] && printf '{}' | curl -sS --max-time 3 --unix-socket "$broker_socket" -H 'Content-Type: application/json' --data-binary @- http://localhost/preflight 2>/dev/null | grep -Fq 'preflight request missing required field: repo'; then
+if [ -S "$broker_socket" ] && printf '{}' | curl -sS --max-time 3 --unix-socket "$broker_socket" -H 'Content-Type: application/json' --data-binary @- http://localhost/preflight 2>/dev/null | grep -Fq '"error":"invalid_preflight_request"'; then
   emit BROKER_SUBMIT_STATUS ok
   emit BROKER_SUBMIT_DETAIL reachable
 elif [ -S "$broker_socket" ]; then
@@ -1201,7 +1201,7 @@ if [ ! -S "$approve_socket" ]; then
   emit APPROVE_SOCKET_STATUS bad
   emit APPROVE_SOCKET_DETAIL "socket missing"
 elif sudo -n -u fieldwork-bot true >/dev/null 2>&1; then
-  if sudo -n -u fieldwork-bot curl -sS --max-time 3 --unix-socket "$approve_socket" -H 'Content-Type: application/json' --data-binary '{}' http://localhost/approve 2>/dev/null | grep -Fq 'approve request missing required field'; then
+  if sudo -n -u fieldwork-bot curl -sS --max-time 3 --unix-socket "$approve_socket" -H 'Content-Type: application/json' --data-binary '{}' http://localhost/approve 2>/dev/null | grep -Fq '"error":"invalid_approval"'; then
     emit APPROVE_SOCKET_STATUS ok
     emit APPROVE_SOCKET_DETAIL reachable
   else
@@ -1235,6 +1235,7 @@ else
 fi
 
 health_file=""
+health_reader=""
 for candidate in \
   "/var/lib/fieldwork-bot/bot-health.json" \
   "/var/lib/fieldwork-pr-broker/bot-health/health.json" \
@@ -1242,14 +1243,24 @@ for candidate in \
   "$HOME/.local/state/fieldwork/bot-health.json"; do
   if [ -r "$candidate" ]; then
     health_file="$candidate"
+    health_reader="direct"
+    break
+  elif sudo -n -u fieldwork-bot test -r "$candidate" >/dev/null 2>&1; then
+    health_file="$candidate"
+    health_reader="fieldwork-bot"
     break
   fi
 done
 
 if [ -n "$health_file" ]; then
-  FIELDWORK_HEALTH_PATH="$health_file" python3 - <<'PY'
+  if [ "$health_reader" = "fieldwork-bot" ]; then
+    health_command=(sudo -n -u fieldwork-bot python3)
+  else
+    health_command=(python3)
+  fi
+  "${health_command[@]}" - "$health_file" <<'PY'
 import json
-import os
+import sys
 from datetime import datetime, timezone
 
 def emit(key, value=""):
@@ -1271,7 +1282,7 @@ def age(value):
         return ""
     return max(0, int((datetime.now(timezone.utc) - ts).total_seconds()))
 
-path = os.environ["FIELDWORK_HEALTH_PATH"]
+path = sys.argv[1]
 try:
     with open(path) as f:
         payload = json.load(f)
@@ -1350,10 +1361,11 @@ for path in entries:
             record = json.load(f)
     except Exception:
         continue
+    repo = record.get("project") or record.get("repo") or ""
     repo_path = record.get("repo_path") or ""
-    slug = os.path.basename(repo_path) if repo_path else os.path.basename(str(record.get("repo") or ""))
+    slug = record.get("slug") or (os.path.basename(repo_path) if repo_path else os.path.basename(str(repo)))
     items.append({
-        "repo": str(record.get("repo") or "unknown").replace("\t", " "),
+        "repo": str(repo or "unknown").replace("\t", " "),
         "branch": str(record.get("branch") or "?").replace("\t", " "),
         "request_id": str(record.get("request_id") or path.stem).replace("\t", " "),
         "age_seconds": age_for(record, path, now),
@@ -1484,7 +1496,7 @@ remote_projects_dir_exists() {
 }
 
 broker_preflight_contract_ok() {
-  ssh "$FIELDWORK_SSH_HOST" "printf '{}' | curl -sS --unix-socket /run/fieldwork-pr-broker/fieldwork-pr.sock -H 'Content-Type: application/json' --data-binary @- http://localhost/preflight 2>/dev/null | grep -Fq 'preflight request missing required field: repo'" >/dev/null 2>&1
+  ssh "$FIELDWORK_SSH_HOST" "printf '{}' | curl -sS --unix-socket /run/fieldwork-pr-broker/fieldwork-pr.sock -H 'Content-Type: application/json' --data-binary @- http://localhost/preflight 2>/dev/null | grep -Fq '\"error\":\"invalid_preflight_request\"'" >/dev/null 2>&1
 }
 
 fieldwork_sudoers_path() {
@@ -1832,30 +1844,26 @@ fingerprint_current() {
 
 bootstrap_ready() {
   export PATH="$HOME/.local/bin:$PATH"
-  { [ "${FIELDWORK_FORGE:-github}" = "gitlab" ] || command -v gh >/dev/null 2>&1; } &&
-    test -d "$FIELDWORK_PROJECTS_DIR" &&
-    test -f "$HOME/.config/systemd/user/fieldwork-verify-runner.socket" &&
-    test -f "$HOME/.config/systemd/user/fieldwork-pr-prepare-runner.socket" || return 1
+  test -d "$FIELDWORK_PROJECTS_DIR" &&
+    test -f /etc/systemd/system/fieldwork-verify-runner.socket &&
+    test -f /etc/systemd/system/fieldwork-pr-prepare-runner.socket || return 1
   case "${FIELDWORK_SETUP_AGENTS:-claude}" in
     claude|both|claude,codex|codex,claude)
       command -v claude >/dev/null 2>&1 &&
-        test -f "$HOME/.config/systemd/user/fieldwork-agent@.service"
+        test -f /etc/systemd/system/fieldwork-agent@.service
       ;;
     *) return 0 ;;
   esac
 }
 
 verify_runner_ready() {
-  export PATH="$HOME/.local/bin:$PATH"
-  local runtime_dir
-  test -x "$HOME/.local/bin/fieldwork-verify" &&
-    test -x "$HOME/.local/bin/fieldwork-verify-runner" &&
-    test -x "$HOME/.fieldwork/scripts/fieldwork-verify-pipeline" &&
-    test -f "$HOME/.config/systemd/user/fieldwork-verify-runner.socket" &&
-    test -f "$HOME/.config/systemd/user/fieldwork-verify-runner@.service" &&
-    systemctl --user is-active --quiet fieldwork-verify-runner.socket || return 1
-  runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
-  test -S "$runtime_dir/fieldwork-verify.sock" &&
+  test -x /usr/local/bin/fieldwork-verify &&
+    test -x /usr/local/lib/fieldwork/fieldwork-verify-runner &&
+    test -x /usr/local/lib/fieldwork/fieldwork-verify-pipeline &&
+    test -f /etc/systemd/system/fieldwork-verify-runner.socket &&
+    test -f /etc/systemd/system/fieldwork-verify-runner@.service &&
+    systemctl is-active --quiet fieldwork-verify-runner.socket &&
+    test -S /run/fieldwork/fieldwork-verify.sock &&
     command -v bwrap >/dev/null 2>&1 &&
     bwrap --unshare-user --unshare-net --unshare-pid --unshare-uts --unshare-ipc \
       --ro-bind / / --tmpfs /tmp --dev /dev --proc /proc \
@@ -1975,12 +1983,17 @@ else
   timing_emit timing_remote_gh_auth_status "$gh_live_start"
 fi
 status_for verify_runner verify_runner_ready
-status_for prepare_runner test -f "$HOME/.config/systemd/user/fieldwork-pr-prepare-runner.socket"
-status_for claude_service test -f "$HOME/.config/systemd/user/fieldwork-agent@.service"
+status_for prepare_runner sh -c 'test -f /etc/systemd/system/fieldwork-pr-prepare-runner.socket && systemctl is-active --quiet fieldwork-pr-prepare-runner.socket && test -S /run/fieldwork/fieldwork-pr-prepare.sock'
+status_for claude_service test -f /etc/systemd/system/fieldwork-agent@.service
 broker_checks_start="$(timing_now)"
 status_for broker_socket sh -c 'test -S /run/fieldwork-pr-broker/fieldwork-pr.sock && test -w /run/fieldwork-pr-broker/fieldwork-pr.sock'
-status_for broker_pat_tool test -f /usr/local/sbin/rotate-pat
-status_for broker_thin_client test -e "$HOME/.local/bin/fieldwork-pr-submit"
+status_for broker_pat_tool sh -c \
+  'test -f /usr/local/sbin/rotate-pat &&
+   test -x /usr/local/sbin/fieldwork-policy-write &&
+   test -f /usr/local/sbin/fieldwork-pr-maintenance-submit &&
+   test -f /usr/local/sbin/fieldwork-pr-maintenance-mode &&
+   test -f /usr/local/sbin/fieldwork-migrate-instructions'
+status_for broker_thin_client sh -c 'test -x /usr/local/bin/fieldwork-pr-build && test -x /usr/local/bin/fieldwork-pr-upload'
 status_for broker_pat_marker test -f "$HOME/.fieldwork/state/broker-pat-confirmed"
 status_for broker_pat_sudo broker_pat_sudo
 broker_pat_sudo_probe
@@ -2333,7 +2346,7 @@ doctor() {
     local helpers_ok=0
     if [ -f "$HOME/.claude/CLAUDE.md" ] \
       && [ -f "$HOME/.claude/settings.json" ] \
-      && [ -x "$HOME/.fieldwork/scripts/fieldwork-pr-submit" ] \
+      && [ -x "$HOME/.fieldwork/scripts/fieldwork-pr-build" ] \
       && [ -x "$HOME/.fieldwork/scripts/fieldwork-verify" ] \
       && [ -x "$HOME/.fieldwork/scripts/fieldwork-pr-prepare" ] \
       && [ -f "$HOME/.fieldwork/agents" ]; then
@@ -2657,8 +2670,8 @@ EOF
 	  else
 	    doctor_needs "Fieldwork command" "bash install.sh" "the fieldwork command is not on PATH or installed under ~/.local/bin" "setup, sync, and onboarding expect the local CLI to be installed" "run bash install.sh" "yes"
 	  fi
-	  if { [ -f "$HOME/.claude/CLAUDE.md" ] && [ -f "$HOME/.claude/settings.json" ] && [ -x "$HOME/.fieldwork/scripts/fieldwork-pr-submit" ]; } \
-	    || { [ -f "$FIELDWORK_ROOT/lib/claude/CLAUDE.md" ] && [ -f "$FIELDWORK_ROOT/lib/claude/settings.json" ] && [ -x "$FIELDWORK_ROOT/lib/scripts/fieldwork-pr-submit" ]; }; then
+	  if { [ -f "$HOME/.claude/CLAUDE.md" ] && [ -f "$HOME/.claude/settings.json" ] && [ -x "$HOME/.fieldwork/scripts/fieldwork-pr-build" ]; } \
+	    || { [ -f "$FIELDWORK_ROOT/lib/claude/CLAUDE.md" ] && [ -f "$FIELDWORK_ROOT/lib/claude/settings.json" ] && [ -x "$FIELDWORK_ROOT/lib/scripts/fieldwork-pr-build" ]; }; then
 	    doctor_row ok "Fieldwork helper files"
 	  else
 	    doctor_needs "Fieldwork helper files" "bash install.sh" "Fieldwork helper files are missing from ~/.fieldwork or Claude config is missing from ~/.claude" "Fieldwork sessions use these helpers for launch, verify, prepare, and PR submission" "run bash install.sh" "yes"
@@ -2819,35 +2832,41 @@ EOF
           || doctor_manual "GitHub CLI login needed" "ssh -t $FIELDWORK_SSH_HOST 'gh auth login --hostname github.com --git-protocol ssh --web --skip-ssh-key'" "gh is installed but not logged in on the VPS" "onboarding needs gh auth for repo-resolution preflights before the broker opens PRs" "run ssh -t $FIELDWORK_SSH_HOST 'gh auth login --hostname github.com --git-protocol ssh --web --skip-ssh-key'" "yes"
 	      fi
 
-      # Opt-in because the probe runs claude headless on the VPS: it spends
-      # model tokens and needs a confirmed login. It exists because claude CLI
-      # updates have changed sandbox.excludedCommands semantics before; if
-      # exclusions stop rescuing the fieldwork clients, remote sessions lose
-      # their only working Bash commands.
+      # The recorded probe digest is the fail-closed admission control for
+      # Claude sessions. The optional live probe below spends model tokens and
+      # is therefore still opt-in; recording it is an explicit root operation.
+      if agents_include "$remote_agents" claude; then
+        if ssh "$FIELDWORK_SSH_HOST" 'test -s /usr/local/lib/fieldwork/claude.sha256 && test "$(cat /usr/local/lib/fieldwork/claude.sha256)" = "$(cat /usr/local/lib/fieldwork/claude.probe.sha256 2>/dev/null)"' >/dev/null 2>&1; then
+          doctor_ok "pinned Claude binary has a passing hostile probe"
+        else
+          doctor_needs "pinned Claude binary has no current hostile-probe result" "ssh -t $FIELDWORK_SSH_HOST 'sudo env FIELDWORK_REMOTE_USER=$FIELDWORK_REMOTE_USER /usr/local/sbin/fieldwork-session-probe-record'" "the recorded passing digest is absent or differs from the installed pinned Claude digest" "Claude sessions fail closed until this exact executable passes the root-owned runtime probe" "authenticate Claude for $FIELDWORK_REMOTE_USER if needed, run the probe-record command, then rerun doctor" "yes"
+        fi
+      fi
+
       if [ "$session_probe" = "1" ]; then
         doctor_section "Session probe"
-        [ "$explain" = "1" ] && doctor_info "purpose" "run claude headless inside a NoNewPrivs + userns cage (the agent's runtime) and confirm the fieldwork clients still skip the per-call sandbox"
+        [ "$explain" = "1" ] && doctor_info "purpose" "run the root-pinned Claude executable under the hostile agent runtime and confirm only the three exact root-owned clients escape while the managed hook blocks unsafe forms"
         if ! agents_include "$remote_agents" claude; then
           doctor_row skipped "sandbox excludedCommands semantics" "Claude not configured"
         elif ! ssh "$FIELDWORK_SSH_HOST" "test -f ~/.fieldwork/state/claude-login-confirmed"; then
           doctor_manual "session probe needs Claude Code login" "ssh -t $FIELDWORK_SSH_HOST '~/.local/bin/claude login'" "the probe runs claude headless on the VPS, which requires a confirmed login" "without login the probe can only return inconclusive" "log in, then rerun fieldwork doctor --remote --session-probe" "yes"
         else
           local probe_out probe_state probe_detail
-          probe_out="$(ssh "$FIELDWORK_SSH_HOST" "\"\$HOME/.fieldwork/scripts/fieldwork-session-probe\"" 2>/dev/null || true)"
+          probe_out="$(ssh "$FIELDWORK_SSH_HOST" "FIELDWORK_SESSION_PROBE=1 /usr/local/lib/fieldwork/fieldwork-session-probe" 2>/dev/null || true)"
           probe_state="$(doctor_kv_value "$probe_out" probe)"
           probe_detail="$(doctor_kv_value "$probe_out" detail)"
           case "$probe_state" in
             pass)
-              doctor_ok "sandbox excludedCommands semantics hold on the installed claude CLI"
+              doctor_ok "hostile runtime probe passes for the root-pinned Claude executable"
               ;;
             fail)
-              doctor_needs "sandbox excludedCommands no longer rescue the fieldwork clients" "inspect ~/.claude/settings.json sandbox.excludedCommands against the installed claude version" "${probe_detail:-the excluded client hit the per-call sandbox}" "remote sessions lose their only working Bash commands when exclusions break, so verify and PR delivery dead-end" "compare the installed claude version with the last known-good one, adjust the exclusion patterns if their matching changed, then rerun fieldwork doctor --remote --session-probe" "yes"
+              doctor_needs "pinned Claude hostile-runtime contract failed" "inspect /etc/claude-code/managed-settings.json and reinstall or roll back the pinned Claude executable" "${probe_detail:-the delivery clients did not satisfy the exact allowlist contract}" "Claude sessions remain disabled because an arbitrary Bash escape or a blocked delivery client would violate the security boundary" "repair or roll back the root-owned install, then run sudo env FIELDWORK_REMOTE_USER=$FIELDWORK_REMOTE_USER /usr/local/sbin/fieldwork-session-probe-record" "yes"
               if [ "$explain" = "1" ]; then
                 printf '%s\n' "$probe_out" | sed -n -e '/^detail_/s/^/      /p' -e '/^raw=/s/^/      /p'
               fi
               ;;
             *)
-              doctor_manual "session probe inconclusive" "fieldwork doctor --remote --session-probe --explain" "${probe_detail:-the probe produced no usable transcript}" "inconclusive is not proof of drift; it usually means login expiry, a startup abort, or model deviation" "check claude login on the VPS and rerun; raw probe lines print with --explain" "yes"
+              doctor_manual "session probe inconclusive" "fieldwork doctor --remote --session-probe --explain" "${probe_detail:-the probe produced no usable transcript}" "inconclusive is not a passing security result; it usually means login expiry, a startup abort, or model deviation" "check Claude login for $FIELDWORK_REMOTE_USER and rerun the root probe-record command; raw probe lines print with --explain" "yes"
               if [ "$explain" = "1" ]; then
                 printf '%s\n' "$probe_out" | sed -n -e '/^detail_/s/^/      /p' -e '/^raw=/s/^/      /p'
               fi
@@ -2868,10 +2887,10 @@ EOF
 	        || doctor_info "remote" "not configured; optional — fieldwork setup-notify --remote"
 
 	      doctor_section "Remote services"
-	      [ "$explain" = "1" ] && doctor_info "purpose" "verify Fieldwork user services and runner sockets"
+	      [ "$explain" = "1" ] && doctor_info "purpose" "verify root-owned Fieldwork boundary services and sockets"
       if agents_include "$remote_agents" claude; then
-        ssh "$FIELDWORK_SSH_HOST" "test -f ~/.config/systemd/user/fieldwork-agent@.service" \
-          && doctor_ok "fieldwork-agent@ systemd user unit installed" \
+        ssh "$FIELDWORK_SSH_HOST" "test -f /etc/systemd/system/fieldwork-agent@.service" \
+          && doctor_ok "fieldwork-agent@ system unit installed" \
           || doctor_manual "fieldwork-agent@ unit missing; rerun bootstrap after Fieldwork install" "run fieldwork sync-vps, then ssh -t $FIELDWORK_SSH_HOST 'cd ~/fieldwork && ./bin/fieldwork bootstrap-vps'" "the per-repo systemd template is missing" "fieldwork onboard enables fieldwork-agent@<repo> from this template" "run fieldwork sync-vps, then rerun bootstrap-vps on the VPS" "yes"
       else
         doctor_row skipped "fieldwork-agent@ unit" "not configured for Codex-only setup"
@@ -2880,23 +2899,22 @@ EOF
       # claude and codex. The poll timer must be installed, enabled (survives
       # reboot), and active now; a VPS upgraded via onboard/refresh without a
       # fresh setup keeps the timer unenabled, which used to pass silently.
-      # The dashboard service is started on demand by `fieldwork dashboard`, so
-      # only its unit-file presence is asserted, never is-active.
+      # The dashboard is deliberately disabled in hard-boundary mode.
       poll_meta="$(ssh "$FIELDWORK_SSH_HOST" '
   unit=fieldwork-event-poll.timer
-  if test -f "$HOME/.config/systemd/user/$unit"; then
-    enabled=$(systemctl --user is-enabled "$unit" 2>/dev/null || true)
-    active=$(systemctl --user is-active "$unit" 2>/dev/null || true)
+  if test -f "/etc/systemd/system/$unit"; then
+    enabled=$(systemctl is-enabled "$unit" 2>/dev/null || true)
+    active=$(systemctl is-active "$unit" 2>/dev/null || true)
     printf "timer=yes enabled=%s active=%s " "$enabled" "$active"
   else
     printf "timer=no enabled= active= "
   fi
-  test -f "$HOME/.config/systemd/user/fieldwork-dashboard.service" \
-    && printf "dashboard=yes " || printf "dashboard=no "
+  test ! -f "/etc/systemd/system/fieldwork-dashboard.service" \
+    && printf "dashboard=disabled " || printf "dashboard=present "
   disp=fieldwork-task-dispatcher.service
-  if test -f "$HOME/.config/systemd/user/$disp"; then
-    den=$(systemctl --user is-enabled "$disp" 2>/dev/null || true)
-    dac=$(systemctl --user is-active "$disp" 2>/dev/null || true)
+  if test -f "/etc/systemd/system/$disp"; then
+    den=$(systemctl is-enabled "$disp" 2>/dev/null || true)
+    dac=$(systemctl is-active "$disp" 2>/dev/null || true)
     printf "dispatcher=yes dispatcher_enabled=%s dispatcher_active=%s\n" "$den" "$dac"
   else
     printf "dispatcher=no dispatcher_enabled= dispatcher_active=\n"
@@ -2920,13 +2938,13 @@ EOF
           "fieldwork doctor --remote --explain" \
           "the SSH probe for fieldwork-event-poll.timer returned nothing" \
           "without the poller, dashboard events and PR status updates stop refreshing" \
-          "rerun doctor; if it persists, check SSH access and systemctl --user on the VPS" \
+          "rerun doctor; if it persists, check SSH access and systemctl on the VPS" \
           "yes"
       elif [ "$timer_present" != "yes" ]; then
         doctor_manual \
           "event poll timer unit file missing" \
           "fieldwork setup --force-install" \
-          "fieldwork-event-poll.timer is not in ~/.config/systemd/user" \
+          "fieldwork-event-poll.timer is not in /etc/systemd/system" \
           "the poller never runs, so dashboard events and PR status updates stall" \
           "fieldwork setup --force-install re-copies the unit, daemon-reloads, and enables it" \
           "yes"
@@ -2945,18 +2963,18 @@ EOF
           "fieldwork setup --force-install" \
           "fieldwork-event-poll.timer is enabled=$timer_enabled active=$timer_active" \
           "the poller drives dashboard events and PR status refresh; if disabled it will not survive a reboot, if inactive it is not refreshing now" \
-          "fieldwork setup --force-install re-applies and enables the timer. Advanced: if the unit file is already current, ssh -t $FIELDWORK_SSH_HOST 'systemctl --user enable --now fieldwork-event-poll.timer'" \
+          "fieldwork setup --force-install re-applies and enables the root-owned timer" \
           "yes"
       fi
-      if [ "$dashboard_present" = "yes" ]; then
-        doctor_ok "dashboard unit installed"
+      if [ "$dashboard_present" = "disabled" ]; then
+        doctor_ok "dashboard disabled in hard-boundary mode"
       else
         doctor_manual \
-          "dashboard unit file missing" \
+          "dashboard system unit must be disabled" \
           "fieldwork setup --force-install" \
-          "fieldwork-dashboard.service is not in ~/.config/systemd/user" \
-          "fieldwork dashboard cannot start the read-only dashboard until the unit is installed" \
-          "fieldwork setup --force-install re-copies the dashboard unit (started on demand by fieldwork dashboard)" \
+          "fieldwork-dashboard.service exists in /etc/systemd/system" \
+          "hard-boundary mode does not permit the dashboard process" \
+          "rerun the boundary installer and remove the stale system unit" \
           "yes"
       fi
       # one_shot_job dispatcher: always-on; must be installed, enabled, active.
@@ -2971,91 +2989,98 @@ EOF
             "fieldwork setup --force-install" \
             "fieldwork-task-dispatcher.service is not both enabled and active" \
             "queued one_shot_job tasks (fieldwork task add / Telegram /task) will not run until it is up" \
-            "fieldwork setup --force-install re-applies and enables it. Advanced: ssh -t $FIELDWORK_SSH_HOST 'systemctl --user enable --now fieldwork-task-dispatcher.service'" \
+            "fieldwork setup --force-install re-applies and enables the root-owned dispatcher" \
             "yes"
         fi
       else
         doctor_manual \
           "task dispatcher unit file missing" \
           "fieldwork setup --force-install" \
-          "fieldwork-task-dispatcher.service is not in ~/.config/systemd/user" \
+          "fieldwork-task-dispatcher.service is not in /etc/systemd/system" \
           "one_shot_job tasks cannot run until the dispatcher unit is installed" \
           "fieldwork setup --force-install re-copies, daemon-reloads, and enables it" \
           "yes"
       fi
 
 	      doctor_section "Verify runner"
-	      [ "$explain" = "1" ] && doctor_info "purpose" "verify /verify-before-pr can confine repo-controlled lint/test steps"
-      # The /verify-before-pr skill invokes ~/.local/bin/fieldwork-verify (a
-      # unix-socket client). The client connects to fieldwork-verify-runner.sock,
-      # which systemd activates per-connection. The runner runs the actual
-      # pipeline under the user manager (outside the agent's userns + NNP),
-      # so its bwrap-confined inner steps can create user namespaces.
-      ssh "$FIELDWORK_SSH_HOST" "test -x ~/.local/bin/fieldwork-verify" \
+	      [ "$explain" = "1" ] && doctor_info "purpose" "verify the root-owned runner can confine repo-controlled lint/test steps"
+      ssh "$FIELDWORK_SSH_HOST" "test -x /usr/local/bin/fieldwork-verify" \
         && doctor_ok "fieldwork-verify client installed" \
-        || doctor_manual "fieldwork-verify client missing" "fieldwork sync-vps" "the verify client is not symlinked into ~/.local/bin" "without the client, /verify-before-pr exits with command-not-found and the agent cannot ship" "run fieldwork sync-vps to re-link the client" "yes"
-      ssh "$FIELDWORK_SSH_HOST" "test -x ~/.local/bin/fieldwork-verify-runner && test -x ~/.fieldwork/scripts/fieldwork-verify-pipeline" \
+        || doctor_manual "fieldwork-verify client missing" "fieldwork setup --force-install" "the root-owned verify client is absent" "without the client, /verify-before-pr exits with command-not-found and the agent cannot ship" "rerun the boundary installer" "yes"
+      ssh "$FIELDWORK_SSH_HOST" "test -x /usr/local/lib/fieldwork/fieldwork-verify-runner && test -x /usr/local/lib/fieldwork/fieldwork-verify-pipeline" \
         && doctor_ok "fieldwork-verify-runner + pipeline installed" \
-        || doctor_manual "fieldwork-verify-runner or pipeline missing" "fieldwork sync-vps" "the runner script (or its pipeline backend) is not on disk" "without the runner, the socket has nothing to invoke when the client connects" "run fieldwork sync-vps to re-link the runner" "yes"
-      # Verify the socket unit is installed in ~/.config/systemd/user, enabled,
-      # and actively listening. The "active" + "listening" pair distinguishes
-      # "user copied unit files but didn't enable" from "enabled but daemon-reload
-      # not run since file changed".
-      runner_install_cmd="ssh -t $FIELDWORK_SSH_HOST 'cp ~/.fieldwork/infra/fieldwork-verify-runner.socket ~/.fieldwork/infra/fieldwork-verify-runner@.service ~/.config/systemd/user/ && systemctl --user daemon-reload && systemctl --user enable --now fieldwork-verify-runner.socket'"
-      ssh "$FIELDWORK_SSH_HOST" "test -f ~/.config/systemd/user/fieldwork-verify-runner.socket && test -f ~/.config/systemd/user/fieldwork-verify-runner@.service" \
-        && doctor_ok "verify runner user units installed" \
+        || doctor_manual "fieldwork-verify-runner or pipeline missing" "fieldwork setup --force-install" "the root-owned runner script or pipeline is absent" "without the runner, the socket has nothing to invoke" "rerun the boundary installer" "yes"
+      runner_install_cmd="ssh -t $FIELDWORK_SSH_HOST 'cd ~/fieldwork && sudo env FIELDWORK_REMOTE_USER=\$(id -un) bash lib/systemd/install-boundary.sh'"
+      ssh "$FIELDWORK_SSH_HOST" "test -f /etc/systemd/system/fieldwork-verify-runner.socket && test -f /etc/systemd/system/fieldwork-verify-runner@.service" \
+        && doctor_ok "verify runner system units installed" \
         || doctor_manual \
-             "verify runner user units missing from ~/.config/systemd/user" \
+             "verify runner system units missing from /etc/systemd/system" \
              "$runner_install_cmd" \
-             "the socket + template service files have not been copied into the user systemd directory" \
-             "without them, systemctl --user can't activate the socket and the verify client has nothing to talk to" \
-             "copy the units, daemon-reload, and enable the socket; the command above does all three" \
+             "the root-owned socket and service files have not been installed" \
+             "without them, the verify client has nothing to talk to" \
+             "run the boundary installer; it copies, reloads, and enables the units" \
              "yes"
-      if ssh "$FIELDWORK_SSH_HOST" "systemctl --user is-active --quiet fieldwork-verify-runner.socket"; then
-        runner_socket_path="$(ssh "$FIELDWORK_SSH_HOST" 'echo "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/fieldwork-verify.sock"' 2>/dev/null | tr -d "\r\n")"
+      if ssh "$FIELDWORK_SSH_HOST" "systemctl is-active --quiet fieldwork-verify-runner.socket"; then
+        runner_socket_path="/run/fieldwork/fieldwork-verify.sock"
         if ssh "$FIELDWORK_SSH_HOST" "test -S '$runner_socket_path'"; then
           doctor_ok "verify runner socket active and listening at $runner_socket_path"
         else
           doctor_manual \
             "verify runner socket unit is active but no socket file at $runner_socket_path" \
-            "ssh -t $FIELDWORK_SSH_HOST 'systemctl --user daemon-reload && systemctl --user restart fieldwork-verify-runner.socket'" \
+            "ssh -t $FIELDWORK_SSH_HOST 'sudo systemctl daemon-reload && sudo systemctl restart fieldwork-verify-runner.socket'" \
             "systemd reports the unit active but the socket inode is missing" \
             "the verify client connects to this socket; without it, /verify-before-pr fails fast with a clear error" \
-            "daemon-reload + restart the socket; if still failing, check journalctl --user -u fieldwork-verify-runner.socket" \
+            "daemon-reload + restart the socket; if still failing, check journalctl -u fieldwork-verify-runner.socket" \
             "yes"
         fi
       else
         doctor_manual \
           "verify runner socket not active" \
-          "ssh -t $FIELDWORK_SSH_HOST 'systemctl --user daemon-reload && systemctl --user enable --now fieldwork-verify-runner.socket'" \
+          "ssh -t $FIELDWORK_SSH_HOST 'sudo systemctl daemon-reload && sudo systemctl enable --now fieldwork-verify-runner.socket'" \
           "fieldwork-verify-runner.socket is not enabled or not started" \
           "the verify client connects to this socket; without it, /verify-before-pr fails fast" \
-          "daemon-reload + enable --now; journalctl --user -u fieldwork-verify-runner.socket shows activation errors" \
+          "daemon-reload + enable --now; journalctl -u fieldwork-verify-runner.socket shows activation errors" \
           "yes"
       fi
-      prepare_runner_install_cmd="ssh -t $FIELDWORK_SSH_HOST 'cp ~/.fieldwork/infra/fieldwork-pr-prepare-runner.socket ~/.fieldwork/infra/fieldwork-pr-prepare-runner@.service ~/.config/systemd/user/ && systemctl --user daemon-reload && systemctl --user enable --now fieldwork-pr-prepare-runner.socket'"
-      ssh "$FIELDWORK_SSH_HOST" "test -x ~/.local/bin/fieldwork-pr-prepare && test -x ~/.local/bin/fieldwork-pr-prepare-runner && test -x ~/.fieldwork/scripts/fieldwork-pr-prepare-impl" \
+      prepare_runner_install_cmd="$runner_install_cmd"
+      ssh "$FIELDWORK_SSH_HOST" "test -x /usr/local/bin/fieldwork-pr-prepare && test -x /usr/local/lib/fieldwork/fieldwork-pr-prepare-runner && test -x /usr/local/lib/fieldwork/fieldwork-pr-prepare-impl" \
         && doctor_ok "fieldwork-pr-prepare client + runner installed" \
         || doctor_manual "fieldwork-pr-prepare client or runner missing" "fieldwork sync-vps" "the PR prepare delivery client or runner is missing" "agents need this socket client to commit through the controlled runner before broker submit" "run fieldwork sync-vps to re-link the prepare client and runner" "yes"
-      ssh "$FIELDWORK_SSH_HOST" "test -f ~/.config/systemd/user/fieldwork-pr-prepare-runner.socket && test -f ~/.config/systemd/user/fieldwork-pr-prepare-runner@.service" \
-        && doctor_ok "PR prepare runner user units installed" \
-        || doctor_manual "PR prepare runner user units missing" "$prepare_runner_install_cmd" "the PR prepare socket + template service files have not been copied into the user systemd directory" "without them, fieldwork-pr-prepare cannot reach the controlled commit runner" "copy the units, daemon-reload, and enable the socket; the command above does all three" "yes"
-      prepare_runner_socket_path="$(ssh "$FIELDWORK_SSH_HOST" 'echo "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/fieldwork-pr-prepare.sock"' 2>/dev/null | tr -d "\r\n")"
-      ssh "$FIELDWORK_SSH_HOST" "systemctl --user is-active --quiet fieldwork-pr-prepare-runner.socket && test -S '$prepare_runner_socket_path'" \
+      ssh "$FIELDWORK_SSH_HOST" "test -f /etc/systemd/system/fieldwork-pr-prepare-runner.socket && test -f /etc/systemd/system/fieldwork-pr-prepare-runner@.service" \
+        && doctor_ok "PR prepare runner system units installed" \
+        || doctor_manual "PR prepare runner system units missing" "$prepare_runner_install_cmd" "the root-owned PR prepare socket and service have not been installed" "without them, fieldwork-pr-prepare cannot reach the controlled commit runner" "run the boundary installer" "yes"
+      prepare_runner_socket_path="/run/fieldwork/fieldwork-pr-prepare.sock"
+      ssh "$FIELDWORK_SSH_HOST" "systemctl is-active --quiet fieldwork-pr-prepare-runner.socket && test -S '$prepare_runner_socket_path'" \
         && doctor_ok "PR prepare runner socket active and listening at $prepare_runner_socket_path" \
-        || doctor_manual "PR prepare runner socket not active" "ssh -t $FIELDWORK_SSH_HOST 'systemctl --user daemon-reload && systemctl --user enable --now fieldwork-pr-prepare-runner.socket'" "fieldwork-pr-prepare-runner.socket is not enabled, not started, or not listening" "fieldwork-pr-prepare connects to this socket before broker submit; Codex also needs it allowed through its sandbox" "daemon-reload + enable --now; check journalctl --user -u fieldwork-pr-prepare-runner.socket if it still fails" "yes"
+        || doctor_manual "PR prepare runner socket not active" "ssh -t $FIELDWORK_SSH_HOST 'sudo systemctl daemon-reload && sudo systemctl enable --now fieldwork-pr-prepare-runner.socket'" "fieldwork-pr-prepare-runner.socket is not enabled, started, or listening" "fieldwork-pr-prepare connects here before broker upload" "daemon-reload + enable --now; check journalctl -u fieldwork-pr-prepare-runner.socket" "yes"
       remote_bwrap_installed() {
         ssh "$FIELDWORK_SSH_HOST" "command -v bwrap >/dev/null 2>&1"
       }
       remote_bwrap_probe_ok() {
         ssh "$FIELDWORK_SSH_HOST" "bwrap --unshare-user --unshare-net --unshare-pid --unshare-uts --unshare-ipc --ro-bind / / --tmpfs /tmp --dev /dev --proc /proc -- /bin/true >/dev/null 2>&1"
       }
+      remote_verify_runner_unit_bwrap_compatible() {
+        ssh "$FIELDWORK_SSH_HOST" \
+          "grep -Fxq 'RestrictAddressFamilies=AF_UNIX AF_NETLINK' /etc/systemd/system/fieldwork-verify-runner@.service \
+            && grep -Fxq 'CapabilityBoundingSet=' /etc/systemd/system/fieldwork-verify-runner@.service \
+            && ! grep -Fxq 'ProtectKernelTunables=true' /etc/systemd/system/fieldwork-verify-runner@.service"
+      }
       remote_systemd_run_user_probe_ok() {
         ssh "$FIELDWORK_SSH_HOST" "command -v systemd-run >/dev/null 2>&1 && systemd-run --user --scope --quiet -p PrivateNetwork=yes -p PrivateTmp=yes -- /bin/true >/dev/null 2>&1"
       }
 	      if remote_bwrap_installed; then
 	        if remote_bwrap_probe_ok; then
-	          doctor_ok "verify inner sandbox ready (bwrap with unprivileged user namespaces)"
+	          if remote_verify_runner_unit_bwrap_compatible; then
+	            doctor_ok "verify inner sandbox ready (bwrap with unprivileged user namespaces)"
+	          else
+	            doctor_manual \
+	              "verify runner unit is stale for bwrap namespace setup" \
+	              "$runner_install_cmd" \
+	              "the host bwrap probe passes, but the installed runner still blocks AF_NETLINK or bwrap's private /proc mount" \
+	              "fieldwork-verify runs inside the hardened system unit, so a host-only bwrap probe is insufficient" \
+	              "reinstall the root-owned boundary units, then rerun fieldwork doctor --remote and fieldwork-verify" \
+	              "yes"
+	          fi
 	        else
 	          systemd_run_note=""
 	          if remote_systemd_run_user_probe_ok; then
@@ -3119,10 +3144,15 @@ EOF
 	      fi
 
 	      doctor_section "PR broker"
-	      [ "$explain" = "1" ] && doctor_info "purpose" "verify the separate broker that owns the GitHub write token"
-      ssh "$FIELDWORK_SSH_HOST" "test -f /usr/local/sbin/rotate-pat" \
+      [ "$explain" = "1" ] && doctor_info "purpose" "verify the separate broker that owns the GitHub write token"
+      ssh "$FIELDWORK_SSH_HOST" \
+        "test -f /usr/local/sbin/rotate-pat \
+          && test -x /usr/local/sbin/fieldwork-policy-write \
+          && test -f /usr/local/sbin/fieldwork-pr-maintenance-submit \
+          && test -f /usr/local/sbin/fieldwork-pr-maintenance-mode \
+          && test -f /usr/local/sbin/fieldwork-migrate-instructions" \
         && doctor_ok "PR broker installer ran" \
-        || doctor_manual "PR broker install needed" "fieldwork setup" "the broker daemon and rotate-pat helper are not installed yet" "the broker is the only component with the GitHub write token, so onboarding cannot open PRs without it" "run fieldwork setup and complete Install PR services" "yes"
+        || doctor_manual "PR broker install needed" "fieldwork setup" "one or more broker control helpers are missing" "the broker is the only component with the GitHub write token, so onboarding cannot open PRs without its policy writer and credential helpers" "run fieldwork setup and complete Install PR services" "yes"
       if ssh "$FIELDWORK_SSH_HOST" "test -S /run/fieldwork-pr-broker/fieldwork-pr.sock && test -w /run/fieldwork-pr-broker/fieldwork-pr.sock"; then
         doctor_ok "PR broker socket present and writable"
         broker_preflight_contract_ok \
@@ -3141,7 +3171,7 @@ EOF
         ssh "$FIELDWORK_SSH_HOST" "test \"\$(id -un)\" = $(shell_quote "$FIELDWORK_REMOTE_USER")" \
           && doctor_ok "Codex SSH identity is $FIELDWORK_REMOTE_USER" \
           || doctor_needs "Codex SSH identity mismatch" "fix Host $FIELDWORK_SSH_HOST User in ~/.ssh/config" "SSH does not resolve to the configured Fieldwork Linux user" "verify-security and broker socket checks assume Codex runs as the Fieldwork user" "fix the SSH config User and rerun doctor" "yes"
-        ssh "$FIELDWORK_SSH_HOST" "export PATH=\"\$HOME/.local/bin:/usr/local/bin:\$PATH\"; command -v fieldwork-verify >/dev/null 2>&1 && command -v fieldwork-pr-prepare >/dev/null 2>&1 && command -v fieldwork-pr-submit >/dev/null 2>&1" \
+        ssh "$FIELDWORK_SSH_HOST" "test -x /usr/local/bin/fieldwork-verify && test -x /usr/local/bin/fieldwork-pr-prepare && test -x /usr/local/bin/fieldwork-pr-build && test -x /usr/local/bin/fieldwork-pr-upload" \
           && doctor_ok "delivery clients available on Codex SSH PATH" \
           || doctor_needs "delivery clients missing from Codex SSH PATH" "fieldwork sync-vps --force-install" "the SSH login shell cannot resolve one or more fieldwork delivery clients" "Codex must run verify, prepare, and submit from inside its task session" "re-sync Fieldwork and ensure ~/.local/bin is on the SSH login PATH" "yes"
         ssh "$FIELDWORK_SSH_HOST" 'test "$(loginctl show-user "$(id -un)" -p Linger --value 2>/dev/null)" = yes' \
@@ -3605,7 +3635,7 @@ start_repo() {
     info_row "service" "fieldwork-agent@$slug"
     info_row "session" "vps-$slug"
     if progress_run "starting remote Claude session" "remote Claude session is active" \
-      ssh "$FIELDWORK_SSH_HOST" "systemctl --user start 'fieldwork-agent@$slug' && systemctl --user is-active --quiet 'fieldwork-agent@$slug'"; then
+      ssh -t "$FIELDWORK_SSH_HOST" "sudo systemctl start 'fieldwork-agent@$slug' && systemctl is-active --quiet 'fieldwork-agent@$slug'"; then
       claude_started=1
     else
       echo
@@ -3708,15 +3738,12 @@ fi
 git pull --ff-only origin "$default_branch" || git pull --ff-only
 case ",$agents," in
   *,claude,*)
-    systemctl --user stop "fieldwork-agent@$slug" || true
     claude_project_key="$(printf '%s' "$repo_path" | sed 's#[^A-Za-z0-9]#-#g')"
     claude_bridge="$HOME/.claude/projects/$claude_project_key/bridge-pointer.json"
     if [ -f "$claude_bridge" ]; then
       stamp="$(date -u +%Y%m%dT%H%M%SZ)"
       mv "$claude_bridge" "$claude_bridge.fieldwork-refresh-$stamp"
     fi
-    systemctl --user start "fieldwork-agent@$slug"
-    systemctl --user is-active --quiet "fieldwork-agent@$slug"
     ;;
 esac
 REMOTE_EOF
@@ -3738,6 +3765,9 @@ REMOTE_EOF
   local refresh_done="VPS checkout refreshed"
   agents_include "$agents" claude && refresh_done="VPS checkout refreshed and Claude session restarted"
   if progress_run "refreshing VPS checkout" "$refresh_done" refresh_remote; then
+    if agents_include "$agents" claude; then
+      ssh -t "$FIELDWORK_SSH_HOST" "sudo systemctl restart 'fieldwork-agent@$slug' && systemctl is-active --quiet 'fieldwork-agent@$slug'" || return 1
+    fi
     echo
     label_line "Next action"
     if agents_include "$agents" codex; then
@@ -3755,163 +3785,13 @@ REMOTE_EOF
 }
 
 dashboard_fieldwork() {
-  local local_port="${FIELDWORK_DASHBOARD_LOCAL_PORT:-8765}"
-  local remote_port="${FIELDWORK_DASHBOARD_REMOTE_PORT:-8765}"
-  local open_browser=1
-
-  while [ $# -gt 0 ]; do
-    case "$1" in
-      --local-port)
-        [ -n "${2:-}" ] || { echo "--local-port requires a port" >&2; return 2; }
-        local_port="$2"
-        shift 2
-        ;;
-      --local-port=*)
-        local_port="${1#--local-port=}"
-        shift
-        ;;
-      --remote-port)
-        [ -n "${2:-}" ] || { echo "--remote-port requires a port" >&2; return 2; }
-        remote_port="$2"
-        shift 2
-        ;;
-      --remote-port=*)
-        remote_port="${1#--remote-port=}"
-        shift
-        ;;
-      --no-open)
-        open_browser=0
-        shift
-        ;;
-      --help|-h)
-        cat <<'EOF'
-usage: fieldwork dashboard [--local-port <port>] [--remote-port <port>] [--no-open]
-
-Start the read-only dashboard service on the VPS, open an SSH tunnel bound to
-127.0.0.1 on this machine, and open the local browser URL.
-
-The dashboard server itself binds only to 127.0.0.1 on the VPS. Keep this
-command running while you use the dashboard; Ctrl-C closes the SSH tunnel.
-EOF
-        return 0
-        ;;
-      --*) echo "unknown dashboard argument: $1" >&2; return 2 ;;
-      *) echo "fieldwork dashboard does not accept positional arguments" >&2; return 2 ;;
-    esac
-  done
-
-  valid_port "$local_port" || { echo "invalid --local-port: $local_port" >&2; return 2; }
-  valid_port "$remote_port" || { echo "invalid --remote-port: $remote_port" >&2; return 2; }
-
-  dashboard_start_remote() {
-    local remote_port_q
-    remote_port_q="$(shell_quote "$remote_port")"
-    ssh "$FIELDWORK_SSH_HOST" "remote_port=$remote_port_q bash -s" <<'REMOTE'
-set -eu
-case "$remote_port" in
-  ''|*[!0-9]*) exit 2 ;;
-esac
-if [ "$remote_port" -lt 1 ] || [ "$remote_port" -gt 65535 ]; then
-  exit 2
-fi
-test -x "$HOME/.fieldwork/scripts/fieldwork-dashboard-server"
-test -x "$HOME/.fieldwork/scripts/fieldwork-status-snapshot"
-test -f "$HOME/.fieldwork/infra/fieldwork-dashboard.service"
-mkdir -p "$HOME/.config/systemd/user/fieldwork-dashboard.service.d"
-cp "$HOME/.fieldwork/infra/fieldwork-dashboard.service" "$HOME/.config/systemd/user/fieldwork-dashboard.service"
-{
-  printf '[Service]\n'
-  printf 'Environment=FIELDWORK_DASHBOARD_HOST=127.0.0.1\n'
-  printf 'Environment=FIELDWORK_DASHBOARD_PORT=%s\n' "$remote_port"
-} > "$HOME/.config/systemd/user/fieldwork-dashboard.service.d/port.conf"
-systemctl --user daemon-reload
-systemctl --user restart fieldwork-dashboard.service
-systemctl --user is-active --quiet fieldwork-dashboard.service
-REMOTE
+  [ "$#" -eq 0 ] || {
+    case "${1:-}" in --help|-h) ;; *) echo "fieldwork dashboard is disabled in hard-boundary mode" >&2; return 2 ;; esac
   }
-
-  phase_section "Dashboard"
-  info_row "VPS" "$FIELDWORK_SSH_HOST"
-  info_row "remote bind" "127.0.0.1:$remote_port"
-  info_row "local URL" "http://127.0.0.1:$local_port/"
-
-  if ! progress_run "starting remote dashboard service" "remote dashboard service is active" dashboard_start_remote; then
-    echo
-    label_line "Fix"
-    echo "  fieldwork sync-vps --force-install"
-    echo "  fieldwork doctor --remote --explain"
-    return 1
-  fi
-
-  local url="http://127.0.0.1:$local_port/"
-  local tunnel_status=0
-  fieldwork_status_start "opening SSH tunnel"
-  set +e
-  ssh -N -o ExitOnForwardFailure=yes -L "127.0.0.1:${local_port}:127.0.0.1:${remote_port}" "$FIELDWORK_SSH_HOST" &
-  FIELDWORK_ACTIVE_PID=$!
-  sleep 1
-  if kill -0 "$FIELDWORK_ACTIVE_PID" 2>/dev/null; then
-    fieldwork_status_succeed "SSH tunnel open"
-  else
-    wait "$FIELDWORK_ACTIVE_PID"
-    tunnel_status=$?
-    FIELDWORK_ACTIVE_PID=""
-    fieldwork_status_fail ""
-    set -e
-    echo
-    label_line "Fix"
-    echo "  choose another local port: fieldwork dashboard --local-port 8766"
-    return "$tunnel_status"
-  fi
-  set -e
-
-  # The SSH -L local listener can take a moment to start accepting after the ssh
-  # process launches; opening the browser before then shows a connection-refused
-  # page that needs a manual reload. Wait until the local port answers first.
-  dashboard_local_ready() {
-    if command -v curl >/dev/null 2>&1; then
-      curl -fsS -o /dev/null --max-time 2 "http://127.0.0.1:${local_port}/healthz" 2>/dev/null
-      return
-    fi
-    (exec 3<>"/dev/tcp/127.0.0.1/${local_port}") 2>/dev/null && exec 3>&- 3<&-
-  }
-  fieldwork_status_start "waiting for dashboard to respond"
-  local dashboard_ready=0 dashboard_attempt=0
-  while [ "$dashboard_attempt" -lt 40 ]; do
-    if dashboard_local_ready; then dashboard_ready=1; break; fi
-    kill -0 "$FIELDWORK_ACTIVE_PID" 2>/dev/null || break
-    sleep 0.25
-    dashboard_attempt=$((dashboard_attempt + 1))
-  done
-  if [ "$dashboard_ready" = "1" ]; then
-    fieldwork_status_succeed "dashboard responding"
-  else
-    fieldwork_status_fail ""
-    info_note "dashboard did not answer yet; if the page shows an error, reload it"
-  fi
-
-  echo
-  label_line "Open"
-  echo "  $url"
-  if [ "$open_browser" = "1" ]; then
-    if fieldwork_open_url "$url"; then
-      status_ok_line "browser opened"
-    else
-      info_note "Could not open a browser automatically; paste the URL above."
-    fi
-  fi
-  echo
-  label_line "Tunnel"
-  echo "  keep this command running; press Ctrl-C to close the tunnel"
-
-  set +e
-  wait "$FIELDWORK_ACTIVE_PID"
-  tunnel_status=$?
-  FIELDWORK_ACTIVE_PID=""
-  set -e
-  return "$tunnel_status"
+  echo "fieldwork dashboard is disabled in hard-boundary mode" >&2
+  echo "use 'fieldwork status' or the typed notification channel instead" >&2
+  return 2
 }
-
 status_repo() {
   local slug=""
   local verbose=0
@@ -3971,7 +3851,7 @@ EOF
     echo
     if agents_include "$agents" claude; then
       info_row "listing" "fieldwork-agent@*.service"
-      ssh "$FIELDWORK_SSH_HOST" "systemctl --user list-units 'fieldwork-agent@*.service' --no-pager || true"
+      ssh "$FIELDWORK_SSH_HOST" "systemctl list-units 'fieldwork-agent@*.service' --no-pager || true"
     else
       echo "  Claude session services are not configured."
     fi
@@ -3997,11 +3877,11 @@ EOF
     info_row "repo" "$slug"
     info_row "service" "$unit"
     echo
-    label_line "systemctl --user status"
-    ssh "$FIELDWORK_SSH_HOST" "systemctl --user status '$unit' --no-pager || true"
+    label_line "systemctl status"
+    ssh "$FIELDWORK_SSH_HOST" "systemctl status '$unit' --no-pager || true"
     echo
     label_line "journalctl -n 20"
-    ssh "$FIELDWORK_SSH_HOST" "journalctl --user -u '$unit' -n 20 --no-pager || true"
+    ssh "$FIELDWORK_SSH_HOST" "journalctl -u '$unit' -n 20 --no-pager || true"
     return 0
   fi
 
@@ -4054,15 +3934,15 @@ check() {
 export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
 check CODEX_CLI sh -c 'command -v codex >/dev/null 2>&1 && codex --version >/dev/null 2>&1'
 check LOGIN_MARKER test -f "$HOME/.fieldwork/state/codex-login-confirmed"
-check DELIVERY_CLIENTS sh -c 'command -v fieldwork-verify >/dev/null 2>&1 && command -v fieldwork-pr-prepare >/dev/null 2>&1 && command -v fieldwork-pr-submit >/dev/null 2>&1'
+check DELIVERY_CLIENTS sh -c 'test -x /usr/local/bin/fieldwork-verify && test -x /usr/local/bin/fieldwork-pr-prepare && test -x /usr/local/bin/fieldwork-pr-build && test -x /usr/local/bin/fieldwork-pr-upload'
 check SANDBOX_HELPER command -v fieldwork-codex-sandbox
 check XDG_RUNTIME test -d "$runtime"
-check RUNNER_SOCKETS sh -c "test -S '$runtime/fieldwork-verify.sock' && test -S '$runtime/fieldwork-pr-prepare.sock'"
+check RUNNER_SOCKETS sh -c "test -S /run/fieldwork/fieldwork-verify.sock && test -S /run/fieldwork/fieldwork-pr-prepare.sock"
 check BROKER_SOCKET sh -c 'test -S /run/fieldwork-pr-broker/fieldwork-pr.sock && test -w /run/fieldwork-pr-broker/fieldwork-pr.sock'
 check EXPECTED_ORIGIN test -f "$repo_path/.fieldwork/expected-origin"
-check ALLOWLIST sh -c "grep -Fq 'default_permissions = \"fieldwork\"' '$cfg' && grep -Fq '[permissions.fieldwork.network]' '$cfg' && grep -Fq 'enabled = true' '$cfg' && grep -Fq 'mode = \"limited\"' '$cfg' && grep -Fq '[permissions.fieldwork.network.unix_sockets]' '$cfg' && grep -Fq '\"/run/fieldwork-pr-broker/fieldwork-pr.sock\" = \"allow\"' '$cfg' && grep -Fq '\"$runtime/fieldwork-verify.sock\" = \"allow\"' '$cfg' && grep -Fq '\"$runtime/fieldwork-pr-prepare.sock\" = \"allow\"' '$cfg'"
+check ALLOWLIST sh -c "grep -Fq 'default_permissions = \"fieldwork\"' '$cfg' && grep -Fq '[permissions.fieldwork.network]' '$cfg' && grep -Fq 'enabled = true' '$cfg' && grep -Fq 'mode = \"limited\"' '$cfg' && grep -Fq '[permissions.fieldwork.network.unix_sockets]' '$cfg' && grep -Fq '\"/run/fieldwork-pr-broker/fieldwork-pr.sock\" = \"allow\"' '$cfg' && grep -Fq '\"/run/fieldwork/fieldwork-verify.sock\" = \"allow\"' '$cfg' && grep -Fq '\"/run/fieldwork/fieldwork-pr-prepare.sock\" = \"allow\"' '$cfg'"
 if command -v fieldwork-codex-sandbox >/dev/null 2>&1; then
-  if fieldwork-codex-sandbox run -- python3 - /run/fieldwork-pr-broker/fieldwork-pr.sock "$runtime/fieldwork-verify.sock" "$runtime/fieldwork-pr-prepare.sock" <<'PY' >/dev/null 2>&1
+  if fieldwork-codex-sandbox run -- python3 - /run/fieldwork-pr-broker/fieldwork-pr.sock /run/fieldwork/fieldwork-verify.sock /run/fieldwork/fieldwork-pr-prepare.sock <<'PY' >/dev/null 2>&1
 import socket
 import sys
 
@@ -4169,7 +4049,7 @@ REMOTE_CODEX_STATUS
   IFS= read -r -d '' remote_script <<'REMOTE_EOF' || true
 slug="$1"
 unit="fieldwork-agent@${slug}.service"
-get() { systemctl --user show "$unit" -p "$1" --value 2>/dev/null; }
+get() { systemctl show "$unit" -p "$1" --value 2>/dev/null; }
 load_state=$(get LoadState)
 active_state=$(get ActiveState)
 sub_state=$(get SubState)
@@ -4177,7 +4057,7 @@ exec_start=$(get ExecStart)
 main_pid=$(get MainPID)
 mem_bytes=$(get MemoryCurrent)
 enter_mono=$(get ActiveEnterTimestampMonotonic)
-adapter="$HOME/.fieldwork/infra/agents/claude-remote-control"
+adapter="/usr/local/lib/fieldwork/agents/claude-remote-control"
 
 cmdline=""
 if [ -n "$main_pid" ] && [ "$main_pid" != "0" ] && [ -r "/proc/$main_pid/cmdline" ]; then
@@ -4216,7 +4096,7 @@ case "$cmdline $exec_start" in *"--spawn=worktree"*|*"--spawn worktree"*) worktr
 url=""
 capacity=""
 if [ "$active_state" = "active" ]; then
-  log=$(journalctl --user -u "$unit" -n 200 --no-pager 2>/dev/null || true)
+  log=$(journalctl -u "$unit" -n 200 --no-pager 2>/dev/null || true)
   url=$(printf '%s\n' "$log" | grep -Eo 'https://claude\.ai/code[^[:space:]]+' | tail -1)
   capacity=$(printf '%s\n' "$log" | grep -Eo 'Capacity:[[:space:]]*[0-9]+/[0-9]+' | tail -1 | awk '{print $NF}')
 fi
@@ -4777,7 +4657,7 @@ EOF
     fi
     remote_check "remote projects dir exists" "test -d $projects_dir_q" || true
     remote_check "remote notification config present" "test -s ~/.fieldwork/notify.env" || true
-    remote_check "remote Claude session systemd unit installed" "test -f ~/.config/systemd/user/fieldwork-agent@.service" || true
+    remote_check "remote Claude session systemd unit installed" "test -f /etc/systemd/system/fieldwork-agent@.service" || true
     remote_check "broker socket writable" "test -S /run/fieldwork-pr-broker/fieldwork-pr.sock && test -w /run/fieldwork-pr-broker/fieldwork-pr.sock" || true
   else
     report_row "skipped" "remote checks skipped because SSH is blocked"
@@ -4928,18 +4808,18 @@ git add "\$smoke_file"
 git -c user.email=fieldwork@vps -c user.name="Fieldwork VPS" commit -m "chore(fieldwork): smoke test broker path"
 
 request_id="\$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen)"
-cat > .fieldwork/local/pr-request.json <<JSON
+cat > .fieldwork/local/pr-build-request.json <<JSON
 {
-  "request_id": "\$request_id",
-  "created_at": "\$created_at",
-  "repo_path": "$repo_path",
+  "schema_version": 2,
   "branch": "$branch",
+  "slug": "$slug",
   "title": "chore(fieldwork): smoke test broker path",
   "body": "Summary:\\n- Verify Fieldwork broker can push a fieldwork/... branch and open a PR without Claude.\\n\\nTests:\\n- fieldwork smoke"
 }
 JSON
 
-~/.local/bin/fieldwork-pr-submit .fieldwork/local/pr-request.json
+request_id="\$(/usr/local/bin/fieldwork-pr-build .fieldwork/local/pr-build-request.json)"
+/usr/local/bin/fieldwork-pr-upload "\$request_id"
 EOF
 
   if ! progress_run "uploading smoke script to VPS" "smoke script uploaded" \

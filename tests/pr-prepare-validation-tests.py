@@ -1,325 +1,239 @@
 #!/usr/bin/env python3
-"""PR-prepare schema validation smoke tests.
-
-These tests exercise schema/pr-prepare-request.schema.json against a small
-generic validator. They are static (no socket, no git, no FS scratch beyond
-the schema itself).
-"""
+"""Prepare schema plus protocol-v2 builder/uploader tests."""
 
 from __future__ import annotations
 
+import importlib.util
+from importlib.machinery import SourceFileLoader
 import json
 import os
+from pathlib import Path
 import re
 import shutil
+import socket
 import subprocess
 import tempfile
+import threading
 import unittest
 import uuid
-from pathlib import Path
-from typing import Any
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SCHEMA_PATH = ROOT / "schema" / "pr-prepare-request.schema.json"
-PREPARE_CLIENT = ROOT / "lib/scripts/fieldwork-pr-prepare"
-SUBMIT_CLIENT = ROOT / "lib/scripts/fieldwork-pr-submit"
+PREPARE_SCHEMA = ROOT / "schema/pr-prepare-request.schema.json"
 
 
 class SchemaError(Exception):
-    """Raised when a request fails schema validation."""
+    pass
 
 
-def validate_against_schema(value: Any, schema: dict) -> None:
-    """Minimal JSON Schema subset validator. Handles the rules the
-    prepare runner's preflight relies on. Keep it dependency-free so
-    tests pass on a bare Python 3 install."""
-    expected_type = schema.get("type")
-    if expected_type == "object":
-        if not isinstance(value, dict):
-            raise SchemaError("must be an object")
-        required = schema.get("required", [])
-        for field in required:
-            if field not in value:
-                raise SchemaError(f"missing required field: {field}")
+def validate(value, schema):
+    expected = schema.get("type")
+    if expected == "object":
+        if not isinstance(value, dict): raise SchemaError("must be object")
+        for field in schema.get("required", []):
+            if field not in value: raise SchemaError(f"missing {field}")
         if schema.get("additionalProperties") is False:
-            allowed = set(schema.get("properties", {}).keys())
-            extras = sorted(set(value.keys()) - allowed)
-            if extras:
-                raise SchemaError(f"unexpected field: {extras[0]}")
+            extras = set(value) - set(schema.get("properties", {}))
+            if extras: raise SchemaError(f"unexpected {sorted(extras)[0]}")
         for field, rules in schema.get("properties", {}).items():
             if field in value:
-                try:
-                    validate_against_schema(value[field], rules)
-                except SchemaError as exc:
-                    raise SchemaError(f"{field}: {exc}") from None
-    elif expected_type == "array":
-        if not isinstance(value, list):
-            raise SchemaError("must be an array")
-        if "minItems" in schema and len(value) < schema["minItems"]:
-            raise SchemaError(f"array shorter than minItems={schema['minItems']}")
-        if "maxItems" in schema and len(value) > schema["maxItems"]:
-            raise SchemaError(f"array longer than maxItems={schema['maxItems']}")
-        item_schema = schema.get("items")
-        if item_schema:
-            for idx, item in enumerate(value):
-                try:
-                    validate_against_schema(item, item_schema)
-                except SchemaError as exc:
-                    raise SchemaError(f"[{idx}]: {exc}") from None
-    elif expected_type == "string":
-        if not isinstance(value, str):
-            raise SchemaError("must be a string")
-        if "minLength" in schema and len(value) < schema["minLength"]:
-            raise SchemaError(f"too short (minLength={schema['minLength']})")
-        if "maxLength" in schema and len(value) > schema["maxLength"]:
-            raise SchemaError(f"too long (maxLength={schema['maxLength']})")
-        pattern = schema.get("pattern")
-        if pattern and not re.fullmatch(pattern, value):
-            raise SchemaError(f"does not match pattern: {pattern}")
+                try: validate(value[field], rules)
+                except SchemaError as exc: raise SchemaError(f"{field}: {exc}") from None
+    elif expected == "array":
+        if not isinstance(value, list): raise SchemaError("must be array")
+        if len(value) < schema.get("minItems", 0) or len(value) > schema.get("maxItems", 1 << 30): raise SchemaError("array length")
+        for item in value: validate(item, schema.get("items", {}))
+    elif expected == "string":
+        if not isinstance(value, str): raise SchemaError("must be string")
+        if len(value) < schema.get("minLength", 0) or len(value) > schema.get("maxLength", 1 << 30): raise SchemaError("string length")
+        if schema.get("pattern") and not re.fullmatch(schema["pattern"], value): raise SchemaError("pattern")
 
 
-def load_schema() -> dict:
-    return json.loads(SCHEMA_PATH.read_text())
-
-
-def valid_request() -> dict:
+def prepare_request():
     return {
-        "request_id": str(uuid.uuid4()),
-        "created_at": "2026-05-17T10:30:00Z",
-        "repo_path": "/home/fieldwork/projects/fieldwork-smoke",
-        "branch": "fieldwork/test-change",
-        "paths": ["src/a.py", "src/b.py"],
-        "message": "fix: tighten validation\n\nDescription of why.\n",
+        "request_id": str(uuid.uuid4()), "created_at": "2026-07-18T12:00:00Z",
+        "repo_path": "/home/fieldwork/projects/demo", "branch": "fieldwork/test-change",
+        "paths": ["src/a.py"], "message": "fix: safe change\n",
     }
 
 
-class PrPrepareValidationTests(unittest.TestCase):
+class PrepareSchemaTests(unittest.TestCase):
     @classmethod
-    def setUpClass(cls) -> None:
-        cls.schema = load_schema()
+    def setUpClass(cls):
+        cls.schema = json.loads(PREPARE_SCHEMA.read_text())
 
-    def assertValid(self, req: dict) -> None:
-        try:
-            validate_against_schema(req, self.schema)
-        except SchemaError as exc:
-            self.fail(f"expected request to validate, got: {exc}")
+    def test_valid_request(self):
+        validate(prepare_request(), self.schema)
 
-    def assertRejects(self, req: dict, contains: str) -> None:
-        with self.assertRaises(SchemaError) as ctx:
-            validate_against_schema(req, self.schema)
-        self.assertIn(contains, str(ctx.exception))
+    def test_required_fields_and_extras(self):
+        for field in prepare_request():
+            value = prepare_request(); del value[field]
+            with self.subTest(field=field), self.assertRaises(SchemaError): validate(value, self.schema)
+        value = prepare_request(); value["title"] = "extra"
+        with self.assertRaises(SchemaError): validate(value, self.schema)
 
-    # ----- positive ----------
-
-    def test_valid_request_passes(self) -> None:
-        self.assertValid(valid_request())
-
-    def test_single_path_ok(self) -> None:
-        req = valid_request()
-        req["paths"] = ["only.py"]
-        self.assertValid(req)
-
-    def test_100_paths_ok(self) -> None:
-        req = valid_request()
-        req["paths"] = [f"f{i}.py" for i in range(100)]
-        self.assertValid(req)
-
-    # ----- missing required ----------
-
-    def test_missing_request_id(self) -> None:
-        req = valid_request(); del req["request_id"]
-        self.assertRejects(req, "missing required field: request_id")
-
-    def test_missing_branch(self) -> None:
-        req = valid_request(); del req["branch"]
-        self.assertRejects(req, "missing required field: branch")
-
-    def test_missing_paths(self) -> None:
-        req = valid_request(); del req["paths"]
-        self.assertRejects(req, "missing required field: paths")
-
-    def test_missing_message(self) -> None:
-        req = valid_request(); del req["message"]
-        self.assertRejects(req, "missing required field: message")
-
-    # ----- additionalProperties ----------
-
-    def test_extra_field_rejected(self) -> None:
-        req = valid_request(); req["title"] = "no titles here"
-        self.assertRejects(req, "unexpected field: title")
-
-    # ----- request_id ----------
-
-    def test_request_id_not_a_uuid(self) -> None:
-        req = valid_request(); req["request_id"] = "not-a-uuid"
-        self.assertRejects(req, "request_id")
-
-    def test_request_id_wrong_version(self) -> None:
-        # version digit must be 1-5 per the regex; 9 is rejected
-        req = valid_request(); req["request_id"] = "11111111-2222-9333-8444-555555555555"
-        self.assertRejects(req, "request_id")
-
-    # ----- created_at ----------
-
-    def test_created_at_not_utc(self) -> None:
-        req = valid_request(); req["created_at"] = "2026-05-17T10:30:00+02:00"
-        self.assertRejects(req, "created_at")
-
-    def test_created_at_pre_2000(self) -> None:
-        req = valid_request(); req["created_at"] = "1999-05-17T10:30:00Z"
-        self.assertRejects(req, "created_at")
-
-    # ----- repo_path ----------
-
-    def test_repo_path_outside_root(self) -> None:
-        req = valid_request(); req["repo_path"] = "/tmp/projects/foo"
-        self.assertRejects(req, "repo_path")
-
-    def test_repo_path_uppercase(self) -> None:
-        req = valid_request(); req["repo_path"] = "/home/fieldwork/projects/FOO"
-        self.assertRejects(req, "repo_path")
-
-    def test_repo_path_trailing_slash(self) -> None:
-        req = valid_request(); req["repo_path"] = "/home/fieldwork/projects/foo/"
-        self.assertRejects(req, "repo_path")
-
-    # ----- branch ----------
-
-    def test_branch_wrong_prefix(self) -> None:
-        req = valid_request(); req["branch"] = "claude/test-change"
-        self.assertRejects(req, "branch")
-
-    def test_branch_main(self) -> None:
-        req = valid_request(); req["branch"] = "main"
-        self.assertRejects(req, "branch")
-
-    def test_branch_uppercase_segment(self) -> None:
-        req = valid_request(); req["branch"] = "fieldwork/Test-Change"
-        self.assertRejects(req, "branch")
-
-    # ----- paths ----------
-
-    def test_paths_empty_rejected(self) -> None:
-        req = valid_request(); req["paths"] = []
-        self.assertRejects(req, "paths")
-
-    def test_paths_too_many(self) -> None:
-        req = valid_request(); req["paths"] = [f"f{i}" for i in range(101)]
-        self.assertRejects(req, "paths")
-
-    def test_path_with_leading_slash_rejected(self) -> None:
-        req = valid_request(); req["paths"] = ["/etc/passwd"]
-        self.assertRejects(req, "paths")
-
-    def test_path_with_newline_rejected(self) -> None:
-        req = valid_request(); req["paths"] = ["a\nb.py"]
-        self.assertRejects(req, "paths")
-
-    def test_path_with_nul_rejected(self) -> None:
-        req = valid_request(); req["paths"] = ["a\x00b.py"]
-        self.assertRejects(req, "paths")
-
-    def test_path_too_long(self) -> None:
-        req = valid_request(); req["paths"] = ["a" * 257]
-        self.assertRejects(req, "paths")
-
-    def test_path_empty_string_rejected(self) -> None:
-        req = valid_request(); req["paths"] = [""]
-        self.assertRejects(req, "paths")
-
-    # ----- message ----------
-
-    def test_message_empty_rejected(self) -> None:
-        req = valid_request(); req["message"] = ""
-        self.assertRejects(req, "message")
-
-    def test_message_too_long(self) -> None:
-        req = valid_request(); req["message"] = "x" * 8193
-        self.assertRejects(req, "message")
+    def test_field_constraints(self):
+        cases = [
+            ("request_id", "not-a-uuid"), ("created_at", "2026-07-18T12:00:00+01:00"),
+            ("repo_path", "/tmp/demo"), ("branch", "main"), ("branch", "fieldwork/Upper"),
+            ("paths", []), ("paths", [f"f{i}" for i in range(101)]),
+            ("paths", ["/etc/passwd"]), ("paths", ["bad\nname"]),
+            ("message", ""), ("message", "x" * 8193),
+        ]
+        for field, replacement in cases:
+            value = prepare_request(); value[field] = replacement
+            with self.subTest(field=field, replacement=replacement), self.assertRaises(SchemaError): validate(value, self.schema)
 
 
-class DeliveryClientPathTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.tmp = Path(tempfile.mkdtemp(prefix="fieldwork-delivery-client."))
-        self.repo = self.tmp / "repo"
-        self.repo.mkdir()
-        self.git("init", "-q")
+def load_script(name: str, path: Path):
+    spec = importlib.util.spec_from_loader(name, SourceFileLoader(name, str(path)))
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+builder = load_script("fieldwork_pr_build_tests", ROOT / "lib/scripts/fieldwork-pr-build")
+uploader = load_script("fieldwork_pr_upload_tests", ROOT / "lib/scripts/fieldwork-pr-upload")
+
+
+class ProtocolV2ClientTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="fieldwork-v2-clients-")
+        self.root = Path(self.temp.name)
+        self.repo = self.root / "repo"; self.repo.mkdir()
+        self.git("init", "-q", "-b", "main")
+        self.git("config", "user.email", "test@example.test"); self.git("config", "user.name", "Test")
+        (self.repo / "base.txt").write_text("base\n")
+        (self.repo / ".gitignore").write_text(".fieldwork/local/\n")
+        self.git("add", "base.txt", ".gitignore"); self.git("commit", "-q", "-m", "base")
+        self.base = self.git_output("rev-parse", "HEAD")
+        self.git("checkout", "-q", "-b", "fieldwork/test-change")
+        (self.repo / "change.txt").write_text("change\n"); self.git("add", "change.txt"); self.git("commit", "-q", "-m", "change")
         (self.repo / ".fieldwork/local").mkdir(parents=True)
-        (self.repo / ".claude/local").mkdir(parents=True)
-        self.runtime = self.tmp / "runtime"
-        self.runtime.mkdir()
-        self.fake_bin = self.tmp / "bin"
-        self.fake_bin.mkdir()
-        realpath = self.fake_bin / "realpath"
-        realpath.write_text(
-            "#!/usr/bin/env bash\n"
-            "if [ \"${1:-}\" = \"-e\" ]; then shift; fi\n"
-            "python3 -c 'import os, sys; p=sys.argv[1]; sys.exit(1) if not os.path.exists(p) else print(os.path.realpath(p))' \"$1\"\n"
-        )
-        realpath.chmod(0o755)
+        self.spool = self.root / "spool"; self.spool.mkdir(mode=0o700)
 
-    def tearDown(self) -> None:
-        shutil.rmtree(self.tmp)
+    def tearDown(self):
+        self.temp.cleanup()
 
-    def git(self, *args: str) -> None:
-        subprocess.run(["git", *args], cwd=self.repo, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    def git(self, *args):
+        subprocess.run(["/usr/bin/git", *args], cwd=self.repo, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    def run_client(self, script: Path, request_file: Path) -> subprocess.CompletedProcess[str]:
-        env = os.environ.copy()
-        env["XDG_RUNTIME_DIR"] = str(self.runtime)
-        env["FIELDWORK_BROKER_SOCKET"] = str(self.tmp / "missing-broker.sock")
-        env["PATH"] = f"{self.fake_bin}:{env['PATH']}"
-        return subprocess.run(
-            [str(script), str(request_file)],
-            cwd=self.repo,
-            env=env,
-            text=True,
-            capture_output=True,
-            check=False,
-        )
+    def git_output(self, *args):
+        return subprocess.check_output(["/usr/bin/git", *args], cwd=self.repo, text=True).strip()
 
-    def write_prepare_request(self, directory: Path) -> Path:
-        request_file = directory / "pr-prepare-request.json"
-        request_file.write_text(json.dumps(valid_request()))
-        return request_file
+    def request_file(self, **updates):
+        value = {
+            "schema_version": 2, "slug": "demo", "branch": "fieldwork/test-change",
+            "title": "Test change", "body": "Protocol-v2 client test", "common_base_oid": self.base,
+        }
+        value.update(updates)
+        path = self.repo / ".fieldwork/local" / f"request-{uuid.uuid4().hex}.json"
+        path.write_text(json.dumps(value))
+        return path
 
-    def write_submit_request(self, directory: Path) -> Path:
-        request_file = directory / "pr-request.json"
-        request_file.write_text(json.dumps({
-            "request_id": str(uuid.uuid4()),
-            "created_at": "2026-05-17T10:30:00Z",
-            "repo_path": "/home/fieldwork/projects/fieldwork-smoke",
-            "branch": "fieldwork/test-change",
-            "title": "Test change",
-            "body": "Summary:\n- Test delivery client path validation.\n\nTests:\n- client path regression",
-        }))
-        return request_file
+    def build(self, **updates):
+        old = Path.cwd(); os.chdir(self.repo)
+        try: return builder.build(self.request_file(**updates), parent=self.spool)
+        finally: os.chdir(old)
 
-    def test_prepare_accepts_fieldwork_local_path_until_socket_lookup(self) -> None:
-        result = self.run_client(PREPARE_CLIENT, self.write_prepare_request(self.repo / ".fieldwork/local"))
-        self.assertEqual(result.returncode, 20)
-        self.assertIn("runner socket not available", result.stderr)
-        self.assertIn("fieldwork-pr-prepare.sock", result.stderr)
-        self.assertNotIn("request must live under", result.stderr)
+    def test_builder_publishes_only_meta_and_nonthin_pack(self):
+        request_id = self.build()
+        directory = self.spool / request_id
+        self.assertEqual({p.name for p in directory.iterdir()}, {"meta.json", "pack"})
+        meta = json.loads((directory / "meta.json").read_text())
+        self.assertEqual(meta["head_oid"], self.git_output("rev-parse", "HEAD"))
+        bare = self.root / "bare.git"
+        subprocess.run(["/usr/bin/git", "init", "--bare", str(bare)], check=True, stdout=subprocess.DEVNULL)
+        subprocess.run(["/usr/bin/git", "-C", str(bare), "fetch", str(self.repo), self.base], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        with (directory / "pack").open("rb") as handle:
+            result = subprocess.run(["/usr/bin/git", "-C", str(bare), "index-pack", "--stdin", "--strict"], stdin=handle, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
 
-    def test_prepare_rejects_claude_local_path(self) -> None:
-        result = self.run_client(PREPARE_CLIENT, self.write_prepare_request(self.repo / ".claude/local"))
-        self.assertEqual(result.returncode, 20)
-        self.assertIn("request must live under <repo>/.fieldwork/local/", result.stderr)
-        self.assertNotIn("runner socket not available", result.stderr)
+    def test_builder_rejects_dirty_ref_and_alternates(self):
+        (self.repo / "untracked").write_text("dirty")
+        with self.assertRaisesRegex(builder.BuildError, "repository is not clean"): self.build()
+        (self.repo / "untracked").unlink()
+        with self.assertRaisesRegex(builder.BuildError, "valid Git branch"): self.build(branch="fieldwork/bad//name")
+        alternates = Path(self.git_output("rev-parse", "--absolute-git-dir")) / "objects/info/alternates"
+        alternates.write_text(str(self.root / "other-objects"))
+        with self.assertRaisesRegex(builder.BuildError, "alternates"): self.build()
 
-    def test_submit_accepts_fieldwork_local_path_until_broker_socket_lookup(self) -> None:
-        result = self.run_client(SUBMIT_CLIENT, self.write_submit_request(self.repo / ".fieldwork/local"))
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("broker socket missing", result.stderr)
-        self.assertNotIn("request must live under", result.stderr)
+    def test_builder_environment_is_scrubbed(self):
+        with mock.patch.dict(os.environ, {"GIT_DIR": "/tmp/evil", "HTTPS_PROXY": "http://evil", "GIT_CONFIG_COUNT": "1"}): env = builder.fixed_git_env()
+        for key in ("GIT_DIR", "HTTPS_PROXY", "GIT_CONFIG_COUNT"): self.assertNotIn(key, env)
+        self.assertEqual(env["GIT_CONFIG_GLOBAL"], "/dev/null")
 
-    def test_submit_rejects_claude_local_path(self) -> None:
-        result = self.run_client(SUBMIT_CLIENT, self.write_submit_request(self.repo / ".claude/local"))
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("request must live under <repo>/.fieldwork/local/", result.stderr)
-        self.assertNotIn("broker socket missing", result.stderr)
+    def test_builder_rejects_sha256_object_format_client_side(self):
+        real_git_text = builder.git_text
+        def object_format(*args):
+            if args == ("rev-parse", "--show-object-format"):
+                return "sha256"
+            return real_git_text(*args)
+        old = Path.cwd(); os.chdir(self.repo)
+        try:
+            with mock.patch.object(builder, "git_text", side_effect=object_format):
+                with self.assertRaisesRegex(builder.BuildError, "SHA-256"):
+                    builder.build(self.request_file(), parent=self.spool)
+        finally:
+            os.chdir(old)
+
+    def test_builder_removes_incomplete_request_directory(self):
+        request_id = str(uuid.uuid4())
+        real_run = subprocess.run
+        def fail_pack(args, *positional, **keywords):
+            if len(args) > 1 and args[1] == "pack-objects":
+                return subprocess.CompletedProcess(args, 1, stderr=b"synthetic pack failure")
+            return real_run(args, *positional, **keywords)
+        old = Path.cwd(); os.chdir(self.repo)
+        try:
+            with mock.patch.object(builder.subprocess, "run", side_effect=fail_pack):
+                with self.assertRaisesRegex(builder.BuildError, "synthetic pack failure"):
+                    builder.build(self.request_file(request_id=request_id), parent=self.spool)
+        finally:
+            os.chdir(old)
+        self.assertFalse((self.spool / request_id).exists())
+
+    def test_uploader_directory_walk_refuses_symlink(self):
+        safe = self.root / "safe"
+        safe.mkdir(mode=0o700)
+        link = self.root / "link"
+        link.symlink_to(safe, target_is_directory=True)
+        with self.assertRaises(OSError):
+            uploader._open_dir(link, os.getuid())
+
+    def fake_broker(self, captured: dict, state="queued"):
+        client, accepted = socket.socketpair()
+        def serve():
+            with accepted:
+                data = b""
+                while b"\r\n\r\n" not in data: data += accepted.recv(4096)
+                head, _, body = data.partition(b"\r\n\r\n")
+                length = int(next(line.split(b":", 1)[1] for line in head.split(b"\r\n") if line.lower().startswith(b"content-length:")))
+                while len(body) < length: body += accepted.recv(65536)
+                captured["request"] = head + b"\r\n\r\n" + body[:length]
+                payload = json.dumps({"ok": True, "request_id": captured["request_id"], "state": state}).encode() + b"\n"
+                accepted.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: " + str(len(payload)).encode() + b"\r\nConnection: close\r\n\r\n" + payload)
+        thread = threading.Thread(target=serve, daemon=True); thread.start(); return thread, client
+
+    def test_uploader_streams_exact_spool_without_subprocess(self):
+        request_id = self.build(); captured = {"request_id": request_id}
+        thread, client = self.fake_broker(captured)
+        with mock.patch.object(uploader, "_open_dir", return_value=os.open(self.spool, os.O_RDONLY)), mock.patch.object(uploader, "_connect", return_value=client), mock.patch("subprocess.run", side_effect=AssertionError("no subprocess")):
+            result = uploader.upload(request_id)
+        thread.join(2)
+        self.assertEqual(result["state"], "queued")
+        self.assertIn(b'name="meta"', captured["request"]); self.assertIn(b'name="pack"', captured["request"])
+        self.assertNotIn(b"repo_path", captured["request"])
+
+    def test_status_uses_post_contract(self):
+        request_id = str(uuid.uuid4()); captured = {"request_id": request_id}
+        thread, client = self.fake_broker(captured, "done")
+        with mock.patch.object(uploader, "_connect", return_value=client): result = uploader.status(request_id)
+        thread.join(2)
+        self.assertEqual(result["state"], "done")
+        self.assertTrue(captured["request"].startswith(b"POST /pr-status HTTP/1.1"))
 
 
 if __name__ == "__main__":

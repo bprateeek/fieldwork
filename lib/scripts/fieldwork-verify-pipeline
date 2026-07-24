@@ -7,7 +7,7 @@
 # script an execution context where bwrap can create user namespaces — the
 # agent process sets PR_SET_NO_NEW_PRIVS and lives in its own userns, which
 # blocks the AppArmor profile transition bwrap needs. The runner runs under
-# the user manager (systemd --user), outside that confinement.
+# the root-owned system manager, outside that confinement.
 #
 # Each inner step is re-confined inside its own network-off bwrap sandbox
 # (fail-closed if bwrap cannot create the required namespaces), so a malicious
@@ -101,14 +101,20 @@ cd "$repo_path"
 # sync so doctor's verdict matches what the wrapper does at runtime.
 
 BWRAP_INSTALLED=0
+BWRAP_PROBE_DETAIL=""
 
 probe_bwrap() {
+  local detail
   command -v bwrap >/dev/null 2>&1 || return 1
   BWRAP_INSTALLED=1
   # Cheapest test that actually creates the namespaces bwrap will need.
-  bwrap --unshare-user --unshare-net --unshare-pid --unshare-uts --unshare-ipc \
+  if detail="$(bwrap --unshare-user --unshare-net --unshare-pid --unshare-uts --unshare-ipc \
         --ro-bind / / --tmpfs /tmp --dev /dev --proc /proc \
-        -- /bin/true >/dev/null 2>&1
+        -- /bin/true 2>&1)"; then
+    return 0
+  fi
+  BWRAP_PROBE_DETAIL="$(printf '%s' "$detail" | tr '\r\n' ' ')"
+  return 1
 }
 
 if probe_bwrap; then
@@ -132,8 +138,18 @@ else
       echo "  bwrap installed: yes — but probe failed."
       echo "  kernel.unprivileged_userns_clone = $userns_clone"
       echo "  kernel.apparmor_restrict_unprivileged_userns = $userns_apparmor"
+      [ -z "$BWRAP_PROBE_DETAIL" ] || echo "  bwrap detail: $BWRAP_PROBE_DETAIL"
       echo
-      if [ "$userns_clone" != "1" ]; then
+      if [[ "$BWRAP_PROBE_DETAIL" == *"NETLINK_ROUTE"* ]]; then
+        echo "  The installed verify-runner unit blocks AF_NETLINK, which bwrap"
+        echo "  needs only to configure loopback in its isolated network namespace."
+        echo "  Reinstall the current root-owned boundary units:"
+        echo "    sudo env FIELDWORK_REMOTE_USER=\$(id -un) bash ~/fieldwork/lib/systemd/install-boundary.sh"
+      elif [[ "$BWRAP_PROBE_DETAIL" == *"mount proc"* ]]; then
+        echo "  The installed verify-runner unit blocks bwrap's private /proc mount."
+        echo "  Reinstall the current root-owned boundary units:"
+        echo "    sudo env FIELDWORK_REMOTE_USER=\$(id -un) bash ~/fieldwork/lib/systemd/install-boundary.sh"
+      elif [ "$userns_clone" != "1" ]; then
         echo "  unprivileged user namespaces are disabled at the kernel level."
         echo "  If this is deliberate hardening, fieldwork-verify cannot run on this host."
         echo "  Fieldwork will not apply or suggest a global userns sysctl relaxation."

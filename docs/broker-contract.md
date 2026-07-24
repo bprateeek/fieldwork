@@ -1,223 +1,158 @@
-# Broker Contract
+# Broker protocol v2
 
-The PR broker is Fieldwork's forge write boundary.
+Protocol v2 is checkout-blind. The broker receives metadata and a Git pack; it
+does not accept a repository path and has no projects-root option.
 
-Claude or Codex can edit and commit in the repo workspace, but the agent does
-not receive the GitHub or GitLab write token. To open a pull request or merge
-request, the agent writes a structured request under the repo and sends it
-through a tokenless Unix-socket client. The broker validates the request, pushes
-a branch with its own forge credential, and opens the PR/MR.
-
-## Request Location
-
-The thin client accepts a request file under:
-
-```text
-<repo>/.fieldwork/local/*.json
-```
-
-The default path is:
-
-```text
-<repo>/.fieldwork/local/pr-request.json
-```
-
-`fieldwork-pr-submit` rejects request files that are missing, symlinks, outside `.fieldwork/local/`, larger than 128 KiB, or missing the required top-level fields.
-
-## JSON Shape
-
-The documented schema lives at [../schema/pr-request.schema.json](../schema/pr-request.schema.json).
-
-Current required fields:
+## Metadata
 
 ```json
 {
-  "request_id": "2d7b8cf0-6c9d-42e2-a0e1-f8d3c4d5f678",
-  "created_at": "2026-05-11T10:30:00Z",
-  "repo_path": "/home/fieldwork/projects/example",
-  "branch": "fieldwork/fix-login-redirect",
-  "title": "Fix login redirect after auth",
-  "body": "Summary...\n\nTests..."
+  "schema_version": 2,
+  "request_id": "f02865ee-bbed-45cb-8b32-b1b987916105",
+  "created_at": "2026-07-18T12:00:00Z",
+  "slug": "example",
+  "branch": "fieldwork/fix-widget",
+  "title": "Fix widget",
+  "body": "Summary and tests",
+  "head_oid": "0123456789012345678901234567890123456789",
+  "common_base_oid": "abcdefabcdefabcdefabcdefabcdefabcdefabcd"
 }
 ```
 
-The broker reads the review base from `<repo>/.fieldwork/default-branch`, falling back
-to the configured broker default when the file is absent.
+`common_base_oid` may be null for a full pack. Object IDs are SHA-1 only.
+Unknown fields are rejected. The slug, branch, UUID, timestamp, title, UTF-8
+body size, and OID shapes are validated before policy or forge access.
 
-## Socket Boundary
+## Upload
 
-The client sends the request to:
+`fieldwork-pr-build` requires a clean worktree, a `fieldwork/...` branch,
+SHA-1 object format, and no object alternates/reference clone. It uses a fixed
+Git environment and:
 
-```text
-/run/fieldwork-pr-broker/fieldwork-pr.sock
+```sh
+git pack-objects --revs --local --stdout
 ```
 
-The checked-in systemd template uses `SocketGroup=fieldwork-pr`, but the installer rewrites the installed socket group. By default the installed socket is owned by `fieldwork-pr-broker:<agent-primary-group>` with mode `0660` (for the standard install, usually `fieldwork-pr-broker:fieldwork`).
+It intentionally does not use `--thin`. It publishes exactly `meta.json` and
+`pack` into a private per-UID spool.
 
-The agent's primary group is preserved by the user namespace that `claude remote-control --sandbox` puts the agent into. A dedicated supplementary group would be stripped from the agent's effective group set inside the sandbox and the kernel would deny `connect()` against the 0660 group-gated socket. The broker user owns the socket and the forge credential, but the agent user cannot read the token or GitHub App private key (`/etc/fieldwork-pr-broker/gh-token` and `/etc/fieldwork-pr-broker/github-app-private-key.pem` are mode `0600`, owned by the broker user when present).
+`/usr/local/bin/fieldwork-pr-upload <request-id>` walks that spool without
+following symlinks, checks ownership/modes/type/size, and composes an exact
+`multipart/form-data` POST with parts named `meta` and `pack`. The uploader
+uses only Python standard-library sockets and never starts a subprocess.
 
-An operator who wants to gate the socket with a dedicated group can override the default via `FIELDWORK_BROKER_SOCKET_GROUP=<group>` in `lib/broker/install.sh`, but must then arrange for the agent's userns mapping to preserve that group. Otherwise this kind of regression resurfaces.
+VPS transport is a group-restricted Unix socket. Local transport is
+`127.0.0.1:8377` with a bearer used for loopback/CSRF defense in depth.
+Authentication is checked before a TCP body is read. Header, body, idle, and
+total processing deadlines apply.
 
-## Preflight Endpoint
+## Broker-owned policy
 
-Onboarding can ask the broker to prove credential reachability before it creates a checkout:
-
-```text
-POST /preflight
-```
-
-Request:
+The slug selects a root/broker-owned policy record:
 
 ```json
 {
-  "repo": "owner/repo"
+  "schema_version": 1,
+  "forge": "github",
+  "project": "owner/example",
+  "api_base_url": "https://api.github.com",
+  "git_base_url": "https://github.com",
+  "base_branch": "main",
+  "approval": "require",
+  "allow_private_network": false,
+  "ca_bundle_ref": null
 }
 ```
 
-The `repo` field is the opaque project identifier: `owner/repo` for GitHub, or
-the full project path such as `group/subgroup/project` for GitLab. GitHub
-preflight uses `gh repo view` with the broker PAT or GitHub App installation
-token. GitLab preflight calls `/projects/<urlencoded-project>` with
-`PRIVATE-TOKEN`. Success means the token can resolve the project; a `404`
-usually means the credential cannot see it. This endpoint does not push, open a
-PR/MR, or expose the token to the caller.
+GitHub endpoints are constants. GitLab API and Git endpoints must be HTTPS and
+share the same operator-confirmed host and port. Custom CA files are copied
+into a content-addressed broker store. DNS resolution rejects a destination if
+any answer is a forbidden address class unless private networking was
+explicitly enabled; the accepted addresses are pinned for Git and REST.
+Redirects are disabled.
 
-## Broker Validations
+Policy reads and writes use no-follow checks and per-slug locks. A digest of the
+full policy is recorded with pending work. Any change before a forge write
+moves the request to `needs_operator`.
 
-The broker rejects requests when:
+## Credential preflight
 
-- the JSON is invalid
-- the request fails the runtime-enforced JSON Schema contract
-- required fields are missing or not strings
-- `request_id` is not a UUID
-- `request_id` was already accepted by this broker
-- `created_at` is not a valid UTC timestamp like `2026-05-11T10:30:00Z`
-- `repo_path` is outside the configured projects root
-- `repo_path` is not a Git repository
-- `branch` does not match `^fieldwork/[a-z0-9][a-z0-9/_-]{1,80}$`
-- `title` is over 200 characters or contains a newline
-- `body` is over 64 KiB as UTF-8
-- `.fieldwork/expected-origin` is missing or not an HTTPS URL for the selected forge
-- the repo's current `origin` remote does not match `.fieldwork/expected-origin`
-- the worktree has unstaged or staged changes
-- `gitleaks` detects secret-shaped content in the PR body
-- the in-memory per-repo rate limit is exceeded
-- `git push` or forge PR/MR creation fails
+Onboarding sends `POST /preflight {"slug":"example"}` after the privileged
+policy writer has wired the repository. The broker resolves the project and
+base branch only from that root-owned policy, obtains its broker-owned
+credential, and performs a bounded, DNS-pinned `git ls-remote` for the exact
+base-branch ref. It returns `{"ok":true,"slug":"example","state":"ready"}` only
+when the credential can read that ref. The request accepts no checkout path,
+forge URL, project, or branch from the agent.
 
-The broker derives the push URL from `.fieldwork/expected-origin`; it does not
-trust the repo's current `origin` remote for push auth. It still checks that the
-current `origin` points at the same project so an attacker cannot silently swap
-the local checkout's origin while asking the broker to push elsewhere. For
-GitLab, `.fieldwork/expected-origin` must use the host pinned by
-`FIELDWORK_GITLAB_API`; SSH remotes are parsed only for the project path.
+An empty object returns the fixed `invalid_preflight_request` error; setup
+health checks use that response to detect the current route contract without
+selecting a repository or exercising a credential.
 
-Broker git subprocesses set `safe.directory` for the validated repo path in the broker-owned process environment. Onboarding therefore does not need to run `sudo git config --system --add safe.directory ...` for each repo after setup has removed temporary passwordless sudo.
+## Quarantine
 
-## Replay Protection
+The broker fetches only the named base branch, indexes the uploaded pack into a
+fresh quarantine object store with strict Git validation, and rejects thin
+packs. It enforces:
 
-Clients generate a fresh UUID `request_id` for every PR request. After validation and rate-limit checks, the broker stores accepted request IDs under:
+- physical pack and object-count limits;
+- per-object, total expanded, and delta-chain limits;
+- no uploaded objects beyond the expected policy delta;
+- `common_base_oid` is an ancestor of `head_oid`;
+- the pinned head is a commit and the base relationship is current;
+- secret scans over title, body, filenames, blobs, author/committer identity,
+  and signature material.
+
+Blob materialization uses OIDs and safe files in the quarantine directory; tree
+filenames are never interpreted as output paths.
+
+## Approval and durability
+
+Every request reserves its UUID permanently. Pending records and packs enter the
+same fsynced state machine in both approval modes:
 
 ```text
-/var/lib/fieldwork-pr-broker/requests/
+queued -> approved -> pushed -> pr_created -> done
+   |          |                       |
+   +-> denied +-> failed/needs_operator
+   +-> expired
 ```
 
-Each ledger file is mode `0600` and owned by `fieldwork-pr-broker`. Duplicate `request_id` values are rejected with HTTP `409`.
+`approval=require` performs no forge write before approval. Denial and expiry
+perform no forge write at all. Auto mode persists the pack, metadata, MAC, and
+`approved` state before its first write.
 
-## Responses
+Metadata is broker-owned and authenticated with a persistent broker-only HMAC
+key over the canonical record and pack digest. Approval revalidates the MAC,
+pack digest, policy, scans, quarantine, and base under the slug lock.
 
-Success:
+Reconciliation checks the remote branch OID and existing PR before doing only
+the missing operation. An existing Fieldwork PR branch may advance only when
+the broker proves its current remote OID is an ancestor of the submitted head
+inside the validated quarantine repository; divergent or rewind updates fail
+with `branch_conflict`. The forge push is also non-forced, so a concurrent
+branch race fails closed. Reconciliation does not double-push or create a
+duplicate PR.
+Terminal results are durable tombstones. Tombstones default to 30-day
+retention; the replay ledger is permanent.
 
-```json
-{
-  "ok": true,
-  "request_id": "2d7b8cf0-6c9d-42e2-a0e1-f8d3c4d5f678",
-  "url": "https://github.com/owner/repo/pull/123"
-}
+## Status and responses
+
+```sh
+/usr/local/bin/fieldwork-pr-upload --status <request-id>
 ```
 
-Validation failure:
+This sends authenticated `POST /pr-status {"request_id":"..."}`. It returns the
+current state and, for terminal states, the PR URL or fixed error code. After
+tombstone retention, status returns `unknown_request`; replaying a UUID still
+in the permanent ledger returns `duplicate_expired`.
 
-```json
-{
-  "ok": false,
-  "request_id": "2d7b8cf0-6c9d-42e2-a0e1-f8d3c4d5f678",
-  "error": "worktree not clean, commit before submitting"
-}
-```
+Responses are JSON objects. Consumers must rely on `ok`, `state`,
+`request_id`, `url`, and `error_code`, not human log text.
 
-After schema validation, `request_id` is the client-provided UUID. For invalid JSON and other pre-schema failures, the broker may return a short generated fallback request ID for log correlation.
+## Maintenance transport
 
-## Audit Log
-
-The broker logs to:
-
-```text
-/var/log/fieldwork-pr-broker.log
-```
-
-Logs include request IDs, validation results, push attempts, PR/MR creation attempts, and rejection reasons. They do not include forge tokens.
-
-The structured audit log lives at:
-
-```text
-/var/lib/fieldwork-pr-broker/audit.jsonl
-```
-
-`audit.jsonl` and rotated `audit.jsonl.N` files are owned by the broker user and group, mode `0640`. On ACL-capable systems the installer grants the agent user a direct read ACL on those files plus traverse-only access to `/var/lib/fieldwork-pr-broker`. That lets the future event poller and local dashboard open the known audit path without joining `fieldwork-bot` or reading `pending/` and `requests/`. The broker re-applies mode and the direct read ACL after audit writes and rotation.
-
-Accepted request IDs are also recorded in the replay ledger:
-
-```text
-/var/lib/fieldwork-pr-broker/requests/<request_id>.json
-```
-
-Ledger entries include request ID, created timestamp, project, repo path, branch, and accepted timestamp. Pending approval JSON keeps the historical key name `"repo"`, but the value is the opaque project identifier.
-
-## Accepted And Rejected Examples
-
-Accepted shape:
-
-```json
-{
-  "request_id": "2d7b8cf0-6c9d-42e2-a0e1-f8d3c4d5f678",
-  "created_at": "2026-05-11T10:30:00Z",
-  "repo_path": "/home/fieldwork/projects/my-app",
-  "branch": "fieldwork/fix-auth-redirect",
-  "title": "Fix auth redirect",
-  "body": "Summary:\n- Preserve next URL during login.\n\nTests:\n- npm test"
-}
-```
-
-Rejected branch:
-
-```json
-{
-  "request_id": "2d7b8cf0-6c9d-42e2-a0e1-f8d3c4d5f679",
-  "created_at": "2026-05-11T10:30:00Z",
-  "repo_path": "/home/fieldwork/projects/my-app",
-  "branch": "main",
-  "title": "Push directly",
-  "body": "This is rejected because the branch is not under fieldwork/."
-}
-```
-
-Rejected repo path:
-
-```json
-{
-  "request_id": "2d7b8cf0-6c9d-42e2-a0e1-f8d3c4d5f680",
-  "created_at": "2026-05-11T10:30:00Z",
-  "repo_path": "/tmp/my-app",
-  "branch": "fieldwork/fix-auth-redirect",
-  "title": "Fix auth redirect",
-  "body": "This is rejected because the repo path is outside the projects root."
-}
-```
-
-## Future Contract Work
-
-These behaviors are still future work, not current runtime behavior:
-
-- signed requests
-- timestamp freshness windows
-- JSON Schema enforcement through a full draft 2020-12 library instead of Fieldwork's small stdlib validator
+Maintenance uses the same metadata-plus-pack contract. On VPS it is a
+root:root 0600 Unix socket that is not enabled by default. Locally, root invokes
+the broker container entrypoint. While maintenance is active, normal `/pr` and
+`/approve` return 503, while status and reconciliation continue.

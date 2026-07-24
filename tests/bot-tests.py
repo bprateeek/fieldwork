@@ -22,7 +22,8 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def _load_bot_module(tmp: Path):
     """Load lib/scripts/fieldwork-bot as a Python module with test paths."""
-    os.environ["FIELDWORK_BOT_PENDING_DIR"] = str(tmp / "pending")
+    os.environ["FIELDWORK_BOT_PENDING_META_DIR"] = str(tmp / "pending")
+    os.environ["FIELDWORK_BOT_PENDING_SIDECAR_DIR"] = str(tmp / "sidecar")
     os.environ["FIELDWORK_BOT_NOTIFICATIONS_DIR"] = str(tmp / "notifications")
     os.environ["FIELDWORK_BOT_APPROVE_SOCKET"] = str(tmp / "approve.sock")
     os.environ["FIELDWORK_BOT_CONFIG_PATH"] = str(tmp / "config.toml")
@@ -47,6 +48,7 @@ class BotHmacTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.tmp = Path(tempfile.mkdtemp(prefix="fieldwork-bot-tests."))
         (cls.tmp / "pending").mkdir()
+        (cls.tmp / "sidecar").mkdir()
         (cls.tmp / "notifications").mkdir()
         cls.bot = _load_bot_module(cls.tmp)
 
@@ -90,6 +92,7 @@ class BotPendingScanTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.tmp = Path(tempfile.mkdtemp(prefix="fieldwork-bot-scan."))
         (cls.tmp / "pending").mkdir()
+        (cls.tmp / "sidecar").mkdir()
         (cls.tmp / "notifications").mkdir()
         cls.bot = _load_bot_module(cls.tmp)
         cls.cfg = {"bot_token": "tok", "allowed_chat_ids": [111, 222]}
@@ -102,6 +105,8 @@ class BotPendingScanTests(unittest.TestCase):
     def setUp(self) -> None:
         for p in Path(self.bot.PENDING_DIR).glob("*"):
             p.unlink()
+        for p in Path(self.bot.PENDING_SIDECAR_DIR).glob("*"):
+            p.unlink()
         for p in Path(self.bot.NOTIFICATIONS_DIR).glob("*"):
             p.unlink()
         dedupe = Path(self.bot.DEDUPE_STORE_PATH)
@@ -113,10 +118,9 @@ class BotPendingScanTests(unittest.TestCase):
             "request_id": rid,
             "queued_at": "2026-05-15T10:00:00Z",
             "expires_at": "2026-05-16T10:00:00Z",
-            "repo": "owner/example",
-            "branch": "fieldwork/test",
-            "title": "Test PR",
-            "body": "Hi",
+            "slug": "example",
+            "project": "owner/example",
+            "state": "queued",
         }
         Path(self.bot.PENDING_DIR, f"{rid}.json").write_text(json.dumps(record))
 
@@ -136,11 +140,12 @@ class BotPendingScanTests(unittest.TestCase):
             sent = self.bot.process_pending_dir(self.cfg, self.secret)
         self.assertEqual(sent, 1)
         self.assertEqual([c for c, _ in sends], [111, 222])
-        self.assertTrue((Path(self.bot.PENDING_DIR) / f"{rid}.json.notified").exists())
+        self.assertTrue((Path(self.bot.PENDING_SIDECAR_DIR) / f"{rid}.notified.json").exists())
         health = json.loads(Path(self.bot.HEALTH_PATH).read_text())
         self.assertEqual(health["pending_count"], 1)
         self.assertGreaterEqual(health["oldest_pending_age_seconds"], 0)
         self.assertEqual(health["pending_requests"][0]["request_id"], rid)
+        self.assertEqual(health["pending_requests"][0]["repo"], "owner/example")
 
         # Second pass: sidecar present → no resend.
         sends.clear()
@@ -172,7 +177,10 @@ class BotPendingScanTests(unittest.TestCase):
             self.assertEqual(verified[1], rid)
 
     def test_process_notifications_dir_forwards_and_deletes(self) -> None:
-        Path(self.bot.NOTIFICATIONS_DIR, "a.json").write_text('{"text":"hello mobile"}')
+        rid = "55555555-5555-4555-8555-555555555555"
+        Path(self.bot.NOTIFICATIONS_DIR, "a.json").write_text(json.dumps({
+            "schema_version": 1, "event": "pushed", "request_id": rid, "slug": "example",
+        }))
 
         calls: list[dict] = []
 
@@ -183,20 +191,16 @@ class BotPendingScanTests(unittest.TestCase):
         with patch.object(self.bot, "telegram_call", side_effect=fake_telegram_call):
             self.bot.process_notifications_dir(self.cfg)
 
-        self.assertEqual([c["text"] for c in calls], ["hello mobile", "hello mobile"])
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(all(c["text"] == f"Fieldwork branch pushed.\nRepository: example\nRequest ID: {rid}" for c in calls))
         self.assertEqual(list(Path(self.bot.NOTIFICATIONS_DIR).glob("*")), [])
 
     def test_process_notifications_dir_accepts_envelope_and_dedups(self) -> None:
         payload = {
-            "schema": 1,
-            "kind": "broker_lifecycle",
-            "source": "broker",
-            "event": "request_queued",
-            "repo_slug": "fieldwork-smoke",
+            "schema_version": 1,
+            "event": "queued",
+            "slug": "fieldwork-smoke",
             "request_id": "11111111-1111-4111-8111-111111111111",
-            "branch": "fieldwork/test",
-            "dedupe_key": "request_queued:fieldwork-smoke:11111111-1111-4111-8111-111111111111",
-            "text": "Approval queued: fieldwork-smoke @ fieldwork/test",
         }
         Path(self.bot.NOTIFICATIONS_DIR, "a.json").write_text(json.dumps(payload))
 
@@ -210,7 +214,8 @@ class BotPendingScanTests(unittest.TestCase):
             sent = self.bot.process_notifications_dir(self.cfg)
 
         self.assertEqual(sent, 1)
-        self.assertEqual([c["text"] for c in calls], [payload["text"], payload["text"]])
+        expected = "Fieldwork request queued for approval.\nRepository: fieldwork-smoke\nRequest ID: 11111111-1111-4111-8111-111111111111"
+        self.assertEqual([c["text"] for c in calls], [expected, expected])
         self.assertTrue(Path(self.bot.DEDUPE_STORE_PATH).exists())
 
         Path(self.bot.NOTIFICATIONS_DIR, "b.json").write_text(json.dumps(payload))
@@ -222,12 +227,35 @@ class BotPendingScanTests(unittest.TestCase):
         self.assertEqual(calls, [])
         self.assertEqual(list(Path(self.bot.NOTIFICATIONS_DIR).glob("*")), [])
 
+    def test_notification_contract_rejects_text_and_unknown_fields(self) -> None:
+        rid = "66666666-6666-4666-8666-666666666666"
+        hostile = {
+            "schema_version": 1, "event": "error", "request_id": rid,
+            "slug": "example", "error_code": "task_failed",
+            "text": "SECRET_FROM_STDERR",
+        }
+        Path(self.bot.NOTIFICATIONS_DIR, "hostile.json").write_text(json.dumps(hostile))
+        with patch.object(self.bot, "telegram_call") as call:
+            sent = self.bot.process_notifications_dir(self.cfg)
+        self.assertEqual(sent, 0)
+        call.assert_not_called()
+        self.assertEqual(list(Path(self.bot.NOTIFICATIONS_DIR).glob("*")), [])
+
+    def test_notification_contract_rejects_non_uuid_request_id(self) -> None:
+        payload = {
+            "schema_version": 1, "event": "pushed",
+            "request_id": "zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz",
+            "slug": "example",
+        }
+        self.assertEqual(self.bot.parse_notification_payload(payload), (None, None))
+
 
 class BotCallbackTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.tmp = Path(tempfile.mkdtemp(prefix="fieldwork-bot-cb."))
         (cls.tmp / "pending").mkdir()
+        (cls.tmp / "sidecar").mkdir()
         (cls.tmp / "notifications").mkdir()
         cls.bot = _load_bot_module(cls.tmp)
         cls.cfg = {"bot_token": "tok", "allowed_chat_ids": [42]}
@@ -268,8 +296,7 @@ class BotCallbackTests(unittest.TestCase):
         self.assertEqual(posts, [(rid, "approve", 42)])
         edits = [p for m, p in tg_calls if m == "editMessageText"]
         self.assertEqual(len(edits), 1)
-        self.assertIn("Approved by @alice", edits[0]["text"])
-        self.assertIn("pull/9", edits[0]["text"])
+        self.assertEqual(edits[0]["text"], "✅ Fieldwork request approved.")
 
     def test_handle_callback_non_allowlisted_chat_dropped(self) -> None:
         rid = "44444444-4444-4444-8444-444444444444"

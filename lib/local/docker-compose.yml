@@ -1,0 +1,110 @@
+name: fieldwork-local
+
+services:
+  broker:
+    build:
+      context: ../..
+      dockerfile: lib/local/Dockerfile
+    image: fieldwork-local-broker:protocol-v2
+    command: ["broker"]
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${FIELDWORK_LOCAL_PORT:-8377}:8377"
+    environment:
+      FIELDWORK_BROKER_LOG_PATH: /data/state/audit.log
+      FIELDWORK_BROKER_AUDIT_LOG_PATH: /data/state/audit.jsonl
+      FIELDWORK_BROKER_TOKEN_PATH: /data/token/forge-token
+      FIELDWORK_BROKER_ASKPASS_PATH: /usr/local/lib/fieldwork-pr-broker/git-askpass
+      FIELDWORK_BROKER_SCHEMA_PATH: /usr/local/lib/fieldwork-pr-broker/pr-request.schema.json
+      FIELDWORK_BROKER_POLICY_DIR: /data/policy
+      FIELDWORK_BROKER_CA_DIR: /data/policy-ca
+      FIELDWORK_BROKER_LEDGER_DIR: /data/state/requests
+      FIELDWORK_BROKER_PENDING_META_DIR: /data/pending-meta
+      FIELDWORK_BROKER_PENDING_SIDECAR_DIR: /data/pending-sidecar
+      FIELDWORK_BROKER_PENDING_PACK_DIR: /data/pending-pack
+      FIELDWORK_BROKER_TOMBSTONE_DIR: /data/state/tombstones
+      FIELDWORK_BROKER_WORK_DIR: /work
+      FIELDWORK_BROKER_PENDING_MAC_KEY_PATH: /data/keys/pending-mac.key
+      FIELDWORK_BROKER_HTTP_AUTH_TOKEN_PATH: /data/auth/http-auth
+      FIELDWORK_BROKER_APPROVE_SOCKET_PATH: /data/approve/approve.sock
+      FIELDWORK_BROKER_NOTIFICATIONS_DIR: /data/notifications
+      FIELDWORK_BROKER_BOT_GROUP: fieldwork-bot
+      FIELDWORK_BROKER_MAINTENANCE: ${FIELDWORK_BROKER_MAINTENANCE:-0}
+    volumes:
+      - fieldwork-local-token:/data/token
+      - fieldwork-local-policy:/data/policy
+      - fieldwork-local-policy-ca:/data/policy-ca
+      - fieldwork-local-keys:/data/keys
+      - fieldwork-local-state:/data/state
+      - fieldwork-local-meta:/data/pending-meta
+      - fieldwork-local-sidecar:/data/pending-sidecar
+      - fieldwork-local-pack:/data/pending-pack
+      - fieldwork-local-auth:/data/auth
+      - fieldwork-local-approve:/data/approve
+      - fieldwork-local-notifications:/data/notifications
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m
+      - /work:rw,noexec,nosuid,nodev,size=256m
+    read_only: true
+    cap_drop: ["ALL"]
+    cap_add: ["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 1g
+    pids_limit: 128
+    cpus: 2.0
+
+  bot:
+    image: fieldwork-local-broker:protocol-v2
+    command: ["bot"]
+    restart: unless-stopped
+    profiles: ["telegram"]
+    environment:
+      FIELDWORK_BOT_CONFIG_PATH: /data/telegram/config.toml
+      FIELDWORK_BOT_SECRET_PATH: /data/telegram/secret
+      FIELDWORK_BOT_PENDING_META_DIR: /data/pending-meta
+      FIELDWORK_BOT_PENDING_SIDECAR_DIR: /data/pending-sidecar
+      FIELDWORK_BOT_NOTIFICATIONS_DIR: /data/notifications
+      FIELDWORK_BOT_APPROVE_SOCKET: /data/approve/approve.sock
+      FIELDWORK_BOT_HEALTH_PATH: /data/bot-state/health.json
+      FIELDWORK_BOT_DEDUPE_STORE_PATH: /data/bot-state/dedupe.json
+      FIELDWORK_BOT_LOG_PATH: /data/bot-state/bot.log
+    volumes:
+      - fieldwork-local-telegram:/data/telegram:ro
+      - fieldwork-local-meta:/data/pending-meta:ro
+      - fieldwork-local-sidecar:/data/pending-sidecar
+      - fieldwork-local-notifications:/data/notifications
+      - fieldwork-local-approve:/data/approve
+      - fieldwork-local-bot-state:/data/bot-state
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m
+    read_only: true
+    cap_drop: ["ALL"]
+    cap_add: ["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 256m
+    pids_limit: 64
+    cpus: 0.5
+
+  telegram-config:
+    image: fieldwork-local-broker:protocol-v2
+    command: ["configure-telegram"]
+    profiles: ["telegram-config"]
+    stdin_open: true
+    tty: true
+    volumes:
+      - fieldwork-local-telegram:/data/telegram
+
+volumes:
+  fieldwork-local-token:
+  fieldwork-local-policy:
+  fieldwork-local-policy-ca:
+  fieldwork-local-keys:
+  fieldwork-local-state:
+  fieldwork-local-meta:
+  fieldwork-local-sidecar:
+  fieldwork-local-pack:
+  fieldwork-local-auth:
+  fieldwork-local-approve:
+  fieldwork-local-notifications:
+  fieldwork-local-telegram:
+  fieldwork-local-bot-state:

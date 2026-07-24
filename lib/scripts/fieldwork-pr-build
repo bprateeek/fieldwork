@@ -1,0 +1,337 @@
+#!/usr/bin/env python3
+"""Build a protocol-v2 PR metadata record and non-thin Git pack.
+
+This command is intentionally sandboxed.  It performs Git reads in the agent
+checkout and publishes only ``meta.json`` plus ``pack`` into the untrusted
+per-UID spool.  Upload is a separate top-level command.
+"""
+
+from __future__ import annotations
+
+import argparse
+from datetime import datetime, timezone
+import json
+import os
+from pathlib import Path
+import pwd
+import re
+import stat
+import subprocess
+import sys
+import uuid
+
+
+UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
+SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,30}$")
+BRANCH_RE = re.compile(r"^fieldwork/[a-z0-9][a-z0-9/_-]{1,80}$")
+OID_RE = re.compile(r"^[0-9a-f]{40}$")
+TITLE_MAX = 200
+BODY_MAX = 64 * 1024
+
+
+class BuildError(RuntimeError):
+    pass
+
+
+def fixed_git_env() -> dict[str, str]:
+    """Return a complete, scrubbed environment for every builder git child."""
+    return {
+        "HOME": pwd.getpwuid(os.getuid()).pw_dir,
+        "LANG": "C",
+        "LC_ALL": "C",
+        "PATH": "/usr/bin:/bin:/usr/local/bin",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_SYSTEM": "/dev/null",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_ATTR_NOSYSTEM": "1",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_NO_LAZY_FETCH": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_PAGER": "cat",
+    }
+
+
+def git(*args: str, input_bytes: bytes | None = None, check: bool = True) -> subprocess.CompletedProcess[bytes]:
+    try:
+        return subprocess.run(
+            ["/usr/bin/git", *args],
+            input=input_bytes,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=fixed_git_env(),
+            timeout=120,
+            check=check,
+        )
+    except FileNotFoundError as exc:
+        raise BuildError("git is missing at /usr/bin/git") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise BuildError("git command timed out") from exc
+    except subprocess.CalledProcessError as exc:
+        detail = exc.stderr.decode("utf-8", "replace").strip().splitlines()
+        raise BuildError(detail[-1] if detail else "git command failed") from exc
+
+
+def git_text(*args: str) -> str:
+    return git(*args).stdout.decode("utf-8", "strict").strip()
+
+
+def _fixed_spool_parent(uid: int) -> Path:
+    if sys.platform == "darwin":
+        return Path("/private/var/run/fieldwork", str(uid))
+    return Path("/run/user", str(uid), "fieldwork")
+
+
+def spool_parent(uid: int | None = None) -> Path:
+    """Derive the spool from getuid; no environment variable is consulted."""
+    return _fixed_spool_parent(os.getuid() if uid is None else uid) / "spool"
+
+
+def _open_checked_dir(path: Path, uid: int, *, create_leaf: bool = False, strict_user_modes: bool = True) -> int:
+    """Walk an absolute path without following symlinks and return its dir fd."""
+    if not path.is_absolute():
+        raise BuildError("internal spool path is not absolute")
+    fd = os.open("/", os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        for index, component in enumerate(path.parts[1:]):
+            last = index == len(path.parts[1:]) - 1
+            if last and create_leaf:
+                try:
+                    os.mkdir(component, 0o700, dir_fd=fd)
+                except FileExistsError:
+                    pass
+            flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+            next_fd = os.open(component, flags, dir_fd=fd)
+            info = os.fstat(next_fd)
+            if not stat.S_ISDIR(info.st_mode):
+                os.close(next_fd)
+                raise BuildError(f"spool component is not a directory: {component}")
+            # Root-owned fixed parents and the current UID's parents are both
+            # expected.  No other owner may redirect path resolution.
+            if info.st_uid not in (0, uid):
+                os.close(next_fd)
+                raise BuildError(f"unsafe spool owner on component: {component}")
+            if strict_user_modes and info.st_uid == uid and stat.S_IMODE(info.st_mode) & 0o077:
+                os.close(next_fd)
+                raise BuildError(f"unsafe spool permissions on component: {component}")
+            os.close(fd)
+            fd = next_fd
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _mkdir_open(parent_fd: int, name: str, uid: int) -> int:
+    try:
+        os.mkdir(name, 0o700, dir_fd=parent_fd)
+    except FileExistsError:
+        pass
+    fd = os.open(name, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0), dir_fd=parent_fd)
+    info = os.fstat(fd)
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != uid or stat.S_IMODE(info.st_mode) & 0o077:
+        os.close(fd)
+        raise BuildError(f"unsafe spool directory: {name}")
+    return fd
+
+
+def _open_spool_parent(uid: int, test_parent: Path | None) -> int:
+    if test_parent is not None:
+        return _open_checked_dir(test_parent.resolve(strict=True), uid, strict_user_modes=False)
+    if sys.platform == "darwin":
+        # The LaunchDaemon creates the fixed root and per-UID 0700 parent.
+        base = Path("/private/var/run/fieldwork", str(uid))
+        base_fd = _open_checked_dir(base, uid)
+        try:
+            return _mkdir_open(base_fd, "spool", uid)
+        finally:
+            os.close(base_fd)
+    # systemd creates /run/user/<uid>; the client owns the two private leaves.
+    base_fd = _open_checked_dir(Path("/run/user", str(uid)), uid)
+    try:
+        fieldwork_fd = _mkdir_open(base_fd, "fieldwork", uid)
+    finally:
+        os.close(base_fd)
+    try:
+        return _mkdir_open(fieldwork_fd, "spool", uid)
+    finally:
+        os.close(fieldwork_fd)
+
+
+def _load_input(path: Path) -> dict[str, object]:
+    try:
+        info = path.lstat()
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or info.st_size > 128 * 1024:
+            raise BuildError("request input must be a regular non-symlink file no larger than 128 KiB")
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise BuildError(f"request input is missing: {path}") from exc
+    except json.JSONDecodeError as exc:
+        raise BuildError("request input is not valid JSON") from exc
+    if not isinstance(value, dict):
+        raise BuildError("request input must be a JSON object")
+    allowed = {"schema_version", "request_id", "created_at", "slug", "branch", "title", "body", "common_base_oid"}
+    extras = sorted(set(value) - allowed)
+    if extras:
+        raise BuildError(f"unexpected request input field: {extras[0]}")
+    return value
+
+
+def _validate_input(value: dict[str, object]) -> tuple[str, str, str, str, str, str, str | None]:
+    if value.get("schema_version", 2) != 2:
+        raise BuildError("schema_version must be 2")
+    slug = value.get("slug")
+    branch = value.get("branch")
+    title = value.get("title")
+    body = value.get("body")
+    if not isinstance(slug, str) or not SLUG_RE.fullmatch(slug):
+        raise BuildError("slug must match ^[a-z0-9][a-z0-9-]{0,30}$")
+    if not isinstance(branch, str) or not BRANCH_RE.fullmatch(branch):
+        raise BuildError("branch must be under fieldwork/ and match the protocol-v2 branch pattern")
+    if not isinstance(title, str) or len(title) > TITLE_MAX or "\n" in title or "\r" in title:
+        raise BuildError("title is too long or contains a newline")
+    if not isinstance(body, str) or len(body.encode("utf-8")) > BODY_MAX:
+        raise BuildError("body exceeds 65536 UTF-8 bytes")
+    request_id = value.get("request_id") or str(uuid.uuid4())
+    if not isinstance(request_id, str) or not UUID_RE.fullmatch(request_id.lower()):
+        raise BuildError("request_id must be a UUID")
+    created_at = value.get("created_at") or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    if not isinstance(created_at, str):
+        raise BuildError("created_at must be a UTC timestamp")
+    try:
+        datetime.strptime(created_at, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError as exc:
+        raise BuildError("created_at must be UTC like 2026-05-11T10:30:00Z") from exc
+    common = value.get("common_base_oid")
+    if common is not None and (not isinstance(common, str) or not OID_RE.fullmatch(common)):
+        raise BuildError("common_base_oid must be a 40-character SHA-1 OID or null")
+    return request_id.lower(), created_at, slug, branch, title, body, common
+
+
+def _discover_common(head: str) -> str | None:
+    candidates: list[str] = []
+    hint = Path(".fieldwork/default-branch")
+    if hint.is_file() and not hint.is_symlink():
+        lines = hint.read_text(encoding="utf-8", errors="strict").splitlines()
+        if lines:
+            candidates.append(f"refs/remotes/origin/{lines[0].strip()}")
+    try:
+        symbolic = git_text("symbolic-ref", "refs/remotes/origin/HEAD")
+        if symbolic:
+            candidates.append(symbolic)
+    except BuildError:
+        pass
+    for candidate in candidates:
+        result = git("merge-base", head, candidate, check=False)
+        if result.returncode == 0:
+            oid = result.stdout.decode("ascii", "strict").strip()
+            if OID_RE.fullmatch(oid) and git("merge-base", "--is-ancestor", oid, head, check=False).returncode == 0:
+                return oid
+    return None
+
+
+def build(request_file: Path, *, parent: Path | None = None) -> str:
+    request_id, created_at, slug, branch, title, body, common = _validate_input(_load_input(request_file))
+    if git_text("rev-parse", "--show-object-format") != "sha1":
+        raise BuildError("SHA-256 Git repositories are not supported by Fieldwork protocol v2")
+    if git("status", "--porcelain=v1", "-z", "-uall").stdout:
+        raise BuildError("repository is not clean; commit your changes (or run the prepare flow) first")
+    if git("check-ref-format", "--branch", branch, check=False).returncode != 0:
+        raise BuildError("branch is not a valid Git branch name")
+    git_dir = Path(git_text("rev-parse", "--absolute-git-dir"))
+    alternates = git_dir / "objects/info/alternates"
+    if alternates.exists() or alternates.is_symlink():
+        raise BuildError("Git repositories using object alternates/reference clones are unsupported")
+    head = git_text("rev-parse", "HEAD")
+    if not OID_RE.fullmatch(head):
+        raise BuildError("HEAD is not a SHA-1 object ID")
+    if common is None:
+        common = _discover_common(head)
+    elif git("merge-base", "--is-ancestor", common, head, check=False).returncode != 0:
+        raise BuildError("common_base_oid is not an ancestor of HEAD")
+
+    uid = os.getuid()
+    # ``parent`` is an in-process test seam only. Production derives and walks
+    # the literal platform path without consulting the environment.
+    parent_fd = _open_spool_parent(uid, parent)
+    try:
+        try:
+            os.mkdir(request_id, 0o700, dir_fd=parent_fd)
+        except FileExistsError as exc:
+            raise BuildError("request_id already exists in the local spool") from exc
+        request_fd = os.open(
+            request_id,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_fd,
+        )
+        try:
+            pack_tmp_fd = os.open("pack.tmp", os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600, dir_fd=request_fd)
+            revs = f"{head}\n" if common is None else f"{head}\n^{common}\n"
+            try:
+                with os.fdopen(pack_tmp_fd, "wb", closefd=True) as pack_handle:
+                    process = subprocess.run(
+                        ["/usr/bin/git", "pack-objects", "--revs", "--local", "--stdout"],
+                        input=revs.encode("ascii"),
+                        stdout=pack_handle,
+                        stderr=subprocess.PIPE,
+                        env=fixed_git_env(),
+                        timeout=120,
+                    )
+                    pack_handle.flush()
+                    os.fsync(pack_handle.fileno())
+                if process.returncode != 0:
+                    detail = process.stderr.decode("utf-8", "replace").strip()
+                    raise BuildError(detail or "git pack-objects failed")
+                os.rename("pack.tmp", "pack", src_dir_fd=request_fd, dst_dir_fd=request_fd)
+                metadata = {
+                    "schema_version": 2,
+                    "request_id": request_id,
+                    "created_at": created_at,
+                    "slug": slug,
+                    "branch": branch,
+                    "title": title,
+                    "body": body,
+                    "head_oid": head,
+                    "common_base_oid": common,
+                }
+                meta_fd = os.open("meta.tmp", os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600, dir_fd=request_fd)
+                with os.fdopen(meta_fd, "wb") as meta_handle:
+                    meta_handle.write(json.dumps(metadata, sort_keys=True, separators=(",", ":")).encode("utf-8") + b"\n")
+                    meta_handle.flush()
+                    os.fsync(meta_handle.fileno())
+                os.rename("meta.tmp", "meta.json", src_dir_fd=request_fd, dst_dir_fd=request_fd)
+                os.fsync(request_fd)
+            except Exception:
+                for name in ("meta.tmp", "meta.json", "pack.tmp", "pack"):
+                    try:
+                        os.unlink(name, dir_fd=request_fd)
+                    except FileNotFoundError:
+                        pass
+                raise
+        finally:
+            os.close(request_fd)
+    except Exception:
+        try:
+            os.rmdir(request_id, dir_fd=parent_fd)
+        except OSError:
+            pass
+        raise
+    finally:
+        os.close(parent_fd)
+    return request_id
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="build a Fieldwork protocol-v2 PR pack")
+    parser.add_argument("request_file", type=Path, help="JSON containing slug, branch, title, and body")
+    args = parser.parse_args(argv)
+    try:
+        request_id = build(args.request_file)
+    except (BuildError, OSError, UnicodeError) as exc:
+        print(f"[fieldwork-pr-build] {exc}", file=sys.stderr)
+        return 1
+    print(request_id)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

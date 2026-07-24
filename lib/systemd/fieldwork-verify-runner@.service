@@ -1,30 +1,39 @@
 [Unit]
-Description=Fieldwork verify runner (connection %i)
+Description=Fieldwork verify runner (system connection %i)
 Requires=fieldwork-verify-runner.socket
 
 [Service]
-# Critical: do NOT set NoNewPrivileges=true here. The whole point of this
-# unit is to give the verify runner an execution context where bwrap can
-# create user namespaces — which requires AppArmor profile transitions
-# that PR_SET_NO_NEW_PRIVS blocks. The trust boundary is enforced by
-# the socket's 0600 mode (only the fieldwork user can connect) and by
-# the runner's own input validation (path allowlist, symlink rejection),
-# not by systemd hardening on this unit.
-ExecStart=%h/.local/bin/fieldwork-verify-runner
-Environment=FIELDWORK_PROJECTS_ROOT=%h/projects
-Environment=FIELDWORK_WORKTREES_ROOT=%h/worktrees
-
-# The socket is passed in on stdin and used for stdout. stderr is split off
-# so internal runner errors land in the journal and can't be confused with
-# the framed protocol stream we send to the client.
+User=fieldwork
+Group=fieldwork
+ExecStart=/usr/local/lib/fieldwork/fieldwork-verify-runner
+Environment=HOME=/var/empty
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Environment=FIELDWORK_PROJECTS_ROOT=/home/fieldwork/projects
+Environment=FIELDWORK_WORKTREES_ROOT=/home/fieldwork/worktrees
 StandardInput=socket
 StandardOutput=socket
 StandardError=journal
-
-# A full verify pipeline (lint + typecheck + tests + secret scan + semgrep)
-# on a large repo can run minutes. 10 minutes is generous; client-side will
-# be the actual ceiling.
 TimeoutStartSec=600
-
-# One-shot: each connection gets its own instance; exit when done.
 Type=simple
+# Deliberately no NoNewPrivileges: bwrap/userns verification is the controlled
+# escape this root-installed runner exists to provide.
+PrivateTmp=true
+PrivateNetwork=true
+ProtectSystem=strict
+ProtectHome=tmpfs
+BindPaths=/home/fieldwork/projects /home/fieldwork/worktrees
+ReadWritePaths=/home/fieldwork/projects /home/fieldwork/worktrees /var/lib/fieldwork-verify
+PrivateDevices=true
+# bwrap needs AF_NETLINK to bring up loopback inside its new network
+# namespace, and it must mount a fresh /proc for its new PID namespace.
+# ProtectKernelTunables=true blocks that proc mount before the inner sandbox
+# exists. The runner is an unprivileged user with an empty capability set;
+# bwrap's read-only root and isolated namespaces are the tunable boundary.
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+UMask=0077

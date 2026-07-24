@@ -2,7 +2,32 @@
 
 ## Unreleased
 
-- No unreleased changes yet.
+- **Breaking:** replace checkout-reading broker protocol v1 with checkout-blind
+  protocol v2. Agents build a clean SHA-1, non-thin Git pack and upload it with
+  slug-based metadata in two top-level calls. Remove `repo_path`, broker
+  `--projects-root`, and the one-call `fieldwork-pr-submit` client.
+- Add broker-owned per-slug policy, strict quarantine/object caps, title/body
+  and object secret scans, SSRF address classification with DNS/port pinning,
+  host-restricted askpass, and GitHub/GitLab REST PR creation without `gh`.
+- Make approval and auto modes durable before forge writes. Add HMAC-protected
+  split pending stores, permanent replay IDs, terminal tombstones, authenticated
+  status, idempotent reconciliation, and `needs_operator` on policy drift.
+- Add Claude-only local hard-boundary mode with a root-owned control plane,
+  hardened broker/bot containers, dedicated OS user, policy helper, pinned
+  Claude digest, private per-UID spool, TTY token rotation, and local approval.
+- Move VPS Fieldwork boundary runners, poller, dispatcher, sessions, clients,
+  and adapters to root-owned system units/assets. Disable the dashboard in
+  hard-boundary mode; rootless Docker remains a user service.
+- Replace free-text notifications with a typed enum rendered by fixed bot
+  templates, and remove agent write access to the queue.
+- Add a discrete maintenance/migration transaction and exact-byte structural
+  instruction migrator. Existing repositories must be re-wired; approval
+  defaults to `require`.
+- Replace self-authorized release construction with a request to a separately
+  protected, commit-pinned trusted builder. Installation now requires both an
+  operator-pinned signed tag and trusted-builder artifact provenance.
+- Git is SHA-1-only for this protocol. GHES and local Codex hard-boundary mode
+  remain deferred; self-managed GitLab local mode is experimental.
 
 ## v0.2.0 - 2026-06-30
 

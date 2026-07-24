@@ -1,0 +1,34 @@
+#!/usr/bin/python3 -I
+"""Container-internal root admin client for the approve socket."""
+import json, re, socket, sys
+
+if len(sys.argv) != 3 or sys.argv[1] not in ("approve", "deny"):
+    print("usage: fieldwork-local-admin approve|deny <request-id>", file=sys.stderr)
+    raise SystemExit(2)
+request_id = sys.argv[2].lower()
+if not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", request_id):
+    print("invalid request id", file=sys.stderr)
+    raise SystemExit(2)
+body = json.dumps({"request_id": request_id, "decision": sys.argv[1], "chat_id": "local-operator"}, separators=(",", ":")).encode()
+head = (
+    "POST /approve HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n"
+    f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n"
+).encode("ascii")
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+sock.settimeout(370)
+sock.connect("/data/approve/approve.sock")
+with sock:
+    sock.sendall(head + body)
+    data = b""
+    while True:
+        chunk = sock.recv(65536)
+        if not chunk:
+            break
+        data += chunk
+_, _, response = data.partition(b"\r\n\r\n")
+sys.stdout.buffer.write(response)
+try:
+    payload = json.loads(response)
+except json.JSONDecodeError:
+    raise SystemExit(1)
+raise SystemExit(0 if payload.get("ok") else 1)

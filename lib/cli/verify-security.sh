@@ -214,17 +214,37 @@ EOF
   fi
 
   phase_section "Broker Service Hardening"
-  local directive
+  local directive broker_unit=""
+  broker_unit="$(ssh "$FIELDWORK_SSH_HOST" "systemctl cat fieldwork-pr-broker.service 2>/dev/null" || true)"
   for directive in \
     "NoNewPrivileges=true" \
     "PrivateTmp=true" \
+    "PrivateDevices=true" \
     "ProtectSystem=strict" \
-    "ProtectHome=read-only" \
+    "ProtectHome=yes" \
+    "MemoryMax=1G" \
+    "TasksMax=128" \
+    "CPUQuota=200%" \
+    "LimitFSIZE=268435456" \
     "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6"; do
-    if ssh "$FIELDWORK_SSH_HOST" "systemctl cat fieldwork-pr-broker.service 2>/dev/null | grep -Fx '$directive' >/dev/null" >/dev/null 2>&1; then
+    if printf '%s\n' "$broker_unit" | grep -Fxq "$directive"; then
       security_ok "broker service has $directive"
     else
       security_fail "broker service missing $directive" "Run: fieldwork sync-vps --force-install, then $(remote_sudo_ssh_command "bash ~/.fieldwork/infra/fieldwork-pr-broker/install.sh")"
+    fi
+  done
+
+  phase_section "Root-Owned Runner Boundary"
+  for directive in \
+    /etc/systemd/system/fieldwork-agent@.service \
+    /etc/systemd/system/fieldwork-event-poll.service \
+    /etc/systemd/system/fieldwork-task-dispatcher.service \
+    /etc/systemd/system/fieldwork-verify-runner.socket \
+    /etc/systemd/system/fieldwork-pr-prepare-runner.socket; do
+    if ssh "$FIELDWORK_SSH_HOST" "test -f '$directive' && test ! -L '$directive' && test \"\$(stat -c '%U:%G %a' '$directive')\" = 'root:root 644'" >/dev/null 2>&1; then
+      security_ok "$directive is root-owned 0644"
+    else
+      security_fail "$directive is missing or not root-owned 0644" "Run: fieldwork setup --force-install"
     fi
   done
 
@@ -259,6 +279,22 @@ EOF
       security_manual "bot user not provisioned yet" "Run: fieldwork setup-notify --telegram-bot"
     fi
 
+    if [ "$bot_user_exists" = "1" ]; then
+      if ssh "$FIELDWORK_SSH_HOST" "sudo -n -u fieldwork-bot true 2>/dev/null" >/dev/null 2>&1; then
+        local pending_meta_mode=""
+        pending_meta_mode="$(ssh "$FIELDWORK_SSH_HOST" "sudo -n stat -c '%U:%G %a' /var/lib/fieldwork-pr-broker/pending-meta 2>/dev/null" || true)"
+        if [ "$pending_meta_mode" != "fieldwork-pr-broker:fieldwork-bot 2750" ]; then
+          security_fail "pending metadata directory has wrong owner/mode ($pending_meta_mode, expected fieldwork-pr-broker:fieldwork-bot 2750)" "Run: fieldwork sync-vps, then fieldwork setup-notify --telegram-bot"
+        elif ssh "$FIELDWORK_SSH_HOST" "sudo -n -u fieldwork-bot sh -c 'test -x /var/lib/fieldwork-pr-broker && test -r /var/lib/fieldwork-pr-broker/pending-meta && test -x /var/lib/fieldwork-pr-broker/pending-meta && for path in /var/lib/fieldwork-pr-broker/pending-meta/*.json; do test ! -e \"\$path\" || test -r \"\$path\" || exit 1; done' 2>/dev/null" >/dev/null 2>&1; then
+          security_ok "bot user can traverse and read pending metadata"
+        else
+          security_fail "bot user cannot traverse and read pending metadata" "Run: fieldwork sync-vps, then fieldwork setup-notify --telegram-bot"
+        fi
+      else
+        security_manual "pending metadata access needs manual sudo verification" "Run: ssh -t $FIELDWORK_SSH_HOST $(shell_double_quote "sudo stat -c '%U:%G %a' /var/lib/fieldwork-pr-broker/pending-meta && sudo -u fieldwork-bot sh -c 'for path in /var/lib/fieldwork-pr-broker/pending-meta/*.json; do test ! -e \"\$path\" || test -r \"\$path\" || exit 1; done'"). Expected: fieldwork-pr-broker:fieldwork-bot 2750, then exit 0"
+      fi
+    fi
+
     # File presence + owner/mode is necessary but NOT sufficient. A stale or
     # dangling Unix socket bind (kernel listener with no accepting process, or
     # an inode the broker no longer maps to the on-disk path) can pass stat
@@ -280,20 +316,20 @@ EOF
 
     # Live connect probe, must run as the bot user so we exercise the same
     # uid path the daemon uses when handling Telegram callbacks. POST {} to
-    # /approve; the broker validates the JSON shape and returns the
-    # well-known error `approve request missing required field: ...` (set at
-    # lib/broker/server.py:598). Matching that single stable substring proves
-    # the path resolves, connect() succeeds, the broker is accepting on this
-    # fd, and the bot user has SocketGroup access. All in one shot.
+    # /approve; the broker validates the JSON shape and returns the structured
+    # protocol-v2 error `{"error":"invalid_approval",...}`. Matching that
+    # stable error code proves the path resolves, connect() succeeds, the
+    # broker is accepting on this fd, and the bot user has SocketGroup access.
+    # All in one shot.
     if [ "$approve_file_ok" = "1" ] && [ "$bot_user_exists" = "1" ]; then
       if ssh "$FIELDWORK_SSH_HOST" "sudo -n -u fieldwork-bot true 2>/dev/null" >/dev/null 2>&1; then
-        if ssh "$FIELDWORK_SSH_HOST" "sudo -n -u fieldwork-bot curl -sS --unix-socket /run/fieldwork-pr-broker/fieldwork-pr-approve.sock -H 'Content-Type: application/json' --data-binary '{}' http://localhost/approve 2>/dev/null | grep -Fq 'approve request missing required field'" >/dev/null 2>&1; then
+        if ssh "$FIELDWORK_SSH_HOST" "sudo -n -u fieldwork-bot curl -sS --unix-socket /run/fieldwork-pr-broker/fieldwork-pr-approve.sock -H 'Content-Type: application/json' --data-binary '{}' http://localhost/approve 2>/dev/null | grep -Fq '\"error\":\"invalid_approval\"'" >/dev/null 2>&1; then
           security_ok "approve socket connect as fieldwork-bot: ok"
         else
           security_fail "approve socket connect as fieldwork-bot: failed" "$approve_restart_hint"
         fi
       else
-        security_manual "approve socket connect probe needs manual sudo verification" "Run: ssh -t $FIELDWORK_SSH_HOST $(shell_double_quote "sudo -u fieldwork-bot curl -sS --unix-socket /run/fieldwork-pr-broker/fieldwork-pr-approve.sock -H 'Content-Type: application/json' --data-binary '{}' http://localhost/approve"). Expected output contains: approve request missing required field"
+        security_manual "approve socket connect probe needs manual sudo verification" "Run: ssh -t $FIELDWORK_SSH_HOST $(shell_double_quote "sudo -u fieldwork-bot curl -sS --unix-socket /run/fieldwork-pr-broker/fieldwork-pr-approve.sock -H 'Content-Type: application/json' --data-binary '{}' http://localhost/approve"). Expected output contains: \"error\":\"invalid_approval\""
       fi
     fi
 
@@ -346,10 +382,10 @@ EOF
     security_ok "no obvious public 22/tcp allow rule in ufw"
   fi
 
-  if ssh "$FIELDWORK_SSH_HOST" "if grep -RqsE 'notify\\.env|NTFY_TOPIC|TG_BOT_TOKEN' ~/.config/systemd/user/fieldwork-agent@.service ~/.config/systemd/user/fieldwork-agent@.service.d 2>/dev/null; then exit 1; else exit 0; fi" >/dev/null 2>&1; then
+  if ssh "$FIELDWORK_SSH_HOST" "if grep -qsE 'notify\\.env|NTFY_TOPIC|TG_BOT_TOKEN' /etc/systemd/system/fieldwork-agent@.service 2>/dev/null; then exit 1; else exit 0; fi" >/dev/null 2>&1; then
     security_ok "notification secrets are not injected into Claude systemd unit"
   else
-    security_fail "notification secrets appear in Claude systemd unit config" "Remove notify.env or token variables from ~/.config/systemd/user/fieldwork-agent@.service, then run systemctl --user daemon-reload."
+    security_fail "notification secrets appear in Claude systemd unit config" "Remove token variables from /etc/systemd/system/fieldwork-agent@.service, then run sudo systemctl daemon-reload."
   fi
 
   if [ -n "$slug" ]; then

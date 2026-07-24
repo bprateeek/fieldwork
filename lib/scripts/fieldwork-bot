@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3 -I
 """fieldwork-bot — Telegram approval-gate daemon.
 
 Runs as the unprivileged `fieldwork-bot` system user. Watches the broker's
@@ -46,7 +46,8 @@ except ImportError:
 
 CONFIG_PATH = os.environ.get("FIELDWORK_BOT_CONFIG_PATH", "/etc/fieldwork-bot/config.toml")
 SECRET_PATH = os.environ.get("FIELDWORK_BOT_SECRET_PATH", "/etc/fieldwork-bot/secret")
-PENDING_DIR = os.environ.get("FIELDWORK_BOT_PENDING_DIR", "/var/lib/fieldwork-pr-broker/pending")
+PENDING_DIR = os.environ.get("FIELDWORK_BOT_PENDING_META_DIR", "/var/lib/fieldwork-pr-broker/pending-meta")
+PENDING_SIDECAR_DIR = os.environ.get("FIELDWORK_BOT_PENDING_SIDECAR_DIR", "/var/lib/fieldwork-pr-broker/pending-sidecar")
 NOTIFICATIONS_DIR = os.environ.get(
     "FIELDWORK_BOT_NOTIFICATIONS_DIR",
     "/var/lib/fieldwork-pr-broker/notifications",
@@ -178,17 +179,23 @@ def telegram_call(token: str, method: str, payload: dict, timeout: int = 15) -> 
 
 def send_approval_message(token: str, chat_id: int, record: dict, secret: bytes) -> int | None:
     """Sends the Telegram message; returns the sent message_id, or None on failure."""
-    repo = record.get("repo", "unknown")
-    branch = record.get("branch", "?")
-    title = record.get("title", "(no title)")
-    expires_at = record.get("expires_at", "?")
-    request_id = record["request_id"]
+    request_id = record.get("request_id")
+    slug = record.get("slug")
+    if (
+        not isinstance(request_id, str)
+        or not re.fullmatch(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+            request_id,
+        )
+        or not isinstance(slug, str)
+        or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,30}", slug)
+        or record.get("state") != "queued"
+    ):
+        log.warning("refusing malformed pending approval record")
+        return None
     text = (
-        f"🛡 Approval needed\n"
-        f"Repo: {repo}\n"
-        f"Branch: {branch}\n"
-        f"Title: {title}\n"
-        f"Expires: {expires_at} (UTC)\n"
+        "🛡 Fieldwork approval needed\n"
+        f"Repository: {slug}\n"
         f"Request ID: {request_id}"
     )
     keyboard = {
@@ -236,11 +243,11 @@ def answer_callback(token: str, callback_query_id: str, text: str = "") -> None:
 def write_sidecar(request_id: str, chats: list[tuple[int, int]]) -> None:
     """Records that we sent the approval prompt — survives a bot restart.
 
-    Stored as ``pending/<rid>.json.notified`` next to the broker's pending
-    file. Group-writable by fieldwork-bot via the dir's mode 0770 +
-    setgid. The broker removes both files on /approve / /deny.
+    Stored as ``pending-sidecar/<rid>.notified.json`` separately from the
+    broker-owned metadata. Group-writable by fieldwork-bot via the directory's
+    mode 2770. The broker removes both files on /approve / /deny.
     """
-    path = Path(PENDING_DIR) / f"{request_id}.json.notified"
+    path = Path(PENDING_SIDECAR_DIR) / f"{request_id}.notified.json"
     payload = {"sent_at": _utcnow_iso(), "chats": [[c, m] for c, m in chats]}
     with open(path, "w") as f:
         json.dump(payload, f, sort_keys=True)
@@ -252,7 +259,7 @@ def write_sidecar(request_id: str, chats: list[tuple[int, int]]) -> None:
 
 def read_sidecar(request_id: str) -> dict | None:
     try:
-        with open(Path(PENDING_DIR) / f"{request_id}.json.notified") as f:
+        with open(Path(PENDING_SIDECAR_DIR) / f"{request_id}.notified.json") as f:
             return json.load(f)
     except FileNotFoundError:
         return None
@@ -282,21 +289,39 @@ def list_notifications() -> list[Path]:
 
 
 def parse_notification_payload(payload: object) -> tuple[str | None, str | None]:
-    """Return (text, dedupe_key) for legacy and versioned notification drops."""
+    """Render the closed, typed notification contract from fixed templates."""
     if not isinstance(payload, dict):
         return None, None
-    text = payload.get("text")
-    if not isinstance(text, str) or not text:
+    allowed = {"schema_version", "event", "request_id", "slug", "error_code"}
+    if set(payload) - allowed or payload.get("schema_version") != 1:
         return None, None
-    schema = payload.get("schema")
-    if schema is None:
-        return text, None
-    if schema != 1:
+    required = {"schema_version", "event", "request_id", "slug"}
+    if not required.issubset(payload):
         return None, None
-    dedupe_key = payload.get("dedupe_key")
-    if not isinstance(dedupe_key, str) or not dedupe_key:
-        dedupe_key = None
-    return text, dedupe_key
+    event = payload.get("event")
+    request_id = payload.get("request_id")
+    slug = payload.get("slug")
+    if event not in {"queued", "approved", "denied", "pushed", "pr_created", "error"}:
+        return None, None
+    if not isinstance(request_id, str) or not re.fullmatch(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+        request_id,
+    ):
+        return None, None
+    if not isinstance(slug, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,30}", slug):
+        return None, None
+    error_code = payload.get("error_code")
+    if error_code is not None and (not isinstance(error_code, str) or not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", error_code)):
+        return None, None
+    templates = {
+        "queued": "Fieldwork request queued for approval.",
+        "approved": "Fieldwork request approved.",
+        "denied": "Fieldwork request denied.",
+        "pushed": "Fieldwork branch pushed.",
+        "pr_created": "Fieldwork pull request created.",
+        "error": "Fieldwork request could not be completed.",
+    }
+    return f"{templates[event]}\nRepository: {slug}\nRequest ID: {request_id}", f"{event}:{request_id}"
 
 
 def load_dedupe_store(now: float | None = None) -> dict[str, float]:
@@ -373,7 +398,7 @@ def pending_health_summary() -> tuple[int, int | None, list[dict]]:
         request_id = record.get("request_id", path.stem)
         if not isinstance(request_id, str):
             request_id = path.stem
-        repo = record.get("repo", "unknown")
+        repo = record.get("project") or record.get("repo") or record.get("slug") or "unknown"
         branch = record.get("branch", "?")
         age_seconds = _pending_age_seconds(record, path, now)
         summaries.append({
@@ -463,13 +488,7 @@ def process_pending_dir(cfg: dict, secret: bytes) -> int:
 
 
 def process_notifications_dir(cfg: dict) -> int:
-    """Forward outbound notification drop-offs from the agent user.
-
-    File shape: versioned notification envelope or legacy ``{"text": "..."}``
-    (one JSON file per message). The bot deletes the file after sending.
-    Versioned envelopes may carry a ``dedupe_key`` so a restart after a
-    successful delivery does not resend the same drop.
-    """
+    """Render and forward validated typed events; producer text is impossible."""
     sent = 0
     dedupe = load_dedupe_store()
     dedupe_changed = False
@@ -609,13 +628,11 @@ def handle_callback(cfg: dict, secret: bytes, update: dict) -> None:
         return
     if status == 200 and payload.get("ok"):
         if decision == "approve":
-            pr_url = payload.get("url", "")
-            new_text = f"✅ Approved by @{user_name} — {pr_url}".strip()
+            new_text = "✅ Fieldwork request approved."
         else:
-            new_text = f"✋ Denied by @{user_name}"
+            new_text = "✋ Fieldwork request denied."
     else:
-        err = payload.get("error", f"HTTP {status}")
-        new_text = f"⚠️ broker rejected ({decision}): {err}"
+        new_text = "⚠️ Broker could not complete the request."
     edit_message(token, chat_id, message_id, new_text)
 
 
@@ -698,8 +715,7 @@ def handle_message(cfg: dict, update: dict) -> None:
         log.info("/task queued id=%s slug=%s chat=%s user=%s", task_id, slug, chat_id, user_name)
         _reply(token, chat_id, f"✅ queued task {task_id}")
     else:
-        err = proc.stderr.decode("utf-8", "replace").strip()[:200] or "rejected"
-        _reply(token, chat_id, f"⚠️ task rejected: {err}")
+        _reply(token, chat_id, "⚠️ task rejected")
 
 
 def poll_telegram(cfg: dict, secret: bytes, stop: threading.Event) -> None:

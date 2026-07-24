@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# Root-only gate: run the root-owned sandbox probe as the dedicated agent and
+# record the exact pinned Claude digest only on an empirical pass.
+set -euo pipefail
+[ "$(id -u)" -eq 0 ] || { echo "probe recording must run as root" >&2; exit 1; }
+agent_user="${FIELDWORK_REMOTE_USER:-fieldwork}"
+agent_home="$(getent passwd "$agent_user" | cut -d: -f6)"
+[ -n "$agent_home" ] || { echo "agent user is missing" >&2; exit 1; }
+root=/usr/local/lib/fieldwork
+for path in \
+  "$root/claude-pinned" "$root/claude.sha256" \
+  "$root/fieldwork-session-probe" "$root/fieldwork-session-probe-cage" \
+  "$root/empty-mcp.json" /etc/claude-code/managed-settings.json \
+  /usr/local/bin/fieldwork-bash-policy \
+  /usr/local/bin/fieldwork-verify /usr/local/bin/fieldwork-pr-prepare \
+  /usr/local/bin/fieldwork-pr-build /usr/local/bin/fieldwork-pr-upload \
+  /usr/local/sbin/fieldwork-session-probe-record; do
+  mode="$(stat -c '%a' "$path" 2>/dev/null || true)"
+  [ -f "$path" ] && [ ! -L "$path" ] && [ "$(stat -c '%u' "$path")" = 0 ] \
+    && [ -n "$mode" ] && [ $((8#$mode & 8#22)) -eq 0 ] || {
+    echo "untrusted or missing probe asset: $path" >&2
+    exit 1
+  }
+done
+if find /usr/local/share/fieldwork-claude -type l -print -quit | grep -q .; then
+  echo "untrusted symlink in root-owned delivery instructions" >&2
+  exit 1
+fi
+managed_seen=0
+while IFS= read -r path; do
+  mode="$(stat -c '%a' "$path" 2>/dev/null || true)"
+  [ -f "$path" ] && [ ! -L "$path" ] && [ "$(stat -c '%u' "$path")" = 0 ] \
+    && [ -n "$mode" ] && [ $((8#$mode & 8#22)) -eq 0 ] || {
+    echo "untrusted managed instruction asset: $path" >&2
+    exit 1
+  }
+  managed_seen=1
+done < <(find /usr/local/share/fieldwork-claude -type f -print)
+[ "$managed_seen" = 1 ] || { echo "root-owned delivery instructions are missing" >&2; exit 1; }
+echo "Running the pinned Claude hostile probe; this may be silent for up to 180 seconds."
+out="$(
+  /usr/sbin/runuser -u "$agent_user" -- /usr/bin/env -i \
+    HOME="$agent_home" PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+    FIELDWORK_SESSION_PROBE=1 \
+    FIELDWORK_CLAUDE_BIN="$root/claude-pinned" \
+    "$root/fieldwork-session-probe"
+)"
+printf '%s\n' "$out"
+[ "$(printf '%s\n' "$out" | sed -n 's/^probe=//p' | tail -1)" = pass ] || {
+  if printf '%s\n' "$out" | grep -Eq 'authentication_failed|OAuth access token has expired'; then
+    echo "Claude authentication is stale; run: ~/.local/bin/claude login" >&2
+  fi
+  echo "hostile probe did not pass; hard-boundary sessions remain disabled" >&2
+  exit 1
+}
+digest="$(/usr/bin/sha256sum "$root/claude-pinned" | /usr/bin/awk '{print $1}')"
+[ "$digest" = "$(/bin/cat "$root/claude.sha256")" ] || { echo "pinned Claude changed during probe" >&2; exit 1; }
+tmp="$root/.claude.probe.sha256.$$"
+printf '%s\n' "$digest" >"$tmp"
+/bin/chown root:root "$tmp"
+/bin/chmod 0644 "$tmp"
+/bin/mv "$tmp" "$root/claude.probe.sha256"
+echo "Recorded passing hostile probe for Claude digest $digest"

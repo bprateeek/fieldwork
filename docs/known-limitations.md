@@ -6,9 +6,11 @@ so you can decide whether it fits before investing setup time.
 ## Platform
 
 - VPS support is Ubuntu 24.04 only. Other distributions are untested; bootstrap
-  assumes apt, the systemd user manager, and bubblewrap.
-- The local control machine is expected to be macOS or Linux with bash, git, jq,
-  ssh, scp, and rsync.
+  assumes apt, root-owned systemd system units, and bubblewrap.
+- Local hard-boundary mode requires macOS or Linux, Docker, and Claude. Local
+  Codex is unsupported until equivalent managed sandbox controls exist. The
+  unreleased local implementation is not a supported security claim until its
+  external trusted-builder and real-hardware acceptance gate passes.
 
 ## Scope
 
@@ -65,8 +67,10 @@ so you can decide whether it fits before investing setup time.
 - No metrics export or alerting. The broker writes an audit log and
   `fieldwork log` reads it; there is no metrics endpoint or crash alerting.
 - No web UI. Control and status are CLI plus optional Telegram approval.
-- No automatic updates. Upgrades are manual: fetch tags, checkout, run
-  `install.sh`, and re-run `fieldwork doctor`.
+- No automatic updates. Upgrades require signed-tag plus trusted-builder
+  provenance verification and the discrete maintenance transaction.
+- Protocol v2 accepts SHA-1 Git repositories and non-thin packs only. Mature
+  full-pack uploads may exceed the conservative 8 MiB input cap.
 
 See [developer-preview.md](developer-preview.md) for the supported stack and
 [threat-model.md](threat-model.md) for security boundaries and non-goals.

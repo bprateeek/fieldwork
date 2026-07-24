@@ -385,7 +385,7 @@ Expected:
 
 - `claude`, GitHub `gh` when using GitHub, and the projects directory are ready.
 - remote `notify.env` is present.
-- `fieldwork-agent@` user unit is installed.
+- the root-owned `fieldwork-agent@` system unit is installed.
 - PR broker socket is present.
 - temporary passwordless sudo is absent, unless setup has not reached the broker handoff yet.
 - broker token, socket, ledger, systemd hardening, and notification isolation checks pass or print one manual inspection command.

@@ -17,7 +17,7 @@ make_env() {
   local slug="web"
   mkdir -p "$home/.local/bin" "$home/.fieldwork/infra/agents" "$home/.fieldwork/agents" \
            "$home/projects/$slug" "$home/spool/queue" "$home/spool/processing" \
-           "$home/spool/done" "$home/spool/failed" "$home/spool/locks" "$home/notifications"
+           "$home/spool/done" "$home/spool/failed" "$home/spool/locks" "$home/notifications" "$home/client-spool"
 
   # Repo on main with an initial commit + the .fieldwork plumbing.
   git -C "$home/projects/$slug" init -q -b main
@@ -87,7 +87,7 @@ AIDER
   # Fake broker clients.
   cat > "$home/.local/bin/fieldwork-pr-prepare" <<'PREP'
 #!/usr/bin/env bash
-req="$1"; repo="$(git rev-parse --show-toplevel)"
+req="$FIELDWORK_TASK_TEST_SPOOL_ROOT/$1/request.json"; repo="$(git rev-parse --show-toplevel)"
 branch="$(jq -r .branch "$req")"; msg="$(jq -r .message "$req")"
 paths=(); while IFS= read -r p; do paths+=("$p"); done < <(jq -r '.paths[]' "$req")
 G=(git -c core.hooksPath=/dev/null)
@@ -106,12 +106,23 @@ exit "${FAKE_VERIFY_RC:-0}"
 VER
   chmod +x "$home/.local/bin/fieldwork-verify"
 
-  cat > "$home/.local/bin/fieldwork-pr-submit" <<'SUB'
+  cat > "$home/.local/bin/fieldwork-pr-build" <<'BUILD'
 #!/usr/bin/env bash
-printf '%s\n' "${FAKE_SUBMIT_JSON:-{\"ok\":true,\"request_id\":\"r1\",\"url\":\"http://pr/1\"}}"
+printf '%s\n' '11111111-1111-4111-8111-111111111111'
 exit 0
-SUB
-  chmod +x "$home/.local/bin/fieldwork-pr-submit"
+BUILD
+  chmod +x "$home/.local/bin/fieldwork-pr-build"
+
+  cat > "$home/.local/bin/fieldwork-pr-upload" <<'UPLOAD'
+#!/usr/bin/env bash
+if [ "${1:-}" = "--status" ]; then
+  printf '%s\n' "${FAKE_STATUS_JSON:-{\"ok\":true,\"request_id\":\"$2\",\"state\":\"done\",\"url\":\"http://pr/1\"}}"
+else
+  printf '%s\n' "${FAKE_SUBMIT_JSON:-{\"ok\":true,\"request_id\":\"$1\",\"state\":\"done\",\"url\":\"http://pr/1\"}}"
+fi
+exit 0
+UPLOAD
+  chmod +x "$home/.local/bin/fieldwork-pr-upload"
 
   printf '%s\n' "$home"
 }
@@ -127,6 +138,10 @@ run_one() {
   HOME="$home" PATH="$home/.local/bin:$PATH" \
     FIELDWORK_PROJECTS_ROOT="$home/projects" \
     FIELDWORK_TASKS_DIR="$home/spool" \
+    FIELDWORK_TASK_TEST_MODE=1 \
+    FIELDWORK_TASK_TEST_CLIENT_BIN="$home/.local/bin" \
+    FIELDWORK_TASK_TEST_ADAPTERS_DIR="$home/.fieldwork/infra/agents" \
+    FIELDWORK_TASK_TEST_SPOOL_ROOT="$home/client-spool" \
     FIELDWORK_NOTIFICATIONS_DIR="$home/notifications" \
     FIELDWORK_BROKER_AUDIT_LOG="$home/audit.jsonl" \
     FIELDWORK_AIDER_BIN="$home/.local/bin/fake-aider" \
@@ -187,9 +202,8 @@ H="$(make_env gated)"
 touch "$H/projects/web/.fieldwork/approval-gate"
 git -C "$H/projects/web" add .fieldwork/approval-gate
 git -C "$H/projects/web" commit -qm "enable approval gate"
-# submit returns queued; pre-seed the audit log with pr_opened so the wait ends fast
-printf '{"event":"pr_opened","request_id":"r1"}\n' > "$H/audit.jsonl"
-out="$(FAKE_AIDER_MODE=edit FAKE_SUBMIT_JSON='{"ok":true,"queued":true,"request_id":"r1","expires_at":"2099-01-01T00:00:00Z"}' \
+# upload returns queued; the status query then reports done.
+out="$(FAKE_AIDER_MODE=edit FAKE_SUBMIT_JSON='{"ok":true,"queued":true,"state":"queued","request_id":"11111111-1111-4111-8111-111111111111","expires_at":"2099-01-01T00:00:00Z"}' \
   FIELDWORK_TASK_APPROVAL_GRACE=1 run_one "$H")"; rc="${out##*rc=}"
 [ "$rc" = 0 ] && pass "gated approval exits 0" || fail "rc=$rc"
 grep -q '"outcome": "success"' "$H/spool/done/"*/state.json 2>/dev/null && pass "gated success after pr_opened" || fail "gated outcome wrong"
