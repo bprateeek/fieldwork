@@ -1235,6 +1235,7 @@ else
 fi
 
 health_file=""
+health_reader=""
 for candidate in \
   "/var/lib/fieldwork-bot/bot-health.json" \
   "/var/lib/fieldwork-pr-broker/bot-health/health.json" \
@@ -1242,14 +1243,24 @@ for candidate in \
   "$HOME/.local/state/fieldwork/bot-health.json"; do
   if [ -r "$candidate" ]; then
     health_file="$candidate"
+    health_reader="direct"
+    break
+  elif sudo -n -u fieldwork-bot test -r "$candidate" >/dev/null 2>&1; then
+    health_file="$candidate"
+    health_reader="fieldwork-bot"
     break
   fi
 done
 
 if [ -n "$health_file" ]; then
-  FIELDWORK_HEALTH_PATH="$health_file" python3 - <<'PY'
+  if [ "$health_reader" = "fieldwork-bot" ]; then
+    health_command=(sudo -n -u fieldwork-bot python3)
+  else
+    health_command=(python3)
+  fi
+  "${health_command[@]}" - "$health_file" <<'PY'
 import json
-import os
+import sys
 from datetime import datetime, timezone
 
 def emit(key, value=""):
@@ -1271,7 +1282,7 @@ def age(value):
         return ""
     return max(0, int((datetime.now(timezone.utc) - ts).total_seconds()))
 
-path = os.environ["FIELDWORK_HEALTH_PATH"]
+path = sys.argv[1]
 try:
     with open(path) as f:
         payload = json.load(f)

@@ -200,6 +200,11 @@ grep -Fq 'install -o "$broker_user" -g fieldwork-bot -m 0710 -d "$broker_state"'
 grep -Fq 'bot user can traverse and read pending metadata' \
   lib/cli/verify-security.sh
 grep -Fq 'pending_dir="/var/lib/fieldwork-pr-broker/pending-meta"' bin/fieldwork
+grep -Fq 'sudo -n -u fieldwork-bot test -r "$candidate"' bin/fieldwork
+for file in lib/broker/install.sh lib/cli/setup.sh; do
+  grep -Fq 'install -d -o fieldwork-bot -g fieldwork-bot -m 700 /var/lib/fieldwork-bot' "$file" \
+    || die "bot state directory in $file is not private"
+done
 for file in bin/fieldwork lib/cli/verify-security.sh; do
   grep -Fq 'invalid_approval' "$file" \
     || die "approval probe in $file does not recognize protocol-v2 errors"

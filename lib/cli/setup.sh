@@ -2536,7 +2536,7 @@ if [ -f "$src_dir/lib/scripts/fieldwork-task-enqueue" ]; then
   install -o root -g root -m 755 "$src_dir/lib/scripts/fieldwork-task-enqueue" /usr/local/bin/fieldwork-task-enqueue
 fi
 install -o root -g root -m 644 "$bot_unit" /etc/systemd/system/fieldwork-bot.service
-install -o fieldwork-bot -g fieldwork-bot -m 755 -d /var/lib/fieldwork-bot
+install -d -o fieldwork-bot -g fieldwork-bot -m 700 /var/lib/fieldwork-bot
 [ -f /var/log/fieldwork-bot.log ] || install -o fieldwork-bot -g fieldwork-bot -m 640 /dev/null /var/log/fieldwork-bot.log
 
 # Repair the protocol-v2 broker traversal and shared-directory permissions.

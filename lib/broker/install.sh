@@ -65,7 +65,7 @@ install -d -o "$BROKER_USER" -g "$BROKER_BOT_GROUP" -m 750 "$STATE_DIR/pending-m
 install -d -o "$BROKER_USER" -g "$BROKER_BOT_GROUP" -m 2770 \
   "$STATE_DIR/pending-sidecar" "$STATE_DIR/notifications"
 install -d -o root -g fieldwork-bot -m 0750 /etc/fieldwork-bot
-install -d -o fieldwork-bot -g fieldwork-bot -m 0700 /var/lib/fieldwork-bot
+install -d -o fieldwork-bot -g fieldwork-bot -m 700 /var/lib/fieldwork-bot
 
 # Clearing an extended ACL restores its underlying group bits. Reassert the
 # group-readable/writable modes required by the bot for any durable files that
