@@ -147,6 +147,9 @@ grep -Fq 'ExecStart=/usr/local/lib/fieldwork/fieldwork-agent-session' lib/system
 grep -Fq '/usr/local/lib/fieldwork/agents/' lib/scripts/fieldwork-agent-session
 grep -Fq 'managed_settings=/etc/claude-code/managed-settings.json' lib/agents/claude-remote-control
 ! grep -Fq -- '--sandbox' lib/agents/claude-remote-control
+grep -Fq 'agent unit must allow AF_NETLINK for sandbox loopback' lib/agents/claude-remote-control
+grep -Fq 'AF_NETLINK is unavailable at runtime; sandbox loopback cannot start' lib/agents/claude-remote-control
+grep -Fxq 'RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK' lib/systemd/fieldwork-agent@.service
 grep -Fq -- 'claude-remote-control --check' bin/fieldwork lib/cli/setup.sh
 jq -e '
   .sandbox.enabled == true

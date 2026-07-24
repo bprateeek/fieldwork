@@ -53,6 +53,27 @@ managed_settings=/etc/claude-code/managed-settings.json
   exit 1
 }
 
+agent_unit=/etc/systemd/system/fieldwork-agent@.service
+agent_families="$(
+  /bin/sed -n 's/^RestrictAddressFamilies=//p' "$agent_unit" 2>/dev/null \
+    | /usr/bin/tail -1
+)"
+case " $agent_families " in
+  *" AF_NETLINK "*) ;;
+  *)
+    echo "[claude-remote-control] agent unit must allow AF_NETLINK for sandbox loopback" >&2
+    exit 1
+    ;;
+esac
+/usr/bin/python3 -I -c '
+import socket
+s = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, socket.NETLINK_ROUTE)
+s.close()
+' >/dev/null 2>&1 || {
+  echo "[claude-remote-control] AF_NETLINK is unavailable at runtime; sandbox loopback cannot start" >&2
+  exit 1
+}
+
 remote_help="$("$root/claude-pinned" remote-control --help 2>&1)" || {
   echo "[claude-remote-control] pinned Claude remote-control help failed" >&2
   exit 1

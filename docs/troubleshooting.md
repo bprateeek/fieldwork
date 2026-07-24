@@ -381,9 +381,20 @@ and `/usr/local/bin/fieldwork-pr-upload`.
 
 Symptoms:
 
+- Every Claude Bash call fails with
+  `bwrap: loopback: Failed to create NETLINK_ROUTE socket`. Reinstall the
+  root boundary and refresh the repo; `fieldwork-agent@` must allow
+  `AF_NETLINK` so bubblewrap can configure sandbox loopback.
 - `fieldwork-verify` exits `20`.
 - Output mentions `inner-sandbox unavailable`.
 - bwrap reports permission denied or uid map failure.
+
+```sh
+fieldwork sync-vps --yes --force-install
+ssh -t fieldwork-vps \
+  'sudo env FIELDWORK_REMOTE_USER=fieldwork /home/fieldwork/fieldwork/lib/systemd/install-boundary.sh'
+fieldwork refresh <slug>
+```
 
 Check:
 

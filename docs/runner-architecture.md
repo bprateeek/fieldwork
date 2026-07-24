@@ -93,6 +93,11 @@ the remote-control daemon flags supported by the pinned CLI. Root-owned managed
 settings enforce the sandbox, customization lockdown, immutable delivery
 instructions, and exact boundary-client policy.
 
+The agent unit permits `AF_NETLINK` because Claude's bubblewrap sandbox uses a
+`NETLINK_ROUTE` socket to configure loopback inside each isolated network
+namespace. The managed sandbox still starts with an empty outbound-domain
+allowlist.
+
 ## Codex VPS note
 
 VPS Codex may connect to the three fixed Unix sockets through its named socket
