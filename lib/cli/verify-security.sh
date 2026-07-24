@@ -311,20 +311,20 @@ EOF
 
     # Live connect probe, must run as the bot user so we exercise the same
     # uid path the daemon uses when handling Telegram callbacks. POST {} to
-    # /approve; the broker validates the JSON shape and returns the
-    # well-known error `approve request missing required field: ...` (set at
-    # lib/broker/server.py:598). Matching that single stable substring proves
-    # the path resolves, connect() succeeds, the broker is accepting on this
-    # fd, and the bot user has SocketGroup access. All in one shot.
+    # /approve; the broker validates the JSON shape and returns the structured
+    # protocol-v2 error `{"error":"invalid_approval",...}`. Matching that
+    # stable error code proves the path resolves, connect() succeeds, the
+    # broker is accepting on this fd, and the bot user has SocketGroup access.
+    # All in one shot.
     if [ "$approve_file_ok" = "1" ] && [ "$bot_user_exists" = "1" ]; then
       if ssh "$FIELDWORK_SSH_HOST" "sudo -n -u fieldwork-bot true 2>/dev/null" >/dev/null 2>&1; then
-        if ssh "$FIELDWORK_SSH_HOST" "sudo -n -u fieldwork-bot curl -sS --unix-socket /run/fieldwork-pr-broker/fieldwork-pr-approve.sock -H 'Content-Type: application/json' --data-binary '{}' http://localhost/approve 2>/dev/null | grep -Fq 'approve request missing required field'" >/dev/null 2>&1; then
+        if ssh "$FIELDWORK_SSH_HOST" "sudo -n -u fieldwork-bot curl -sS --unix-socket /run/fieldwork-pr-broker/fieldwork-pr-approve.sock -H 'Content-Type: application/json' --data-binary '{}' http://localhost/approve 2>/dev/null | grep -Fq '\"error\":\"invalid_approval\"'" >/dev/null 2>&1; then
           security_ok "approve socket connect as fieldwork-bot: ok"
         else
           security_fail "approve socket connect as fieldwork-bot: failed" "$approve_restart_hint"
         fi
       else
-        security_manual "approve socket connect probe needs manual sudo verification" "Run: ssh -t $FIELDWORK_SSH_HOST $(shell_double_quote "sudo -u fieldwork-bot curl -sS --unix-socket /run/fieldwork-pr-broker/fieldwork-pr-approve.sock -H 'Content-Type: application/json' --data-binary '{}' http://localhost/approve"). Expected output contains: approve request missing required field"
+        security_manual "approve socket connect probe needs manual sudo verification" "Run: ssh -t $FIELDWORK_SSH_HOST $(shell_double_quote "sudo -u fieldwork-bot curl -sS --unix-socket /run/fieldwork-pr-broker/fieldwork-pr-approve.sock -H 'Content-Type: application/json' --data-binary '{}' http://localhost/approve"). Expected output contains: \"error\":\"invalid_approval\""
       fi
     fi
 

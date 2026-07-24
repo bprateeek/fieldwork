@@ -199,6 +199,13 @@ grep -Fq 'install -o "$broker_user" -g fieldwork-bot -m 0710 -d "$broker_state"'
   lib/cli/setup.sh
 grep -Fq 'bot user can traverse and read pending metadata' \
   lib/cli/verify-security.sh
+grep -Fq 'pending_dir="/var/lib/fieldwork-pr-broker/pending-meta"' bin/fieldwork
+for file in bin/fieldwork lib/cli/verify-security.sh; do
+  grep -Fq 'invalid_approval' "$file" \
+    || die "approval probe in $file does not recognize protocol-v2 errors"
+done
+! grep -Fq 'approve request missing required field' \
+  bin/fieldwork lib/cli/verify-security.sh
 for name in pending-meta pending-sidecar notifications; do
   grep -Fq "\"\$broker_state/$name\"" lib/cli/setup.sh \
     || die "Telegram bot repair omits protocol-v2 $name"

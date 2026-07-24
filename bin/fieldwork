@@ -1184,7 +1184,7 @@ emit SERVICE_STATE "$service_state"
 
 broker_socket="/run/fieldwork-pr-broker/fieldwork-pr.sock"
 approve_socket="/run/fieldwork-pr-broker/fieldwork-pr-approve.sock"
-pending_dir="/var/lib/fieldwork-pr-broker/pending"
+pending_dir="/var/lib/fieldwork-pr-broker/pending-meta"
 
 if [ -S "$broker_socket" ] && printf '{}' | curl -sS --max-time 3 --unix-socket "$broker_socket" -H 'Content-Type: application/json' --data-binary @- http://localhost/preflight 2>/dev/null | grep -Fq '"error":"invalid_preflight_request"'; then
   emit BROKER_SUBMIT_STATUS ok
@@ -1201,7 +1201,7 @@ if [ ! -S "$approve_socket" ]; then
   emit APPROVE_SOCKET_STATUS bad
   emit APPROVE_SOCKET_DETAIL "socket missing"
 elif sudo -n -u fieldwork-bot true >/dev/null 2>&1; then
-  if sudo -n -u fieldwork-bot curl -sS --max-time 3 --unix-socket "$approve_socket" -H 'Content-Type: application/json' --data-binary '{}' http://localhost/approve 2>/dev/null | grep -Fq 'approve request missing required field'; then
+  if sudo -n -u fieldwork-bot curl -sS --max-time 3 --unix-socket "$approve_socket" -H 'Content-Type: application/json' --data-binary '{}' http://localhost/approve 2>/dev/null | grep -Fq '"error":"invalid_approval"'; then
     emit APPROVE_SOCKET_STATUS ok
     emit APPROVE_SOCKET_DETAIL reachable
   else
