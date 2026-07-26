@@ -49,6 +49,25 @@ if command -v shasum >/dev/null 2>&1; then ACTUAL="$(shasum -a 256 "$CLAUDE" | a
 [ "$ACTUAL" = "$EXPECTED" ] || { echo "pinned Claude digest changed; rerun the hostile probe before launch" >&2; exit 1; }
 repo="${1:-}"
 case "$(uname -s)" in Darwin) HOME_DIR=/Users/fieldwork-agent; PROJECTS=/Users/Shared/Fieldwork/projects ;; Linux) HOME_DIR=/home/fieldwork-agent; PROJECTS=/srv/fieldwork/projects ;; esac
+auth_env=()
+if [ "$repo" = "--ci-oauth-token-file" ]; then
+  [ "$(uname -s)" = Linux ] || { echo "CI OAuth token files are supported only by the Linux acceptance runner" >&2; exit 1; }
+  token_file="${2:-}"
+  case "$token_file" in /*) ;; *) echo "CI OAuth token file must be an absolute path" >&2; exit 1 ;; esac
+  [ -f "$token_file" ] && [ ! -L "$token_file" ] || { echo "CI OAuth token file is missing or unsafe" >&2; exit 1; }
+  token_owner="$(stat -c '%u' "$token_file")"
+  token_mode="$(stat -c '%a' "$token_file")"
+  [ "$token_owner $token_mode" = "0 600" ] || { echo "CI OAuth token file must be root-owned mode 0600" >&2; exit 1; }
+  token_size="$(stat -c '%s' "$token_file")"
+  [ "$token_size" -ge 20 ] && [ "$token_size" -le 8192 ] || { echo "CI OAuth token file has an invalid size" >&2; exit 1; }
+  oauth_token="$(/bin/cat "$token_file")"
+  [ "$token_size" -eq "${#oauth_token}" ] || { echo "CI OAuth token file must not contain a trailing newline" >&2; exit 1; }
+  case "$oauth_token" in *[![:graph:]]*) echo "CI OAuth token file must contain one non-whitespace token" >&2; exit 1 ;; esac
+  auth_env=("CLAUDE_CODE_OAUTH_TOKEN=$oauth_token")
+  shift 2
+  repo="${1:-}"
+  [ "$repo" != "--login" ] || { echo "CI OAuth token files are for noninteractive acceptance sessions" >&2; exit 1; }
+fi
 if [ "$(uname -s)" = Darwin ]; then
   KEYCHAIN_SECRET=/usr/local/etc/fieldwork-agent.keychain-secret
   KEYCHAIN="$HOME_DIR/Library/Keychains/login.keychain-db"
@@ -61,15 +80,17 @@ fi
 if [ "$repo" = "--login" ]; then
   shift
   exec sudo -H -u fieldwork-agent env -i HOME="$HOME_DIR" PATH=/usr/local/bin:/usr/bin:/bin \
-    CLAUDE_CONFIG_DIR="$HOME_DIR/.claude" "$CLAUDE" auth login "$@"
+    CLAUDE_CONFIG_DIR="$HOME_DIR/.claude" CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1 \
+    "$CLAUDE" auth login "$@"
 fi
 PROBED="$(/bin/cat "$ROOT/claude.probe.sha256" 2>/dev/null || true)"
 [ "$PROBED" = "$EXPECTED" ] || { echo "pinned Claude digest is unprobed; run fieldwork-local probe <slug>" >&2; exit 1; }
-[ -n "$repo" ] || { echo "usage: fieldwork-local claude <slug> | --login" >&2; exit 2; }
+[ -n "$repo" ] || { echo "usage: fieldwork-local claude <slug> | --login | --ci-oauth-token-file <absolute-file> <slug>" >&2; exit 2; }
 shift
 cd "$PROJECTS/$repo"
 exec sudo -H -u fieldwork-agent env -i HOME="$HOME_DIR" PATH=/usr/local/bin:/usr/bin:/bin \
   LANG=C.UTF-8 LC_ALL=C.UTF-8 CLAUDE_CONFIG_DIR="$HOME_DIR/.claude" CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 \
+  CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1 "${auth_env[@]}" \
   GIT_AUTHOR_NAME="Fieldwork Agent" GIT_AUTHOR_EMAIL=fieldwork-agent@localhost \
   GIT_COMMITTER_NAME="Fieldwork Agent" GIT_COMMITTER_EMAIL=fieldwork-agent@localhost \
   "$CLAUDE" --setting-sources "" --strict-mcp-config --mcp-config "$ROOT/empty-mcp.json" \

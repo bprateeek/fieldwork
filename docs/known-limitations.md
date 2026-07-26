@@ -7,10 +7,13 @@ so you can decide whether it fits before investing setup time.
 
 - VPS support is Ubuntu 24.04 only. Other distributions are untested; bootstrap
   assumes apt, root-owned systemd system units, and bubblewrap.
-- Local hard-boundary mode requires macOS or Linux, Docker, and Claude. Local
-  Codex is unsupported until equivalent managed sandbox controls exist. The
-  unreleased local implementation is not a supported security claim until its
-  external trusted-builder and real-hardware acceptance gate passes.
+- The local hard-boundary release target is Ubuntu 24.04 Linux with Docker and
+  Claude. Local Codex is unsupported until equivalent managed sandbox controls
+  exist. The Linux implementation is not a supported security claim until its
+  external trusted-builder and real acceptance gate passes. The macOS
+  implementation remains separately unreleased until a disposable real Mac can
+  exercise install, keychain login, hostile probes, reboot persistence,
+  recovery, and uninstall without risking an operator workstation.
 
 ## Scope
 

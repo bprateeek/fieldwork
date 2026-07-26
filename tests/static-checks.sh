@@ -286,6 +286,13 @@ grep -Fq -- '--strict-mcp-config' lib/local/control/fieldwork-local-claude
 grep -Fq 'assert_root_asset' lib/local/control/fieldwork-local-claude
 grep -Fq 'inventory contains a symlink' lib/local/control/fieldwork-local-claude
 grep -Fq 'hard-boundary inventory contains a symlink' lib/local/control/fieldwork-local-probe
+grep -Fq 'CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1' lib/local/control/fieldwork-local-claude lib/local/control/fieldwork-local-probe
+grep -Fq 'CI OAuth token file must be a root-owned mode 0600 regular file' lib/local/control/fieldwork-local-probe
+grep -Fq 'FIELDWORK_OAUTH_ENV_ESCAPE' lib/local/control/fieldwork-local-probe
+grep -Fq 'FIELDWORK_PROC_ENV_ESCAPE' lib/local/control/fieldwork-local-probe
+grep -Fq 'Unreleased Linux acceptance gate' README.md
+grep -Fq 'macOS remains an implementation preview' README.md
+grep -Fq 'macOS provenance and a local hard-boundary security claim remain' docs/supply-chain.md
 grep -Fq 'fieldwork-pr-prepare" "$ROOT/lib/scripts/fieldwork-verify' lib/local/install.sh
 grep -Fq 'fieldwork-bash-policy' lib/local/install.sh lib/systemd/install-boundary.sh
 grep -Fq 'fieldwork-excluded-client-policy' lib/scripts/fieldwork-session-probe

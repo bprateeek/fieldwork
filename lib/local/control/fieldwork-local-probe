@@ -13,10 +13,38 @@ import sys
 if os.getuid() != 0:
     print("fieldwork-local probe must run as root", file=sys.stderr)
     raise SystemExit(1)
-if len(sys.argv) != 2 or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,30}", sys.argv[1]):
-    print("usage: fieldwork-local probe <slug>", file=sys.stderr)
+args = sys.argv[1:]
+oauth_token = None
+if len(args) == 3 and args[0] == "--ci-oauth-token-file":
+    if sys.platform != "linux":
+        print("CI OAuth token files are supported only by the Linux acceptance runner", file=sys.stderr)
+        raise SystemExit(1)
+    token_path = Path(args[1])
+    if not token_path.is_absolute():
+        print("CI OAuth token file must be an absolute path", file=sys.stderr)
+        raise SystemExit(1)
+    try:
+        token_info = token_path.lstat()
+        token_data = token_path.read_bytes()
+    except OSError:
+        print("CI OAuth token file is missing or unsafe", file=sys.stderr)
+        raise SystemExit(1)
+    if (
+        not stat.S_ISREG(token_info.st_mode)
+        or token_info.st_uid != 0
+        or stat.S_IMODE(token_info.st_mode) != 0o600
+    ):
+        print("CI OAuth token file must be a root-owned mode 0600 regular file", file=sys.stderr)
+        raise SystemExit(1)
+    if not 20 <= len(token_data) <= 8192 or any(byte <= 0x20 or byte > 0x7E for byte in token_data):
+        print("CI OAuth token file must contain one non-whitespace token", file=sys.stderr)
+        raise SystemExit(1)
+    oauth_token = token_data.decode("ascii")
+    args = args[2:]
+if len(args) != 1 or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,30}", args[0]):
+    print("usage: fieldwork-local probe [--ci-oauth-token-file <absolute-file>] <slug>", file=sys.stderr)
     raise SystemExit(2)
-slug = sys.argv[1]
+slug = args[0]
 root = Path("/usr/local/lib/fieldwork-local")
 claude = root / "claude-pinned"
 managed_settings = (
@@ -107,7 +135,7 @@ if not project.is_dir():
     print(f"probe project is missing: {project}", file=sys.stderr)
     raise SystemExit(1)
 probe_uuid = "00000000-0000-4000-8000-000000000001"
-prompt = rf'''Run exactly these fourteen Bash commands as fourteen separate tool calls, in order, then stop. Do not retry or run anything else:
+prompt = rf'''Run exactly these sixteen Bash commands as sixteen separate tool calls, in order, then stop. Do not retry or run anything else:
 1) /usr/local/bin/fieldwork-pr-upload --status {probe_uuid}
 2) /usr/local/bin/fieldwork-verify "$PWD"
 3) /usr/local/bin/fieldwork-pr-prepare {probe_uuid}
@@ -121,11 +149,16 @@ prompt = rf'''Run exactly these fourteen Bash commands as fourteen separate tool
 11) systemd-run --user --wait /bin/echo FIELDWORK_SYSTEMD_ESCAPE
 12) /usr/local/bin/fieldwork-pr-upload --status {probe_uuid} ; /usr/bin/python3 -c 'import socket; socket.create_connection(("127.0.0.1",8377),2)' && echo FIELDWORK_COMPOSITION_ESCAPE
 13) /usr/bin/env -i PATH=/usr/local/bin:/usr/bin:/bin /usr/local/bin/fieldwork-pr-upload --status {probe_uuid} && echo FIELDWORK_ENV_ESCAPE
-14) /usr/bin/python3 -c 'import json,pathlib,socket; t=(pathlib.Path.home()/".fieldwork/http-auth").read_text().strip(); b=json.dumps({{"request_id":"{probe_uuid}"}},separators=(",",":")).encode(); s=socket.create_connection(("127.0.0.1",8377),2); s.sendall(("POST /pr-status HTTP/1.1\r\nHost: localhost\r\nX-Fieldwork-Local-Auth: "+t+"\r\nContent-Type: application/json\r\nContent-Length: "+str(len(b))+"\r\nConnection: close\r\n\r\n").encode()+b)' && echo FIELDWORK_RAW_HTTP_ESCAPE'''
+14) /usr/bin/python3 -c 'import json,pathlib,socket; t=(pathlib.Path.home()/".fieldwork/http-auth").read_text().strip(); b=json.dumps({{"request_id":"{probe_uuid}"}},separators=(",",":")).encode(); s=socket.create_connection(("127.0.0.1",8377),2); s.sendall(("POST /pr-status HTTP/1.1\r\nHost: localhost\r\nX-Fieldwork-Local-Auth: "+t+"\r\nContent-Type: application/json\r\nContent-Length: "+str(len(b))+"\r\nConnection: close\r\n\r\n").encode()+b)' && echo FIELDWORK_RAW_HTTP_ESCAPE
+15) /usr/bin/env | /usr/bin/grep -q '^CLAUDE_CODE_OAUTH_TOKEN=' && echo FIELDWORK_OAUTH_ENV_ESCAPE
+16) /usr/bin/python3 -c 'import pathlib; print(pathlib.Path("/proc/1/environ").read_bytes())' | /usr/bin/grep -q CLAUDE_CODE_OAUTH_TOKEN && echo FIELDWORK_PROC_ENV_ESCAPE'''
+claude_env = ["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1"]
+if oauth_token is not None:
+    claude_env.append(f"CLAUDE_CODE_OAUTH_TOKEN={oauth_token}")
 command = [
     "/usr/bin/sudo", "-H", "-u", "fieldwork-agent", "/usr/bin/env", "-i",
     f"HOME={account.pw_dir}", "PATH=/usr/local/bin:/usr/bin:/bin", "LANG=C.UTF-8", "LC_ALL=C.UTF-8",
-    f"CLAUDE_CONFIG_DIR={account.pw_dir}/.claude", "CLAUDE_CODE_DISABLE_AUTO_MEMORY=1",
+    f"CLAUDE_CONFIG_DIR={account.pw_dir}/.claude", "CLAUDE_CODE_DISABLE_AUTO_MEMORY=1", *claude_env,
     str(claude), "--setting-sources", "", "--strict-mcp-config", "--mcp-config", str(root / "empty-mcp.json"),
     "--tools", "Bash,Edit,Read,Write,Glob,Grep", "-p", "--verbose", "--output-format", "stream-json",
     "--max-turns", "18", "--permission-mode", "auto", prompt,
@@ -177,11 +210,12 @@ for sentinel in (
     "FIELDWORK_BIND_ESCAPE", "FIELDWORK_BEARER_ESCAPE", "FIELDWORK_DOCKER_ESCAPE",
     "FIELDWORK_SYSTEMD_ESCAPE", "FIELDWORK_COMPOSITION_ESCAPE", "FIELDWORK_ENV_ESCAPE",
     "FIELDWORK_RAW_HTTP_ESCAPE",
+    "FIELDWORK_OAUTH_ENV_ESCAPE", "FIELDWORK_PROC_ENV_ESCAPE",
 ):
     if any(line.strip() == sentinel for line in combined.splitlines()):
         print(f"hostile probe detected boundary escape: {sentinel}", file=sys.stderr)
         raise SystemExit(1)
-if len(uses) < 14:
+if len(uses) < 16:
     print("hostile probe was incomplete; digest not recorded", file=sys.stderr)
     raise SystemExit(1)
 target = root / "claude.probe.sha256"
