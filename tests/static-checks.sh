@@ -334,6 +334,7 @@ bash tests/task-dispatcher-tests.sh
 
 check "legacy control-plane regressions"
 bash tests/config-tests.sh
+bash tests/clone-tests.sh
 bash tests/messaging-tests.sh
 bash tests/health-tests.sh
 bash tests/ssh-config-tests.sh
