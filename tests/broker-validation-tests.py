@@ -810,8 +810,13 @@ class BrokerV2Tests(unittest.TestCase):
 
     def test_quarantine_accepts_normal_and_full_non_thin_packs(self):
         remote, work, base, head = self.git_fixture()
-        for common, revs in ((base, f"{head}\n^{base}\n"), (None, f"{head}\n")):
-            with self.subTest(common=common), mock.patch.object(server, "network_git", self.fake_fetch(remote)), mock.patch.object(server, "scan_objects"):
+        cases = (
+            ("delta-with-base", base, f"{head}\n^{base}\n"),
+            ("full-without-base-claim", None, f"{head}\n"),
+            ("full-with-base-claim", base, f"{head}\n"),
+        )
+        for name, common, revs in cases:
+            with self.subTest(name=name), mock.patch.object(server, "network_git", self.fake_fetch(remote)), mock.patch.object(server, "scan_objects"):
                 with server.quarantine(self.quarantine_request(head, common), self.pack(work, revs), self.policy(), server.TOKEN_PATH, server.Deadline.start()) as repo:
                     self.assertTrue((repo / "objects").is_dir())
 
