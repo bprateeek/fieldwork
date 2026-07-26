@@ -123,7 +123,17 @@ def audit_paths() -> list[Path]:
         paths.extend(sorted(parent.glob(f"{audit_log_path.name}.[0-9]*")))
     except OSError:
         pass
-    return [path for path in paths if path.is_file()]
+    regular: list[Path] = []
+    for path in paths:
+        try:
+            if path.is_file():
+                regular.append(path)
+        except OSError:
+            # Protocol v2 deliberately keeps the broker audit private from the
+            # agent identity. Audit-derived PR history is optional; lack of
+            # access must not stop Git-derived journaling and resume context.
+            continue
+    return regular
 
 
 def audit_events_for(slug: str) -> list[dict]:
