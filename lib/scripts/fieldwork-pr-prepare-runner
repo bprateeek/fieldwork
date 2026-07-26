@@ -9,12 +9,11 @@
 # stdout/stderr from the impl are line-tagged and streamed back to the client;
 # a final exit-code frame closes the protocol.
 #
-# Why this layer exists at all: the agent process that calls the root-installed
-# /usr/local/bin/fieldwork-pr-prepare has PR_SET_NO_NEW_PRIVS set
-# and runs inside its own user namespace (claude remote-control --sandbox).
-# Routing the call through this socket-activated unit puts the git work
-# under the root-owned system manager — outside the agent's userns,
-# with NNP clear. Mirror of fieldwork-verify-runner.
+# Why this layer exists at all: the caller inherits PR_SET_NO_NEW_PRIVS from
+# the agent service, and ordinary Bash runs inside the root-managed Claude
+# user-namespace sandbox. Routing the call through this socket-activated unit
+# puts the git work under the root-owned system manager — outside that
+# inherited restriction, with NNP clear. Mirror of fieldwork-verify-runner.
 #
 # Wire protocol (one direction in, one direction out, line-delimited):
 #

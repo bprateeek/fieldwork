@@ -19,9 +19,11 @@ Installed in `/usr/local/bin`:
 - `fieldwork-pr-build`
 - `fieldwork-pr-upload`
 
-The first, second, and fourth clients are isolated Python/socket clients.
-`fieldwork-pr-build` stays sandboxed because it must read Git objects from the
-checkout.
+All four are root-owned boundary clients. The managed Bash hook admits the
+builder only as
+`/usr/local/bin/fieldwork-pr-build .fieldwork/local/pr-build-request.json`;
+the builder scrubs Git configuration and accepts only validated request data
+before writing the untrusted spool.
 
 ## System units
 
@@ -50,7 +52,7 @@ user manager, but no Fieldwork boundary service does.
 Linux uses:
 
 ```text
-/run/user/<uid>/fieldwork/spool/<request-id>/
+/run/fieldwork-agent/spool/<request-id>/
 ```
 
 macOS uses:
@@ -59,8 +61,10 @@ macOS uses:
 /private/var/run/fieldwork/<uid>/spool/<request-id>/
 ```
 
-The macOS LaunchDaemon recreates the volatile root and UID-owned 0700 parent at
-boot. Clients derive the UID with `getuid()`, never an environment variable,
+On Linux, the agent and task-dispatcher units recreate the volatile, agent-owned
+`0700` runtime spool before applying their read-only filesystem namespaces. The
+macOS LaunchDaemon recreates its volatile root and UID-owned `0700` parent at
+boot. Clients derive identity with `getuid()`, never an environment variable,
 and walk every component from the fixed root using no-follow directory opens.
 
 Operation-specific contents are exact:
@@ -86,9 +90,15 @@ checkout path.
 
 `fieldwork-agent-session` accepts a validated adapter name and resolves it only
 under `/usr/local/lib/fieldwork/agents`. An agent-writable adapter or symlink
-cannot influence hard-boundary startup. The Claude adapter launches with empty
-setting sources, strict MCP config, an empty MCP file, and the minimal tool
-allowlist, in addition to root-owned managed settings.
+cannot influence hard-boundary startup. The Claude adapter launches with only
+the remote-control daemon flags supported by the pinned CLI. Root-owned managed
+settings enforce the sandbox, customization lockdown, immutable delivery
+instructions, and exact boundary-client policy.
+
+The agent unit permits `AF_NETLINK` because Claude's bubblewrap sandbox uses a
+`NETLINK_ROUTE` socket to configure loopback inside each isolated network
+namespace. The managed sandbox still starts with an empty outbound-domain
+allowlist.
 
 ## Codex VPS note
 

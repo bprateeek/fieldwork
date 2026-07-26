@@ -44,7 +44,7 @@ settings=json.load(open('lib/local/control/strict-managed-settings.json'))
 assert settings['sandbox']['network']['allowedDomains'] == []
 assert settings['sandbox']['network']['allowManagedDomainsOnly'] is True
 assert settings['disableBypassPermissionsMode'] == 'disable'
-assert '/run/user/*/fieldwork/spool' in settings['sandbox']['filesystem']['allowWrite']
+assert '/run/fieldwork-agent/spool' in settings['sandbox']['filesystem']['allowWrite']
 assert '/private/var/run/fieldwork/*/spool' in settings['sandbox']['filesystem']['allowWrite']
 denied='\n'.join(settings['permissions']['deny'])
 for needle in ('WebFetch','WebSearch','docker','systemd-run','http-auth'):
@@ -133,7 +133,7 @@ grep -Fq 'no subprocess use' lib/scripts/fieldwork-pr-upload
 ! grep -Eq '^import subprocess|from subprocess' lib/scripts/fieldwork-pr-upload
 grep -Fq 'POST /pr-status HTTP/1.1' lib/scripts/fieldwork-pr-upload
 grep -Fq '/private/var/run/fieldwork' lib/scripts/fieldwork-pr-build
-grep -Fq '/run/user' lib/scripts/fieldwork-pr-build
+grep -Fq '/run/fieldwork-agent/spool' lib/scripts/fieldwork-pr-build
 
 check "root-owned system boundary"
 grep -Fq 'ListenStream=/run/fieldwork/fieldwork-verify.sock' lib/systemd/fieldwork-verify-runner.socket
@@ -145,7 +145,32 @@ grep -Fq 'PIPELINE=/usr/local/lib/fieldwork/fieldwork-verify-pipeline' lib/scrip
 grep -Fxq 'Environment=FIELDWORK_PR_PREPARE_STATE_DIR=/var/lib/fieldwork-pr-prepare' lib/systemd/fieldwork-pr-prepare-runner@.service
 grep -Fq 'ExecStart=/usr/local/lib/fieldwork/fieldwork-agent-session' lib/systemd/fieldwork-agent@.service
 grep -Fq '/usr/local/lib/fieldwork/agents/' lib/scripts/fieldwork-agent-session
-grep -Fq -- '--add-dir /usr/local/share/fieldwork-claude' lib/agents/claude-remote-control
+grep -Fq 'managed_settings=/etc/claude-code/managed-settings.json' lib/agents/claude-remote-control
+! grep -Fq -- '--sandbox' lib/agents/claude-remote-control
+grep -Fq 'agent unit must allow AF_NETLINK for sandbox loopback' lib/agents/claude-remote-control
+grep -Fq 'AF_NETLINK is unavailable at runtime; sandbox loopback cannot start' lib/agents/claude-remote-control
+grep -Fq 'private runtime spool is missing or unsafe' lib/agents/claude-remote-control
+grep -Fq 'systemctl restart fieldwork-task-dispatcher.service' lib/systemd/install-boundary.sh
+grep -Fxq 'RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK' lib/systemd/fieldwork-agent@.service
+for unit in lib/systemd/fieldwork-agent@.service lib/systemd/fieldwork-task-dispatcher.service; do
+  grep -Fxq 'RuntimeDirectory=fieldwork-agent/spool' "$unit"
+  grep -Fxq 'RuntimeDirectoryMode=0700' "$unit"
+  grep -Fxq 'RuntimeDirectoryPreserve=yes' "$unit"
+  grep -Eq '^ReadWritePaths=.*(^|[[:space:]])/run/fieldwork-agent/spool([[:space:]]|$)' "$unit"
+done
+grep -Fq -- 'claude-remote-control --check' bin/fieldwork lib/cli/setup.sh
+jq -e '
+  .sandbox.enabled == true
+  and .sandbox.failIfUnavailable == true
+  and .sandbox.allowUnsandboxedCommands == false
+  and .strictPluginOnlyCustomization == true
+  and .disableBundledSkills == true
+  and (.claudeMdExcludes | index("**/CLAUDE.md") != null)
+  and (.claudeMdExcludes | index("**/CLAUDE.local.md") != null)
+  and (.sandbox.excludedCommands | index("/usr/local/bin/fieldwork-pr-build *") != null)
+  and (.claudeMd | contains("fieldwork-pr-build"))
+  and (.claudeMd | contains("fieldwork-pr-upload"))
+' lib/local/control/strict-managed-settings.json >/dev/null
 grep -Fq -- '--setting-sources ""' lib/scripts/fieldwork-session-probe
 grep -Fq -- '--strict-mcp-config' lib/scripts/fieldwork-session-probe
 grep -Fq -- '--add-dir /usr/local/share/fieldwork-claude' lib/scripts/fieldwork-session-probe

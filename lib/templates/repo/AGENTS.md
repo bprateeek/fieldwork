@@ -88,7 +88,7 @@ The prepare runner creates the branch, stages exactly `paths`, commits outside t
 5. Perform the upload phase as exactly two separate top-level calls. First build:
 
 ```bash
-fieldwork-pr-build .fieldwork/local/pr-build-request.json
+/usr/local/bin/fieldwork-pr-build .fieldwork/local/pr-build-request.json
 ```
 
 Then pass the printed UUID to the excluded uploader in a new tool call:

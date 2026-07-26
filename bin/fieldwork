@@ -1993,7 +1993,7 @@ status_for broker_pat_tool sh -c \
    test -f /usr/local/sbin/fieldwork-pr-maintenance-submit &&
    test -f /usr/local/sbin/fieldwork-pr-maintenance-mode &&
    test -f /usr/local/sbin/fieldwork-migrate-instructions'
-status_for broker_thin_client sh -c 'test -x /usr/local/bin/fieldwork-pr-build && test -x /usr/local/bin/fieldwork-pr-upload'
+status_for broker_thin_client sh -c 'test -x /usr/local/bin/fieldwork-pr-build && test -x /usr/local/bin/fieldwork-pr-upload && test -d /run/fieldwork-agent/spool && test -w /run/fieldwork-agent/spool'
 status_for broker_pat_marker test -f "$HOME/.fieldwork/state/broker-pat-confirmed"
 status_for broker_pat_sudo broker_pat_sudo
 broker_pat_sudo_probe
@@ -2892,6 +2892,9 @@ EOF
         ssh "$FIELDWORK_SSH_HOST" "test -f /etc/systemd/system/fieldwork-agent@.service" \
           && doctor_ok "fieldwork-agent@ system unit installed" \
           || doctor_manual "fieldwork-agent@ unit missing; rerun bootstrap after Fieldwork install" "run fieldwork sync-vps, then ssh -t $FIELDWORK_SSH_HOST 'cd ~/fieldwork && ./bin/fieldwork bootstrap-vps'" "the per-repo systemd template is missing" "fieldwork onboard enables fieldwork-agent@<repo> from this template" "run fieldwork sync-vps, then rerun bootstrap-vps on the VPS" "yes"
+        ssh "$FIELDWORK_SSH_HOST" "/usr/local/lib/fieldwork/agents/claude-remote-control --check" >/dev/null 2>&1 \
+          && doctor_ok "Claude remote-control adapter compatible" \
+          || doctor_needs "Claude remote-control adapter incompatible" "fieldwork setup --force-install" "the installed adapter, strict managed sandbox policy, or pinned Claude remote-control flags are incompatible" "a stale CLI flag can leave every mobile session in a restart loop; missing strict sandbox settings must fail closed" "sync and reinstall the current Fieldwork boundary, rerun the hostile probe if prompted, then rerun doctor" "yes"
       else
         doctor_row skipped "fieldwork-agent@ unit" "not configured for Codex-only setup"
       fi
@@ -4087,8 +4090,15 @@ if [ -n "$enter_mono" ] && [ "$enter_mono" != "0" ] && [ -n "$now_mono" ]; then
 fi
 
 sandbox=off
-case "$cmdline $exec_start" in *"--sandbox"*) sandbox=on ;; esac
-[ "$sandbox" = "on" ] || { [ -f "$adapter" ] && grep -q -- '--sandbox' "$adapter" && sandbox=on; }
+managed_settings=/etc/claude-code/managed-settings.json
+if command -v jq >/dev/null 2>&1 \
+  && jq -e '
+    .sandbox.enabled == true
+    and .sandbox.failIfUnavailable == true
+    and .sandbox.allowUnsandboxedCommands == false
+  ' "$managed_settings" >/dev/null 2>&1; then
+  sandbox=on
+fi
 worktree=shared
 case "$cmdline $exec_start" in *"--spawn=worktree"*|*"--spawn worktree"*) worktree=isolated ;; esac
 [ "$worktree" = "isolated" ] || { [ -f "$adapter" ] && grep -q -- '--spawn=worktree' "$adapter" && worktree=isolated; }

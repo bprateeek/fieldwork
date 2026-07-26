@@ -373,15 +373,28 @@ Write and pass the documented request path only:
 
 Do not create a `.claude/local` mirror. Write the prepare request as the only
 file in the private per-UID spool entry, then pass its UUID. The later upload
-phase uses `fieldwork-pr-build` and `/usr/local/bin/fieldwork-pr-upload`.
+phase uses
+`/usr/local/bin/fieldwork-pr-build .fieldwork/local/pr-build-request.json`
+and `/usr/local/bin/fieldwork-pr-upload`.
 
 ## AppArmor, userns, Or bwrap Failures
 
 Symptoms:
 
+- Every Claude Bash call fails with
+  `bwrap: loopback: Failed to create NETLINK_ROUTE socket`. Reinstall the
+  root boundary and refresh the repo; `fieldwork-agent@` must allow
+  `AF_NETLINK` so bubblewrap can configure sandbox loopback.
 - `fieldwork-verify` exits `20`.
 - Output mentions `inner-sandbox unavailable`.
 - bwrap reports permission denied or uid map failure.
+
+```sh
+fieldwork sync-vps --yes --force-install
+ssh -t fieldwork-vps \
+  'sudo env FIELDWORK_REMOTE_USER=fieldwork /home/fieldwork/fieldwork/lib/systemd/install-boundary.sh'
+fieldwork refresh <slug>
+```
 
 Check:
 

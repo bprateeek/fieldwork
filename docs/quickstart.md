@@ -59,7 +59,8 @@ fieldwork start app
 ```
 
 The agent works on a read-only-cloned checkout. After a clean commit it runs
-`fieldwork-pr-build` and then the absolute root-owned uploader. The broker
+`/usr/local/bin/fieldwork-pr-build .fieldwork/local/pr-build-request.json`
+and then the absolute root-owned uploader. The broker
 fetches the operator-wired base, validates the pack in quarantine, and either
 queues or opens the PR/MR.
 

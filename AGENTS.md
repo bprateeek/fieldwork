@@ -7,7 +7,7 @@ Fieldwork is a developer-preview tool for running mobile-driven coding-agent wor
 - Make surgical changes that map directly to the task.
 - Preserve the Claude discovery tree under `.claude/` unless a change explicitly targets Claude behavior.
 - Fieldwork-owned repo state lives under `.fieldwork/`.
-- Escape-side delivery clients are root-owned at `/usr/local/bin`: `fieldwork-verify`, `fieldwork-pr-prepare`, and `fieldwork-pr-upload`. `fieldwork-pr-build` remains sandboxed.
+- Escape-side delivery clients are root-owned at `/usr/local/bin`: `fieldwork-verify`, `fieldwork-pr-prepare`, `fieldwork-pr-build`, and `fieldwork-pr-upload`. The managed hook admits the builder only for `.fieldwork/local/pr-build-request.json`.
 - Never log secrets or put token-shaped values in examples.
 
 ## Verification
@@ -28,10 +28,11 @@ intended change is committed (use the root-owned prepare runner when the agent
 sandbox cannot commit). Then perform the upload phase as two separate top-level
 tool calls:
 
-1. Run `fieldwork-pr-build .fieldwork/local/pr-build-request.json` and record the UUID it prints.
+1. Run `/usr/local/bin/fieldwork-pr-build .fieldwork/local/pr-build-request.json` and record the UUID it prints.
 2. Run `/usr/local/bin/fieldwork-pr-upload <request-id>` as a separate call.
 
 The build input contains `slug`, a `fieldwork/...` branch, `title`, and `body`;
-the builder resolves `head_oid`, creates a non-thin pack, and refuses a dirty
-worktree. Never combine build and upload in one shell command, and never push
-directly—the checkout-blind broker reconstructs, scans, and policy-gates the pack.
+the root-owned builder is admitted only for that fixed request path, resolves
+`head_oid`, creates a non-thin pack, and refuses a dirty worktree. Never combine
+build and upload in one shell command, and never push directly—the
+checkout-blind broker reconstructs, scans, and policy-gates the pack.

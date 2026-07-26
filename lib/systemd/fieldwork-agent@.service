@@ -16,8 +16,14 @@ PrivateTmp=true
 PrivateDevices=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/home/fieldwork/projects/%i /home/fieldwork/.fieldwork /home/fieldwork/.claude /home/fieldwork/.cache
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RuntimeDirectory=fieldwork-agent/spool
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+ReadWritePaths=/home/fieldwork/projects/%i /home/fieldwork/.fieldwork /home/fieldwork/.claude /home/fieldwork/.cache /run/fieldwork-agent/spool
+# Claude's bwrap sandbox uses NETLINK_ROUTE to bring up loopback in its
+# isolated network namespace. Without AF_NETLINK every Bash tool fails before
+# the requested command starts.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 
 [Install]
 WantedBy=multi-user.target

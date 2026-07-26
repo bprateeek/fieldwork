@@ -74,7 +74,7 @@ The agent commits on `fieldwork/...` and writes:
 Then:
 
 ```sh
-fieldwork-pr-build .fieldwork/local/pr-build-request.json
+/usr/local/bin/fieldwork-pr-build .fieldwork/local/pr-build-request.json
 /usr/local/bin/fieldwork-pr-upload <printed-request-id>
 ```
 

@@ -28,7 +28,7 @@ def spool_request(request_id: str) -> bytes:
     if sys.platform == "darwin":
         path = Path("/private/var/run/fieldwork", str(uid), "spool", request_id)
     else:
-        path = Path("/run/user", str(uid), "fieldwork", "spool", request_id)
+        path = Path("/run/fieldwork-agent/spool", request_id)
     fd = os.open("/", os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
     try:
         for component in path.parts[1:]:

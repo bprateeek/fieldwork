@@ -30,7 +30,7 @@ class UploadError(RuntimeError):
 def spool_parent(uid: int) -> Path:
     if sys.platform == "darwin":
         return Path("/private/var/run/fieldwork", str(uid), "spool")
-    return Path("/run/user", str(uid), "fieldwork", "spool")
+    return Path("/run/fieldwork-agent/spool")
 
 
 def _open_dir(path: Path, uid: int) -> int:

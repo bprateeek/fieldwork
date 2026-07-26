@@ -36,6 +36,69 @@ actual="$(/usr/bin/sha256sum "$root/claude-pinned" | /usr/bin/awk '{print $1}')"
   exit 1
 }
 
+managed_settings=/etc/claude-code/managed-settings.json
+/usr/bin/jq -e '
+  .sandbox.enabled == true
+  and .sandbox.failIfUnavailable == true
+  and .sandbox.allowUnsandboxedCommands == false
+  and .strictPluginOnlyCustomization == true
+  and .disableBundledSkills == true
+  and (.claudeMdExcludes | index("**/CLAUDE.md") != null)
+  and (.claudeMdExcludes | index("**/CLAUDE.local.md") != null)
+  and (.sandbox.excludedCommands | index("/usr/local/bin/fieldwork-pr-build *") != null)
+  and (.claudeMd | contains("fieldwork-pr-build"))
+  and (.claudeMd | contains("fieldwork-pr-upload"))
+' "$managed_settings" >/dev/null 2>&1 || {
+  echo "[claude-remote-control] strict managed sandbox policy is missing or invalid" >&2
+  exit 1
+}
+
+agent_unit=/etc/systemd/system/fieldwork-agent@.service
+agent_families="$(
+  /bin/sed -n 's/^RestrictAddressFamilies=//p' "$agent_unit" 2>/dev/null \
+    | /usr/bin/tail -1
+)"
+case " $agent_families " in
+  *" AF_NETLINK "*) ;;
+  *)
+    echo "[claude-remote-control] agent unit must allow AF_NETLINK for sandbox loopback" >&2
+    exit 1
+    ;;
+esac
+/bin/grep -Fxq 'RuntimeDirectory=fieldwork-agent/spool' "$agent_unit" \
+  && /bin/grep -E '^ReadWritePaths=.*(^|[[:space:]])/run/fieldwork-agent/spool([[:space:]]|$)' \
+    "$agent_unit" >/dev/null 2>&1 || {
+  echo "[claude-remote-control] agent unit is missing the private writable runtime spool" >&2
+  exit 1
+}
+spool_meta="$(/usr/bin/stat -c '%u %a' /run/fieldwork-agent/spool 2>/dev/null || true)"
+[ "$spool_meta" = "$(/usr/bin/id -u) 700" ] || {
+  echo "[claude-remote-control] private runtime spool is missing or unsafe" >&2
+  exit 1
+}
+/usr/bin/python3 -I -c '
+import socket
+s = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, socket.NETLINK_ROUTE)
+s.close()
+' >/dev/null 2>&1 || {
+  echo "[claude-remote-control] AF_NETLINK is unavailable at runtime; sandbox loopback cannot start" >&2
+  exit 1
+}
+
+remote_help="$("$root/claude-pinned" remote-control --help 2>&1)" || {
+  echo "[claude-remote-control] pinned Claude remote-control help failed" >&2
+  exit 1
+}
+for required_option in \
+  --name --remote-control-session-name-prefix --spawn --capacity; do
+  printf '%s\n' "$remote_help" | /bin/grep -q -- "$required_option" || {
+    echo "[claude-remote-control] pinned Claude remote-control does not support $required_option" >&2
+    exit 1
+  }
+done
+
+[ "${1:-}" != "--check" ] || exit 0
+
 slug="${1:?agent adapter requires a repo slug}"
 session_name="vps-$slug"
 capacity="${FIELDWORK_AGENT_CAPACITY:-2}"
@@ -45,12 +108,7 @@ esac
 
 export CLAUDE_REMOTE_CONTROL_SESSION_NAME_PREFIX="$session_name"
 exec "$root/claude-pinned" \
-  --setting-sources "" \
-  --strict-mcp-config \
-  --mcp-config /usr/local/lib/fieldwork/empty-mcp.json \
-  --tools "Bash,Edit,Read,Write,Glob,Grep" \
-  --add-dir /usr/local/share/fieldwork-claude \
   remote-control \
   --name "$session_name" \
   --remote-control-session-name-prefix "$session_name" \
-  --sandbox --spawn=worktree --capacity="$capacity"
+  --spawn=worktree --capacity="$capacity"

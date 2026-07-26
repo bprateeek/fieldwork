@@ -16,7 +16,9 @@ REPLACEMENT = '''## Fieldwork Delivery Workflow
 
 Commit every intended change before delivery. If the sandbox cannot commit,
 use the root-owned prepare runner. Then perform the upload phase as two separate
-top-level calls: `fieldwork-pr-build <request-json>` followed by
+top-level calls:
+`/usr/local/bin/fieldwork-pr-build .fieldwork/local/pr-build-request.json`
+followed by
 `/usr/local/bin/fieldwork-pr-upload <request-id>`. Never combine those commands
 and never push directly. The checkout-blind broker reconstructs and scans the
 pack and applies the operator-owned approval policy.
