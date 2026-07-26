@@ -52,7 +52,7 @@ user manager, but no Fieldwork boundary service does.
 Linux uses:
 
 ```text
-/run/user/<uid>/fieldwork/spool/<request-id>/
+/run/fieldwork-agent/spool/<request-id>/
 ```
 
 macOS uses:
@@ -61,8 +61,10 @@ macOS uses:
 /private/var/run/fieldwork/<uid>/spool/<request-id>/
 ```
 
-The macOS LaunchDaemon recreates the volatile root and UID-owned 0700 parent at
-boot. Clients derive the UID with `getuid()`, never an environment variable,
+On Linux, the agent and task-dispatcher units recreate the volatile, agent-owned
+`0700` runtime spool before applying their read-only filesystem namespaces. The
+macOS LaunchDaemon recreates its volatile root and UID-owned `0700` parent at
+boot. Clients derive identity with `getuid()`, never an environment variable,
 and walk every component from the fixed root using no-follow directory opens.
 
 Operation-specific contents are exact:

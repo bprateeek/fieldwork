@@ -15,7 +15,10 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/home/fieldwork/projects /var/lib/fieldwork-tasks
+RuntimeDirectory=fieldwork-agent/spool
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+ReadWritePaths=/home/fieldwork/projects /var/lib/fieldwork-tasks /run/fieldwork-agent/spool
 
 [Install]
 WantedBy=multi-user.target

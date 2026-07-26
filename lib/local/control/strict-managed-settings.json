@@ -70,7 +70,7 @@
       "allowWrite": [
         ".",
         "/private/var/run/fieldwork/*/spool",
-        "/run/user/*/fieldwork/spool"
+        "/run/fieldwork-agent/spool"
       ],
       "denyRead": [
         "~/.claude",

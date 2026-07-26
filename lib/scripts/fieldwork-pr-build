@@ -80,7 +80,7 @@ def git_text(*args: str) -> str:
 def _fixed_spool_parent(uid: int) -> Path:
     if sys.platform == "darwin":
         return Path("/private/var/run/fieldwork", str(uid))
-    return Path("/run/user", str(uid), "fieldwork")
+    return Path("/run/fieldwork-agent")
 
 
 def spool_parent(uid: int | None = None) -> Path:
@@ -147,16 +147,9 @@ def _open_spool_parent(uid: int, test_parent: Path | None) -> int:
             return _mkdir_open(base_fd, "spool", uid)
         finally:
             os.close(base_fd)
-    # systemd creates /run/user/<uid>; the client owns the two private leaves.
-    base_fd = _open_checked_dir(Path("/run/user", str(uid)), uid)
-    try:
-        fieldwork_fd = _mkdir_open(base_fd, "fieldwork", uid)
-    finally:
-        os.close(base_fd)
-    try:
-        return _mkdir_open(fieldwork_fd, "spool", uid)
-    finally:
-        os.close(fieldwork_fd)
+    # The boundary services create this private volatile directory with
+    # RuntimeDirectory before applying their read-only filesystem namespace.
+    return _open_checked_dir(Path("/run/fieldwork-agent/spool"), uid)
 
 
 def _load_input(path: Path) -> dict[str, object]:

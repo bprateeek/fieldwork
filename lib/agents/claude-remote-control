@@ -65,6 +65,17 @@ case " $agent_families " in
     exit 1
     ;;
 esac
+/bin/grep -Fxq 'RuntimeDirectory=fieldwork-agent/spool' "$agent_unit" \
+  && /bin/grep -E '^ReadWritePaths=.*(^|[[:space:]])/run/fieldwork-agent/spool([[:space:]]|$)' \
+    "$agent_unit" >/dev/null 2>&1 || {
+  echo "[claude-remote-control] agent unit is missing the private writable runtime spool" >&2
+  exit 1
+}
+spool_meta="$(/usr/bin/stat -c '%u %a' /run/fieldwork-agent/spool 2>/dev/null || true)"
+[ "$spool_meta" = "$(/usr/bin/id -u) 700" ] || {
+  echo "[claude-remote-control] private runtime spool is missing or unsafe" >&2
+  exit 1
+}
 /usr/bin/python3 -I -c '
 import socket
 s = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, socket.NETLINK_ROUTE)

@@ -329,7 +329,7 @@ def spool_dir(request_id: str) -> Path:
     elif sys.platform == "darwin":
         root = Path("/private/var/run/fieldwork", str(uid), "spool")
     else:
-        root = Path("/run/user", str(uid), "fieldwork", "spool")
+        root = Path("/run/fieldwork-agent/spool")
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(root, 0o700)
     path = root / request_id

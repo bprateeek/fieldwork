@@ -129,4 +129,8 @@ systemctl daemon-reload
 systemctl enable --now \
   fieldwork-verify-runner.socket fieldwork-pr-prepare-runner.socket \
   fieldwork-event-poll.timer fieldwork-task-dispatcher.service
+# `enable --now` does not restart an already-active dispatcher after its
+# filesystem namespace changes. Restart it so the private runtime spool and
+# matching ReadWritePaths mount take effect immediately.
+systemctl restart fieldwork-task-dispatcher.service
 echo "Fieldwork root-owned VPS boundary installed; dashboard remains disabled."

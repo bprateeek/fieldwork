@@ -1993,7 +1993,7 @@ status_for broker_pat_tool sh -c \
    test -f /usr/local/sbin/fieldwork-pr-maintenance-submit &&
    test -f /usr/local/sbin/fieldwork-pr-maintenance-mode &&
    test -f /usr/local/sbin/fieldwork-migrate-instructions'
-status_for broker_thin_client sh -c 'test -x /usr/local/bin/fieldwork-pr-build && test -x /usr/local/bin/fieldwork-pr-upload'
+status_for broker_thin_client sh -c 'test -x /usr/local/bin/fieldwork-pr-build && test -x /usr/local/bin/fieldwork-pr-upload && test -d /run/fieldwork-agent/spool && test -w /run/fieldwork-agent/spool'
 status_for broker_pat_marker test -f "$HOME/.fieldwork/state/broker-pat-confirmed"
 status_for broker_pat_sudo broker_pat_sudo
 broker_pat_sudo_probe

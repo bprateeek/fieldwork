@@ -138,6 +138,16 @@ class ProtocolV2ClientTests(unittest.TestCase):
         try: return builder.build(self.request_file(**updates), parent=self.spool)
         finally: os.chdir(old)
 
+    def test_linux_clients_use_private_systemd_runtime_spool(self):
+        with mock.patch.object(builder.sys, "platform", "linux"):
+            self.assertEqual(
+                builder.spool_parent(1001), Path("/run/fieldwork-agent/spool")
+            )
+        with mock.patch.object(uploader.sys, "platform", "linux"):
+            self.assertEqual(
+                uploader.spool_parent(1001), Path("/run/fieldwork-agent/spool")
+            )
+
     def test_builder_publishes_only_meta_and_nonthin_pack(self):
         request_id = self.build()
         directory = self.spool / request_id

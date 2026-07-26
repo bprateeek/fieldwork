@@ -1398,7 +1398,7 @@ EOF
     elif [ "$FIELDWORK_SETUP_SNAPSHOT_READY" = "1" ] && [ "$FIELDWORK_SETUP_SNAPSHOT_DIRTY" != "1" ]; then
       return 1
     fi
-    ssh "$FIELDWORK_SSH_HOST" "test -x /usr/local/bin/fieldwork-pr-build && test -x /usr/local/bin/fieldwork-pr-upload && test -x /usr/local/bin/fieldwork-bash-policy" >/dev/null 2>&1
+    ssh "$FIELDWORK_SSH_HOST" "test -x /usr/local/bin/fieldwork-pr-build && test -x /usr/local/bin/fieldwork-pr-upload && test -x /usr/local/bin/fieldwork-bash-policy && test -d /run/fieldwork-agent/spool && test -w /run/fieldwork-agent/spool" >/dev/null 2>&1
   }
   broker_install_complete() {
     broker_pat_tool_installed && broker_thin_client_installed
