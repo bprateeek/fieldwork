@@ -15,10 +15,12 @@ opens a pull or merge request.
 
 ### Local hard-boundary mode
 
-> **Unreleased acceptance gate:** the implementation is present for review,
-> but must not be represented as a supported security boundary until the
-> separately protected trusted builder is deployed and the documented real
-> macOS/Linux forge-and-reboot acceptance run has passed.
+> **Unreleased Linux acceptance gate:** the implementation is present for
+> review, but must not be represented as a supported security boundary until
+> the separately protected trusted builder completes the documented real Linux
+> forge, hostile-probe, persistence, reboot, recovery, and uninstall run.
+> macOS remains an implementation preview with no local hard-boundary release
+> claim until a separate real-hardware gate is completed.
 
 Local mode runs the credential-bearing broker in hardened Docker containers and
 launches Claude as a dedicated OS user with root-owned managed policy.
@@ -103,8 +105,9 @@ repository.
 ## Developer preview
 
 Supported today: Ubuntu 24.04 VPS; GitHub; experimental self-managed GitLab;
-Claude; and VPS Codex over SSH. The local macOS/Linux implementation is present
-but remains behind the acceptance gate above.
+Claude; and VPS Codex over SSH. The local Linux implementation remains behind
+the acceptance gate above. The macOS implementation is present for review but
+is not part of the planned Linux local-mode release.
 
 Deferred: local Codex hard-boundary mode, SHA-256 Git repositories, GHES,
 Gitea, team RBAC, and automatic upgrades. See [known limitations](docs/known-limitations.md).

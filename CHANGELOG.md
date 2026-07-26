@@ -15,6 +15,12 @@
 - Add Claude-only local hard-boundary mode with a root-owned control plane,
   hardened broker/bot containers, dedicated OS user, policy helper, pinned
   Claude digest, private per-UID spool, TTY token rotation, and local approval.
+- Scope the initial local hard-boundary release claim to Ubuntu 24.04 Linux;
+  keep macOS unreleased pending a disposable real-hardware gate. Add a
+  root-only, non-persistent CI OAuth-token path whose hostile probe verifies
+  credential scrubbing from Bash and the Linux process view.
+- Recreate the private protocol-v2 runtime spool on Linux install, probe, and
+  Claude launch, and remove its volatile runtime directories during uninstall.
 - Move VPS Fieldwork boundary runners, poller, dispatcher, sessions, clients,
   and adapters to root-owned system units/assets. Disable the dashboard in
   hard-boundary mode; rootless Docker remains a user service.

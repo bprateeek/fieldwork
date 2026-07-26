@@ -42,6 +42,13 @@ fixed hook mode that rewrites harmless marker calls into those exact clients;
 normal agent sessions cannot activate the rewrites, and the probe separately
 feeds a compound client event directly to the root-owned validator.
 
+The protected Linux acceptance runner may pass a dedicated inference-only
+Claude OAuth token to the pinned Claude parent from an absolute root-owned
+`0600` file. Mandatory subprocess credential scrubbing removes it from Bash,
+hooks, and other child environments; the hostile probe also verifies that the
+isolated `/proc` view cannot recover it. The token file is never installed into
+the agent home and is deleted after the acceptance session.
+
 Boundary system units and adapters are root-owned. The systemd user manager is
 not trusted; agent units, dispatcher, poller, and escape runners do not execute
 from its search path. The launcher refuses an incomplete or writable asset

@@ -109,7 +109,10 @@ case "$command_name" in
     case "$decision" in approve|deny) ;; *) echo "decision must be approve or deny" >&2; exit 2 ;; esac
     docker_cmd exec -T broker /usr/local/bin/fieldwork-local-admin "$decision" "$request_id"
     ;;
-  probe) exec "$ROOT/fieldwork-local-probe" "$@" ;;
+  probe)
+    "$ROOT/spool-init"
+    exec "$ROOT/fieldwork-local-probe" "$@"
+    ;;
   maintenance-start)
     docker_cmd stop broker >/dev/null 2>&1 || true
     env -i PATH=/usr/local/bin:/usr/bin:/bin HOME=/var/empty FIELDWORK_BROKER_MAINTENANCE=1 \
@@ -170,6 +173,9 @@ case "$command_name" in
         if [ -f "$managed" ] && /usr/bin/grep -Fq '/usr/local/lib/fieldwork-local/fieldwork-policy-helper' "$managed"; then
           /bin/rm -f "$managed"
         fi
+        agent_uid="$(id -u fieldwork-agent 2>/dev/null || true)"
+        /bin/rm -rf /run/fieldwork-agent
+        [ -z "$agent_uid" ] || /bin/rm -rf "/run/user/$agent_uid"
         /usr/sbin/userdel -r fieldwork-agent >/dev/null 2>&1 || true
         [ "$remove_projects" != 1 ] || /bin/rm -rf /srv/fieldwork/projects
         /bin/rmdir /srv/fieldwork >/dev/null 2>&1 || true

@@ -21,6 +21,9 @@
 
 ## Next
 
+- Complete macOS local hard-boundary acceptance on disposable real hardware:
+  install, dedicated keychain login, hostile probes, reboot persistence,
+  recovery, ordinary-session isolation, and uninstall.
 - Homebrew and Debian packages that absorb the signing-key/provenance bootstrap.
 - Local Codex mode when equivalent managed tool, network, and per-command
   exclusion controls exist.

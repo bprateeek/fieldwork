@@ -22,9 +22,12 @@ repository and pin all of these in the `trusted-builder-dispatch` environment:
 
 The workflow must independently verify the signed source tag, build with fixed
 `git archive` logic without executing candidate release scripts, attest the
-archive, and publish it. Its authenticated macOS/Linux probes run only on a
-restricted ephemeral runner group. The candidate `release.yml` can request
-that workflow but cannot mint provenance or target the runner.
+archive, and publish it. Its authenticated Linux probes run only in a protected
+environment on an ephemeral runner and use a dedicated inference-only Claude
+token plus a forge credential scoped to the smoke repository. The candidate
+`release.yml` can request that workflow but cannot mint provenance or target
+the runner. macOS provenance and a local hard-boundary security claim remain
+deferred until a separate real-hardware acceptance gate exists.
 
 The dispatch inputs are untrusted hints: `source_repository`, `source_ref`,
 `source_event_oid`, and `expected_workflow_sha`. The trusted workflow must check

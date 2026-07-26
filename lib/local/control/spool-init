@@ -9,6 +9,8 @@ case "$(uname -s)" in
     ;;
   Linux)
     install -d -o fieldwork-agent -g "$group" -m 0700 "/run/user/$uid"
+    install -d -o root -g root -m 0755 /run/fieldwork-agent
+    install -d -o fieldwork-agent -g "$group" -m 0700 /run/fieldwork-agent/spool
     ;;
   *) exit 1 ;;
 esac

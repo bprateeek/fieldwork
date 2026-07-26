@@ -2,8 +2,8 @@
 
 ## Local Claude mode
 
-Prerequisites: macOS or Linux, Docker, Git, and Claude. Verify the release
-through both chains in [supply chain](supply-chain.md), then:
+Release target prerequisites: Ubuntu 24.04 Linux, Docker, Git, and Claude.
+Verify the release through both chains in [supply chain](supply-chain.md), then:
 
 ```sh
 sudo env FIELDWORK_CLAUDE_BIN="$(command -v claude)" bash lib/local/install.sh
@@ -15,9 +15,10 @@ sudo fieldwork-local probe app
 sudo fieldwork-local claude app
 ```
 
-Put the checkout in `/Users/Shared/Fieldwork/projects/app` on macOS or
-`/srv/fieldwork/projects/app` on Linux and make it owned by
-`fieldwork-agent`. Wiring defaults to required approval.
+Put the checkout in `/srv/fieldwork/projects/app` and make it owned by
+`fieldwork-agent`. Wiring defaults to required approval. The macOS
+implementation is not included in this release target and remains unreleased
+until its real-hardware acceptance gate is completed.
 
 Inside the dedicated Claude session, commit a `fieldwork/...` branch and use
 the two-call upload contract documented in [local mode](local-mode.md).
