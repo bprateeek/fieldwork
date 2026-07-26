@@ -158,6 +158,10 @@ for unit in lib/systemd/fieldwork-agent@.service lib/systemd/fieldwork-task-disp
   grep -Fxq 'RuntimeDirectoryPreserve=yes' "$unit"
   grep -Eq '^ReadWritePaths=.*(^|[[:space:]])/run/fieldwork-agent/spool([[:space:]]|$)' "$unit"
 done
+grep -Fq 'current_boot_id" != "$previous_boot_id' tests/vps-reboot-runtime-spool-acceptance.sh
+grep -Fq 'findmnt -n -o FSTYPE -T /run' tests/vps-reboot-runtime-spool-acceptance.sh
+grep -Fq "stat -Lc '%U:%G:%a:%F'" tests/vps-reboot-runtime-spool-acceptance.sh
+grep -Fq 'fieldwork-event-poll.service -p Result' tests/vps-reboot-runtime-spool-acceptance.sh
 grep -Fq -- 'claude-remote-control --check' bin/fieldwork lib/cli/setup.sh
 jq -e '
   .sandbox.enabled == true
