@@ -141,7 +141,7 @@ prepare_deploy_key() {
 
   touch "$CONFIG"
   chmod 600 "$CONFIG"
-  if ! grep -q "^Host $HOST_ALIAS\b" "$CONFIG"; then
+  if ! grep -Fqx "Host $HOST_ALIAS" "$CONFIG"; then
     cat >> "$CONFIG" <<EOC
 
 # BEGIN FIELDWORK SSH CONFIG: $HOST_ALIAS

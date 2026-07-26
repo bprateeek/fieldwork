@@ -210,6 +210,24 @@ class EventPollTests(unittest.TestCase):
         self.assertEqual(state["worktrees"][str(linked.resolve())]["base_branch"], "release")
         self.assertTrue((repo / ".git").exists())
 
+    def test_unreadable_audit_path_does_not_stop_git_journaling(self) -> None:
+        repo, linked = self.make_repo()
+        private = self.tmp / "private-broker-state"
+        private.mkdir(mode=0o700)
+        private.chmod(0)
+        try:
+            self.run_poller(extra_env={
+                "FIELDWORK_BROKER_AUDIT_LOG_PATH": str(private / "audit.jsonl"),
+            })
+        finally:
+            private.chmod(0o700)
+
+        state = json.loads((self.home / ".fieldwork/state/events/event-repo.json").read_text())
+        self.assertIn(str(linked.resolve()), state["worktrees"])
+        journal = self.home / ".fieldwork/project-journals/event-repo.md"
+        self.assertIn("fieldwork/test | add feature", journal.read_text())
+        self.assertTrue((repo / ".git").exists())
+
     def test_multiple_concurrent_branches_tracked_independently(self) -> None:
         repo, linked = self.make_repo()
         linked2 = self.add_worktree(repo, "event-repo", "change2", "fieldwork/test2")

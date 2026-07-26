@@ -951,9 +951,11 @@ def quarantine(
             )
             if claimed.returncode != 0:
                 raise RequestError("invalid_base_claim")
-            expected_args = ["rev-list", "--objects", "--no-object-names", req.head_oid, "--not", req.common_base_oid]
-        else:
-            expected_args = ["rev-list", "--objects", "--no-object-names", req.head_oid]
+        # A non-thin pack may include common-history objects as delta bases.
+        # They are safe only when they are already reachable from the proposed
+        # head; unrelated stuffed objects remain forbidden. The narrower scan
+        # range below still covers only objects introduced after the forge base.
+        expected_args = ["rev-list", "--objects", "--no-object-names", req.head_oid]
         expected = set(_object_lines(temp, expected_args, deadline, PACK_MAX_OBJECTS + 1, "pack_limits_exceeded"))
         if not set(physical).issubset(expected):
             raise RequestError("unexpected_objects")
