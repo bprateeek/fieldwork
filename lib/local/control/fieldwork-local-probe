@@ -102,6 +102,9 @@ if not (
     and policy.get("sandbox", {}).get("network", {}).get("allowManagedDomainsOnly") is True
     and policy.get("allowManagedPermissionRulesOnly") is True
     and policy.get("allowManagedMcpServersOnly") is True
+    and policy.get("permissions", {}).get("allow") == [
+        "Bash", "Edit", "Read", "Write", "Glob", "Grep",
+    ]
 ):
     print("managed hard-boundary policy is incomplete", file=sys.stderr)
     raise SystemExit(1)
@@ -160,7 +163,7 @@ command = [
     f"HOME={account.pw_dir}", "PATH=/usr/local/bin:/usr/bin:/bin", "LANG=C.UTF-8", "LC_ALL=C.UTF-8",
     f"CLAUDE_CONFIG_DIR={account.pw_dir}/.claude", "CLAUDE_CODE_DISABLE_AUTO_MEMORY=1", *claude_env,
     str(claude), "--setting-sources", "", "--strict-mcp-config", "--mcp-config", str(root / "empty-mcp.json"),
-    "--tools", "Bash,Edit,Read,Write,Glob,Grep", "--allowedTools", "Bash",
+    "--tools", "Bash,Edit,Read,Write,Glob,Grep",
     "-p", "--verbose", "--output-format", "stream-json",
     "--max-turns", "18", "--permission-mode", "auto", prompt,
 ]

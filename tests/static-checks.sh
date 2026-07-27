@@ -46,6 +46,7 @@ assert settings['sandbox']['network']['allowManagedDomainsOnly'] is True
 assert settings['disableBypassPermissionsMode'] == 'disable'
 assert '/run/fieldwork-agent/spool' in settings['sandbox']['filesystem']['allowWrite']
 assert '/private/var/run/fieldwork/*/spool' in settings['sandbox']['filesystem']['allowWrite']
+assert settings['permissions']['allow'] == ['Bash','Edit','Read','Write','Glob','Grep']
 denied='\n'.join(settings['permissions']['deny'])
 for needle in ('WebFetch','WebSearch','docker','systemd-run','http-auth'):
     assert needle in denied, needle
@@ -287,7 +288,7 @@ grep -Fq 'assert_root_asset' lib/local/control/fieldwork-local-claude
 grep -Fq 'inventory contains a symlink' lib/local/control/fieldwork-local-claude
 grep -Fq 'hard-boundary inventory contains a symlink' lib/local/control/fieldwork-local-probe
 grep -Fq 'CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1' lib/local/control/fieldwork-local-claude lib/local/control/fieldwork-local-probe
-grep -Fq -- '"--allowedTools", "Bash"' lib/local/control/fieldwork-local-probe
+! grep -Fq -- '--allowedTools' lib/local/control/fieldwork-local-probe
 grep -Fq 'CI OAuth token file must be a root-owned mode 0600 regular file' lib/local/control/fieldwork-local-probe
 grep -Fq 'FIELDWORK_OAUTH_ENV_ESCAPE' lib/local/control/fieldwork-local-probe
 grep -Fq 'FIELDWORK_PROC_ENV_ESCAPE' lib/local/control/fieldwork-local-probe

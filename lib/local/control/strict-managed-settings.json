@@ -32,6 +32,14 @@
   "strictKnownMarketplaces": [],
   "strictPluginOnlyCustomization": true,
   "permissions": {
+    "allow": [
+      "Bash",
+      "Edit",
+      "Read",
+      "Write",
+      "Glob",
+      "Grep"
+    ],
     "deny": [
       "WebFetch",
       "WebSearch",

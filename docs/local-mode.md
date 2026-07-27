@@ -17,11 +17,14 @@ Docker access is operator authority. A user that controls Docker can inspect
 the token volume, replace policy, or enter the broker container. The agent must
 not have Docker access.
 
-The dedicated Claude session loads only root-owned managed settings. Bash-child
-network access has an empty managed allowlist, outbound tools and unmanaged MCP
-are unavailable, Docker sockets and the local bearer are unreadable, and only
-the absolute root-owned build/upload/verify/prepare clients may escape the sandbox.
-The launcher refuses symlinked, writable, or digest-changed boundary assets.
+The dedicated Claude session loads only root-owned managed settings. Those
+settings pre-approve normal repository tools so unattended work can proceed;
+managed denies and the Bash policy hook take precedence over that allowlist.
+Bash-child network access has an empty managed allowlist, outbound tools and
+unmanaged MCP are unavailable, Docker sockets and the local bearer are
+unreadable, and only the absolute root-owned build/upload/verify/prepare clients
+may escape the sandbox. The launcher refuses symlinked, writable, or
+digest-changed boundary assets.
 
 Local Codex is not a hard-boundary mode in this release.
 
