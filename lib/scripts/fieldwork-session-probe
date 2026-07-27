@@ -120,7 +120,7 @@ run_claude_probe() {
     --tools "Bash,Edit,Read,Write,Glob,Grep" \
     --add-dir /usr/local/share/fieldwork-claude \
     -p --verbose --output-format stream-json \
-    --max-turns 10 --permission-mode auto "$prompt_text"
+    --max-turns 10 "$prompt_text"
 }
 
 probe_started=$SECONDS

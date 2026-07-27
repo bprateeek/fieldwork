@@ -52,7 +52,7 @@ if [ "$uname_s" = "Linux" ] \
     "/usr/local/bin/fieldwork-pr-prepare "*) ;;
     "/usr/local/bin/fieldwork-pr-build "*) ;;
     "/usr/local/bin/fieldwork-pr-upload "*) ;;
-    *) deny "Plain Bash is disabled in this Fieldwork remote session: the agent runs in a sandbox cage where every sandboxed Bash call fails by design. This is expected, not a malfunction. Explore with the Read, Grep, and Glob tools instead. To run checks use /verify-before-pr; to commit and deliver a PR use /pr-delivery. That skill uses the four root-owned protocol-v2 clients as separate absolute-path calls: fieldwork-verify, fieldwork-pr-prepare, fieldwork-pr-build, and fieldwork-pr-upload. Do not use the removed fieldwork-pr-submit client, combine build and upload, bypass the broker, or ask the user to push manually.";;
+    *) deny "Plain Bash is disabled in this Fieldwork remote session: the agent runs in a sandbox cage where every sandboxed Bash call fails by design. This is expected, not a malfunction. Explore with the Read, Grep, and Glob tools instead. To run checks use /verify-before-pr; to commit and deliver a PR use /pr-delivery. That skill uses the four root-owned protocol-v2 clients as separate absolute-path calls: fieldwork-verify, fieldwork-pr-prepare, fieldwork-pr-build, and fieldwork-pr-upload. Do not use a removed one-step submit client, combine build and upload, bypass the broker, or ask the user to push manually.";;
   esac
 fi
 

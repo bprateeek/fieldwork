@@ -8,6 +8,15 @@ export PYTHONDONTWRITEBYTECODE=1
 
 check() { printf '[checks] %s\n' "$1"; }
 die() { printf '[checks] FAIL: %s\n' "$1" >&2; exit 1; }
+assert_no_match() {
+  local status
+  if "$@"; then
+    die "forbidden pattern matched: $*"
+  else
+    status="$?"
+    [ "$status" -eq 1 ] || die "negative assertion failed with status $status: $*"
+  fi
+}
 
 check "shell syntax"
 while IFS= read -r file; do
@@ -43,7 +52,8 @@ assert set(schema['required']) == set(schema['properties'])
 settings=json.load(open('lib/local/control/strict-managed-settings.json'))
 assert settings['sandbox']['network']['allowedDomains'] == []
 assert settings['sandbox']['network']['allowManagedDomainsOnly'] is True
-assert settings['disableBypassPermissionsMode'] == 'disable'
+assert 'disableBypassPermissionsMode' not in settings
+assert settings['permissions']['disableBypassPermissionsMode'] == 'disable'
 assert '/run/fieldwork-agent/spool' in settings['sandbox']['filesystem']['allowWrite']
 assert '/private/var/run/fieldwork/*/spool' in settings['sandbox']['filesystem']['allowWrite']
 assert settings['permissions']['allow'] == ['Bash','Edit','Read','Write','Glob','Grep']
@@ -86,19 +96,20 @@ done
 
 check "protocol-v1 removal and checkout blindness"
 [ ! -e lib/scripts/fieldwork-pr-submit ] || die "protocol-v1 submitter still exists"
-! grep -R -Fq 'fieldwork-pr-submit' lib/templates/repo
+assert_no_match grep -R -Fq 'fieldwork-pr-submit' lib/templates/repo
 grep -Fq '/usr/local/bin/fieldwork-pr-build .fieldwork/local/pr-build-request.json' \
   lib/templates/repo/.claude/skills/pr-delivery/SKILL.md
 grep -Fq "init PR #\$existing_pr has new local commits" lib/scripts/fieldwork-onboard
-! grep -Eq 'FIELDWORK_BROKER_PROJECTS_ROOT|--projects-root' lib/broker/server.py lib/broker/standalone-install.sh
-! grep -Eq 'repo_path|expected-origin|default-branch|approval-gate' lib/broker/server.py
-! grep -Eq '\bgh\b|gh pr create' lib/broker/server.py lib/broker/standalone-install.sh
+assert_no_match grep -Eq 'FIELDWORK_BROKER_PROJECTS_ROOT|--projects-root' lib/broker/server.py lib/broker/standalone-install.sh
+assert_no_match grep -Eq 'repo_path|expected-origin|default-branch|approval-gate' lib/broker/server.py
+assert_no_match grep -Eq "(^|[[:space:]\"'])gh([[:space:]\"']|$)|gh pr create" \
+  lib/broker/server.py lib/broker/standalone-install.sh
 grep -Fq 'multipart/form-data' lib/broker/server.py
 grep -Fq 'index-pack' lib/broker/server.py
 grep -Fq -- '--strict' lib/broker/server.py
 grep -Fq 'PACK_MAX_INPUT = 8 * 1024 * 1024' lib/broker/server.py
 grep -Fq 'f"--max-input-size={PACK_MAX_INPUT}"' lib/broker/server.py
-! grep -Fq -- '--fix-thin' lib/broker/server.py
+assert_no_match grep -Fq -- '--fix-thin' lib/broker/server.py
 grep -Fq 'unexpected_objects' lib/broker/server.py
 grep -Fq 'branch_update_is_fast_forward' lib/broker/server.py
 grep -Fq 'allow_private_network' lib/broker/server.py
@@ -110,14 +121,14 @@ grep -Fq 'https://downloads.claude.ai/claude-code/apt/stable stable main' \
   lib/templates/repo/.github/workflows/claude-review.yml
 grep -Fq '31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE' \
   lib/templates/repo/.github/workflows/claude-review.yml
-! grep -Fq 'claude.ai/install.sh |' \
+assert_no_match grep -Fq 'claude.ai/install.sh |' \
   lib/templates/repo/.github/workflows/claude-review.yml
 grep -Fq 'socket_type == "maintenance" and not MAINTENANCE' lib/broker/server.py
 grep -Fq '/usr/local/lib/fieldwork-pr-broker' lib/broker/policy_writer.py
 grep -Fq 'os.fchown' lib/broker/policy_writer.py
 
 check "builder and excluded uploader"
-! grep -R -Eq '^#!/usr/bin/env python3 -I$' lib
+assert_no_match grep -R -Eq '^#!/usr/bin/env python3 -I$' lib
 for client in fieldwork-pr-upload fieldwork-pr-prepare fieldwork-verify; do
   head -1 "lib/scripts/$client" | grep -Fxq '#!/usr/bin/python3 -I'
 done
@@ -127,11 +138,11 @@ done
 grep -Fq "/usr/bin/python3 -I - <<'PY'" lib/scripts/fieldwork-event-poll
 grep -Fq 'status", "--porcelain=v1", "-z", "-uall"' lib/scripts/fieldwork-pr-build
 grep -Fq 'pack-objects", "--revs", "--local", "--stdout"' lib/scripts/fieldwork-pr-build
-! grep -Fq -- '--thin' lib/scripts/fieldwork-pr-build
+assert_no_match grep -Fq -- '--thin' lib/scripts/fieldwork-pr-build
 grep -Fq 'objects/info/alternates' lib/scripts/fieldwork-pr-build
 grep -Fq 'object alternates/reference clones are unsupported' <(tr '[:upper:]' '[:lower:]' < lib/scripts/fieldwork-pr-build)
 grep -Fq 'no subprocess use' lib/scripts/fieldwork-pr-upload
-! grep -Eq '^import subprocess|from subprocess' lib/scripts/fieldwork-pr-upload
+assert_no_match grep -Eq '^import subprocess|from subprocess' lib/scripts/fieldwork-pr-upload
 grep -Fq 'POST /pr-status HTTP/1.1' lib/scripts/fieldwork-pr-upload
 grep -Fq '/private/var/run/fieldwork' lib/scripts/fieldwork-pr-build
 grep -Fq '/run/fieldwork-agent/spool' lib/scripts/fieldwork-pr-build
@@ -147,7 +158,7 @@ grep -Fxq 'Environment=FIELDWORK_PR_PREPARE_STATE_DIR=/var/lib/fieldwork-pr-prep
 grep -Fq 'ExecStart=/usr/local/lib/fieldwork/fieldwork-agent-session' lib/systemd/fieldwork-agent@.service
 grep -Fq '/usr/local/lib/fieldwork/agents/' lib/scripts/fieldwork-agent-session
 grep -Fq 'managed_settings=/etc/claude-code/managed-settings.json' lib/agents/claude-remote-control
-! grep -Fq -- '--sandbox' lib/agents/claude-remote-control
+assert_no_match grep -Fq -- '--sandbox' lib/agents/claude-remote-control
 grep -Fq 'agent unit must allow AF_NETLINK for sandbox loopback' lib/agents/claude-remote-control
 grep -Fq 'AF_NETLINK is unavailable at runtime; sandbox loopback cannot start' lib/agents/claude-remote-control
 grep -Fq 'private runtime spool is missing or unsafe' lib/agents/claude-remote-control
@@ -201,7 +212,7 @@ for unit in lib/systemd/fieldwork-{verify-runner,pr-prepare-runner}@.service; do
 done
 grep -Fxq 'RestrictAddressFamilies=AF_UNIX AF_NETLINK' lib/systemd/fieldwork-verify-runner@.service
 grep -Fxq 'CapabilityBoundingSet=' lib/systemd/fieldwork-verify-runner@.service
-! grep -Fxq 'ProtectKernelTunables=true' lib/systemd/fieldwork-verify-runner@.service
+assert_no_match grep -Fxq 'ProtectKernelTunables=true' lib/systemd/fieldwork-verify-runner@.service
 
 check "broker service hardening and maintenance socket"
 for directive in \
@@ -209,11 +220,11 @@ for directive in \
   'MemoryMax=1G' 'TasksMax=128' 'CPUQuota=200%' 'LimitFSIZE=268435456'; do
   grep -Fxq "$directive" lib/broker/fieldwork-pr-broker.service || die "broker unit missing $directive"
 done
-! grep -Fq '/home/fieldwork/projects' lib/broker/fieldwork-pr-broker.service
+assert_no_match grep -Fq '/home/fieldwork/projects' lib/broker/fieldwork-pr-broker.service
 grep -Fxq 'SocketUser=root' lib/broker/fieldwork-pr-broker-maintenance.socket
 grep -Fxq 'SocketGroup=root' lib/broker/fieldwork-pr-broker-maintenance.socket
 grep -Fxq 'SocketMode=0600' lib/broker/fieldwork-pr-broker-maintenance.socket
-! grep -Fq '[Install]' lib/broker/fieldwork-pr-broker-maintenance.socket
+assert_no_match grep -Fxq '[Install]' lib/broker/fieldwork-pr-broker-maintenance.socket
 grep -Fq 'FIELDWORK_BROKER_MAINTENANCE' lib/broker/server.py
 
 check "split durable stores and bot least privilege"
@@ -250,21 +261,21 @@ for file in bin/fieldwork lib/cli/verify-security.sh; do
   grep -Fq 'invalid_approval' "$file" \
     || die "approval probe in $file does not recognize protocol-v2 errors"
 done
-! grep -Fq 'approve request missing required field' \
+assert_no_match grep -Fq 'approve request missing required field' \
   bin/fieldwork lib/cli/verify-security.sh
 for name in pending-meta pending-sidecar notifications; do
   grep -Fq "\"\$broker_state/$name\"" lib/cli/setup.sh \
     || die "Telegram bot repair omits protocol-v2 $name"
 done
-! grep -Fq '"$broker_state/pending"' lib/cli/setup.sh
+assert_no_match grep -Fq '"$broker_state/pending"' lib/cli/setup.sh
 bot_block="$(awk '/^  bot:/{flag=1} /^  telegram-config:/{flag=0} flag' lib/local/docker-compose.yml)"
 case "$bot_block" in *fieldwork-local-token*|*fieldwork-local-policy:*|*fieldwork-local-pack:*|*fieldwork-local-auth:*|*docker.sock*) die "bot has forbidden mount" ;; esac
 for mount in fieldwork-local-meta fieldwork-local-sidecar fieldwork-local-notifications fieldwork-local-approve fieldwork-local-bot-state; do
   case "$bot_block" in *"$mount"*) ;; *) die "bot missing $mount" ;; esac
 done
 grep -Fq 'allowed = {"schema_version", "event", "request_id", "slug", "error_code"}' lib/scripts/fieldwork-bot
-! grep -Fq 'payload.get("text")' lib/scripts/fieldwork-bot
-! grep -Fq "payload.get('text')" lib/scripts/fieldwork-bot
+assert_no_match grep -Fq 'payload.get("text")' lib/scripts/fieldwork-bot
+assert_no_match grep -Fq "payload.get('text')" lib/scripts/fieldwork-bot
 
 check "local hard boundary"
 grep -Eq '^FROM .+@sha256:[0-9a-f]{64}$' lib/local/Dockerfile
@@ -272,8 +283,8 @@ grep -Eq '^ARG GIT_SHA_AMD64=[0-9a-f]{64}$' lib/local/Dockerfile
 grep -Eq '^ARG GIT_SHA_ARM64=[0-9a-f]{64}$' lib/local/Dockerfile
 grep -Eq '^ARG GITLEAKS_SHA_AMD64=[0-9a-f]{64}$' lib/local/Dockerfile
 grep -Eq '^ARG GITLEAKS_SHA_ARM64=[0-9a-f]{64}$' lib/local/Dockerfile
-! grep -Eq 'apt-get install[^\\]*[[:space:]]git([[:space:]]|$)' lib/local/Dockerfile
-! grep -Eq '(^|[[:space:]])gh([[:space:]]|$)' lib/local/Dockerfile
+assert_no_match grep -Eq 'apt-get install[^\\]*[[:space:]]git([[:space:]]|$)' lib/local/Dockerfile
+assert_no_match grep -Eq '(^|[[:space:]])gh([[:space:]]|$)' lib/local/Dockerfile
 grep -Fq 'unsafe pending MAC-key path' lib/local/entrypoint.sh
 grep -Fq 'unsafe pending MAC-key path' lib/broker/install.sh
 for service in broker bot; do
@@ -288,7 +299,15 @@ grep -Fq 'assert_root_asset' lib/local/control/fieldwork-local-claude
 grep -Fq 'inventory contains a symlink' lib/local/control/fieldwork-local-claude
 grep -Fq 'hard-boundary inventory contains a symlink' lib/local/control/fieldwork-local-probe
 grep -Fq 'CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1' lib/local/control/fieldwork-local-claude lib/local/control/fieldwork-local-probe
-! grep -Fq -- '--allowedTools' lib/local/control/fieldwork-local-probe
+if grep -Fq -- '--allowedTools' lib/local/control/fieldwork-local-probe; then
+  echo "local probe contains a forbidden CLI permission allowlist" >&2
+  exit 1
+fi
+if grep -Fq -- '--permission-mode auto' lib/local/control/fieldwork-local-probe lib/scripts/fieldwork-session-probe; then
+  echo "a Claude boundary probe contains the forbidden auto permission mode" >&2
+  exit 1
+fi
+grep -Fq 'FIELDWORK_SESSION_PROBE=1' lib/local/control/fieldwork-local-probe
 grep -Fq 'CI OAuth token file must be a root-owned mode 0600 regular file' lib/local/control/fieldwork-local-probe
 grep -Fq 'FIELDWORK_OAUTH_ENV_ESCAPE' lib/local/control/fieldwork-local-probe
 grep -Fq 'FIELDWORK_PROC_ENV_ESCAPE' lib/local/control/fieldwork-local-probe
@@ -307,7 +326,7 @@ grep -Fq '[[ "$token" =~ ^[0-9a-f]{64}$ ]]' lib/local/control/fieldwork-local .g
 grep -Fq -- "--write-out '%{http_code}'" lib/local/control/fieldwork-local .github/workflows/test.yml
 grep -Fq '[ "$http_status" = 401 ]' lib/local/control/fieldwork-local .github/workflows/test.yml
 test -f lib/local/managed/.claude/skills/pr-delivery/SKILL.md
-! grep -Eq '(^|[[:space:]])local\)' bin/fieldwork
+assert_no_match grep -Eq '(^|[[:space:]])local\)' bin/fieldwork
 python3 - <<'PY'
 import xml.etree.ElementTree as ET
 ET.parse('lib/local/com.fieldwork.spool-init.plist')
@@ -319,10 +338,10 @@ if grep -RInE 'uses:[[:space:]]+[^#[:space:]]+@(v[0-9]+|main|master)$' .github/w
 fi
 grep -Fq 'FIELDWORK_TRUSTED_BUILDER_WORKFLOW_SHA' .github/workflows/release.yml
 grep -Fq 'FIELDWORK_TRUSTED_BUILDER_DISPATCH_TOKEN' .github/workflows/release.yml
-! grep -Eq 'git archive|gh release create|attest-build-provenance|upload-artifact' .github/workflows/release.yml
+assert_no_match grep -Eq 'git archive|gh release create|attest-build-provenance|upload-artifact' .github/workflows/release.yml
 grep -Fq 'expected_workflow_sha' .github/workflows/release.yml
 grep -Fq 'source_event_oid' .github/workflows/release.yml
-! grep -Fq 'source_digest' .github/workflows/release.yml
+assert_no_match grep -Fq 'source_digest' .github/workflows/release.yml
 
 check "migration transaction"
 grep -Fq 'maintenance-start' lib/local/control/fieldwork-local

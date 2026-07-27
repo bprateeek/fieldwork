@@ -20,6 +20,8 @@ not have Docker access.
 The dedicated Claude session loads only root-owned managed settings. Those
 settings pre-approve normal repository tools so unattended work can proceed;
 managed denies and the Bash policy hook take precedence over that allowlist.
+Bash subprocess environment scrubbing pins Claude to its default permission
+mode, so no session-supplied mode can loosen the root-owned rules.
 Bash-child network access has an empty managed allowlist, outbound tools and
 unmanaged MCP are unavailable, Docker sockets and the local bearer are
 unreadable, and only the absolute root-owned build/upload/verify/prepare clients

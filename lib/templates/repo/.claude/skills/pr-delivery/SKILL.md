@@ -6,7 +6,7 @@ description: Verify, commit, and deliver a Fieldwork change through the checkout
 # /pr-delivery
 
 Open or update a PR without exposing forge credentials to the agent checkout.
-Never run `git push` or use a removed `fieldwork-pr-submit` client.
+Never run `git push` or use a removed one-step submit client.
 
 Before changing Git state, print the complete list of dirty paths and one short
 paragraph explaining why they belong in this delivery. Then continue through
