@@ -15,6 +15,8 @@
 - Add Claude-only local hard-boundary mode with a root-owned control plane,
   hardened broker/bot containers, dedicated OS user, policy helper, pinned
   Claude digest, private per-UID spool, TTY token rotation, and local approval.
+  Scrubbed Claude launches explicitly authorize the same fixed managed tool
+  surface so headless probes and deliveries never wait on an unavailable prompt.
 - Scope the initial local hard-boundary release claim to Ubuntu 24.04 Linux;
   keep macOS unreleased pending a disposable real-hardware gate. Add a
   root-only, non-persistent CI OAuth-token path whose hostile probe verifies
