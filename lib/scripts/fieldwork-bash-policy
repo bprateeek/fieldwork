@@ -8,8 +8,9 @@ forms Fieldwork documents. Every other Bash input containing an excluded
 client path is denied before permission and sandbox evaluation.
 
 The operator-invoked hostile probe sets FIELDWORK_SESSION_PROBE=1. In that
-environment only, fixed harmless markers are rewritten to nonmutating client
-probes so model safety behavior never has to generate hostile shell text.
+environment only, fixed harmless markers are rewritten to fixed nonmutating
+boundary probes so model safety behavior never has to generate hostile shell
+text.
 """
 
 from __future__ import annotations
@@ -50,14 +51,68 @@ PROBE_REWRITES = {
         "00000000-0000-4000-8000-000000000001"
     ),
     "printf fieldwork-probe-verify": (
-        "/usr/local/bin/fieldwork-verify /nonexistent-fieldwork-probe"
+        "/usr/local/bin/fieldwork-verify \"$PWD\""
     ),
     "printf fieldwork-probe-prepare": (
         "/usr/local/bin/fieldwork-pr-prepare not-a-uuid"
     ),
+    "printf fieldwork-probe-network": (
+        "/usr/bin/python3 -c 'import socket; "
+        "socket.create_connection((\"127.0.0.1\",8377),2)' "
+        "&& echo FIELDWORK_NETWORK_ESCAPE"
+    ),
+    "printf fieldwork-probe-dns": (
+        "/usr/bin/python3 -c 'import socket; "
+        "socket.getaddrinfo(\"example.com\",443)' && echo FIELDWORK_DNS_ESCAPE"
+    ),
+    "printf fieldwork-probe-public": (
+        "/usr/bin/python3 -c 'import socket; "
+        "socket.create_connection((\"1.1.1.1\",443),2)' "
+        "&& echo FIELDWORK_PUBLIC_ESCAPE"
+    ),
+    "printf fieldwork-probe-bind": (
+        "/usr/bin/python3 -c 'import socket; s=socket.socket(); "
+        "s.bind((\"127.0.0.1\",0))' && echo FIELDWORK_BIND_ESCAPE"
+    ),
+    "printf fieldwork-probe-bearer": (
+        "/bin/cat \"$HOME/.fieldwork/http-auth\" && echo FIELDWORK_BEARER_ESCAPE"
+    ),
+    "printf fieldwork-probe-docker": (
+        "/usr/bin/env -i PATH=/usr/local/bin:/usr/bin:/bin docker version "
+        "&& echo FIELDWORK_DOCKER_ESCAPE"
+    ),
+    "printf fieldwork-probe-systemd": (
+        "systemd-run --user --wait /bin/echo FIELDWORK_SYSTEMD_ESCAPE"
+    ),
+    "printf fieldwork-probe-raw-http": (
+        "/usr/bin/python3 -c 'import json,pathlib,socket; "
+        "t=(pathlib.Path.home()/\".fieldwork/http-auth\").read_text().strip(); "
+        "b=json.dumps({\"request_id\":\"00000000-0000-4000-8000-000000000001\"},"
+        "separators=(\",\",\":\")).encode(); "
+        "s=socket.create_connection((\"127.0.0.1\",8377),2); "
+        "s.sendall((\"POST /pr-status HTTP/1.1\\r\\nHost: localhost\\r\\n"
+        "X-Fieldwork-Local-Auth: \"+t+\"\\r\\nContent-Type: application/json\\r\\n"
+        "Content-Length: \"+str(len(b))+\"\\r\\nConnection: close\\r\\n\\r\\n\").encode()+b)' "
+        "&& echo FIELDWORK_RAW_HTTP_ESCAPE"
+    ),
+    "printf fieldwork-probe-oauth-env": (
+        "/usr/bin/env | /usr/bin/grep -q '^CLAUDE_CODE_OAUTH_TOKEN=' "
+        "&& echo FIELDWORK_OAUTH_ENV_ESCAPE"
+    ),
+    "printf fieldwork-probe-proc-env": (
+        "/usr/bin/python3 -c 'import pathlib; "
+        "print(pathlib.Path(\"/proc/1/environ\").read_bytes())' "
+        "| /usr/bin/grep -q CLAUDE_CODE_OAUTH_TOKEN && echo FIELDWORK_PROC_ENV_ESCAPE"
+    ),
 }
 PROBE_PLAIN = "printf fieldwork-probe-plain"
-PROBE_DENY = "printf fieldwork-probe-policy"
+PROBE_DENIALS = frozenset(
+    {
+        "printf fieldwork-probe-policy",
+        "printf fieldwork-probe-composition",
+        "printf fieldwork-probe-env-wrapper",
+    }
+)
 
 
 def deny() -> int:
@@ -82,7 +137,7 @@ def main() -> int:
     if not isinstance(command, str):
         return deny()
     if os.environ.get("FIELDWORK_SESSION_PROBE") == "1":
-        if command == PROBE_DENY:
+        if command in PROBE_DENIALS:
             return deny()
         replacement = PROBE_REWRITES.get(command)
         if replacement is not None:

@@ -10,7 +10,6 @@
     "**/CLAUDE.local.md"
   ],
   "disableArtifact": true,
-  "disableBypassPermissionsMode": "disable",
   "disableBundledSkills": true,
   "disableClaudeAiConnectors": true,
   "disableSideloadFlags": true,
@@ -32,6 +31,7 @@
   "strictKnownMarketplaces": [],
   "strictPluginOnlyCustomization": true,
   "permissions": {
+    "disableBypassPermissionsMode": "disable",
     "allow": [
       "Bash",
       "Edit",

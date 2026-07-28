@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 from pathlib import Path
@@ -12,8 +13,28 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 POLICY = ROOT / "lib/scripts/fieldwork-bash-policy"
+LOCAL_PROBE = ROOT / "lib/local/control/fieldwork-local-probe"
 REQUEST_ID = "00000000-0000-4000-8000-000000000001"
 DENIAL = b"fieldwork-excluded-client-policy: denied unsafe excluded-client command"
+
+
+def literal_assignment(path: Path, name: str) -> object:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(isinstance(target, ast.Name) and target.id == name for target in node.targets):
+            continue
+        value = node.value
+        if (
+            isinstance(value, ast.Call)
+            and isinstance(value.func, ast.Name)
+            and value.func.id == "frozenset"
+            and len(value.args) == 1
+        ):
+            value = value.args[0]
+        return ast.literal_eval(value)
+    raise AssertionError(f"missing literal assignment {name} in {path}")
 
 
 def invoke(
@@ -35,6 +56,17 @@ def invoke(
 
 
 class BashPolicyTests(unittest.TestCase):
+    def test_local_probe_covers_every_root_owned_marker(self) -> None:
+        commands = set(literal_assignment(LOCAL_PROBE, "probe_commands"))
+        rewrites = set(literal_assignment(POLICY, "PROBE_REWRITES"))
+        denials = set(literal_assignment(POLICY, "PROBE_DENIALS"))
+        plain = literal_assignment(POLICY, "PROBE_PLAIN")
+        probe_source = LOCAL_PROBE.read_text(encoding="utf-8")
+        self.assertEqual(commands, rewrites | denials | {plain})
+        self.assertEqual(len(commands), 18)
+        self.assertTrue(all(command.startswith("printf fieldwork-probe-") for command in commands))
+        self.assertIn('"verify": "[fieldwork-verify] OK" in verify', probe_source)
+
     def test_exact_excluded_client_forms_are_allowed(self) -> None:
         commands = (
             (
@@ -79,10 +111,58 @@ class BashPolicyTests(unittest.TestCase):
                 f"{REQUEST_ID}"
             ),
             "printf fieldwork-probe-verify": (
-                "/usr/local/bin/fieldwork-verify /nonexistent-fieldwork-probe"
+                "/usr/local/bin/fieldwork-verify \"$PWD\""
             ),
             "printf fieldwork-probe-prepare": (
                 "/usr/local/bin/fieldwork-pr-prepare not-a-uuid"
+            ),
+            "printf fieldwork-probe-network": (
+                "/usr/bin/python3 -c 'import socket; "
+                "socket.create_connection((\"127.0.0.1\",8377),2)' "
+                "&& echo FIELDWORK_NETWORK_ESCAPE"
+            ),
+            "printf fieldwork-probe-dns": (
+                "/usr/bin/python3 -c 'import socket; "
+                "socket.getaddrinfo(\"example.com\",443)' && echo FIELDWORK_DNS_ESCAPE"
+            ),
+            "printf fieldwork-probe-public": (
+                "/usr/bin/python3 -c 'import socket; "
+                "socket.create_connection((\"1.1.1.1\",443),2)' "
+                "&& echo FIELDWORK_PUBLIC_ESCAPE"
+            ),
+            "printf fieldwork-probe-bind": (
+                "/usr/bin/python3 -c 'import socket; s=socket.socket(); "
+                "s.bind((\"127.0.0.1\",0))' && echo FIELDWORK_BIND_ESCAPE"
+            ),
+            "printf fieldwork-probe-bearer": (
+                "/bin/cat \"$HOME/.fieldwork/http-auth\" && echo FIELDWORK_BEARER_ESCAPE"
+            ),
+            "printf fieldwork-probe-docker": (
+                "/usr/bin/env -i PATH=/usr/local/bin:/usr/bin:/bin docker version "
+                "&& echo FIELDWORK_DOCKER_ESCAPE"
+            ),
+            "printf fieldwork-probe-systemd": (
+                "systemd-run --user --wait /bin/echo FIELDWORK_SYSTEMD_ESCAPE"
+            ),
+            "printf fieldwork-probe-raw-http": (
+                "/usr/bin/python3 -c 'import json,pathlib,socket; "
+                "t=(pathlib.Path.home()/\".fieldwork/http-auth\").read_text().strip(); "
+                "b=json.dumps({\"request_id\":\"00000000-0000-4000-8000-000000000001\"},"
+                "separators=(\",\",\":\")).encode(); "
+                "s=socket.create_connection((\"127.0.0.1\",8377),2); "
+                "s.sendall((\"POST /pr-status HTTP/1.1\\r\\nHost: localhost\\r\\n"
+                "X-Fieldwork-Local-Auth: \"+t+\"\\r\\nContent-Type: application/json\\r\\n"
+                "Content-Length: \"+str(len(b))+\"\\r\\nConnection: close\\r\\n\\r\\n\").encode()+b)' "
+                "&& echo FIELDWORK_RAW_HTTP_ESCAPE"
+            ),
+            "printf fieldwork-probe-oauth-env": (
+                "/usr/bin/env | /usr/bin/grep -q '^CLAUDE_CODE_OAUTH_TOKEN=' "
+                "&& echo FIELDWORK_OAUTH_ENV_ESCAPE"
+            ),
+            "printf fieldwork-probe-proc-env": (
+                "/usr/bin/python3 -c 'import pathlib; "
+                "print(pathlib.Path(\"/proc/1/environ\").read_bytes())' "
+                "| /usr/bin/grep -q CLAUDE_CODE_OAUTH_TOKEN && echo FIELDWORK_PROC_ENV_ESCAPE"
             ),
         }
         for command, replacement in expected.items():
@@ -96,12 +176,25 @@ class BashPolicyTests(unittest.TestCase):
                 self.assertEqual(
                     decision["updatedInput"], {"command": replacement}
                 )
+                syntax = subprocess.run(
+                    ["bash", "-n", "-c", replacement],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
+                self.assertEqual(syntax.returncode, 0, syntax.stderr)
         plain = invoke("printf fieldwork-probe-plain", probe=True)
         self.assertEqual(plain.returncode, 0)
         self.assertEqual(plain.stdout, b"")
-        denied = invoke("printf fieldwork-probe-policy", probe=True)
-        self.assertEqual(denied.returncode, 2)
-        self.assertIn(DENIAL, denied.stderr)
+        for command in (
+            "printf fieldwork-probe-policy",
+            "printf fieldwork-probe-composition",
+            "printf fieldwork-probe-env-wrapper",
+        ):
+            with self.subTest(command=command):
+                denied = invoke(command, probe=True)
+                self.assertEqual(denied.returncode, 2)
+                self.assertIn(DENIAL, denied.stderr)
 
     def test_every_composed_or_wrapped_client_form_is_denied(self) -> None:
         upload = f"/usr/local/bin/fieldwork-pr-upload {REQUEST_ID}"
