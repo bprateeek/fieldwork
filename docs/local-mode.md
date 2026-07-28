@@ -21,7 +21,9 @@ The dedicated Claude session loads only root-owned managed settings. Those
 settings pre-approve normal repository tools so unattended work can proceed;
 managed denies and the Bash policy hook take precedence over that allowlist.
 Bash subprocess environment scrubbing pins Claude to its default permission
-mode, so no session-supplied mode can loosen the root-owned rules.
+mode. Because scrubbed non-root sessions require an explicit headless
+authorization surface, the root-owned launcher repeats the same fixed tool list
+through `--allowedTools`; no session-supplied mode can loosen the managed rules.
 Bash-child network access has an empty managed allowlist, outbound tools and
 unmanaged MCP are unavailable, Docker sockets and the local bearer are
 unreadable, and only the absolute root-owned build/upload/verify/prepare clients

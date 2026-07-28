@@ -300,10 +300,13 @@ grep -Fq 'assert_root_asset' lib/local/control/fieldwork-local-claude
 grep -Fq 'inventory contains a symlink' lib/local/control/fieldwork-local-claude
 grep -Fq 'hard-boundary inventory contains a symlink' lib/local/control/fieldwork-local-probe
 grep -Fq 'CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1' lib/local/control/fieldwork-local-claude lib/local/control/fieldwork-local-probe
-if grep -Fq -- '--allowedTools' lib/local/control/fieldwork-local-probe; then
-  echo "local probe contains a forbidden CLI permission allowlist" >&2
-  exit 1
-fi
+for scrubbed_driver in \
+  lib/local/control/fieldwork-local-claude \
+  lib/local/control/fieldwork-local-probe \
+  lib/scripts/fieldwork-session-probe; do
+  grep -Fq -- '--allowedTools' "$scrubbed_driver" \
+    || die "$scrubbed_driver does not explicitly authorize its fixed tool surface"
+done
 if grep -Fq -- '--permission-mode auto' lib/local/control/fieldwork-local-probe lib/scripts/fieldwork-session-probe; then
   echo "a Claude boundary probe contains the forbidden auto permission mode" >&2
   exit 1

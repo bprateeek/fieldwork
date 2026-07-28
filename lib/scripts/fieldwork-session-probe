@@ -35,6 +35,7 @@
 set -u
 
 CLAUDE_BIN="${FIELDWORK_CLAUDE_BIN:-/usr/local/lib/fieldwork/claude-pinned}"
+CLAUDE_TOOLS=Bash,Edit,Read,Write,Glob,Grep
 BWRAP_ERR="bwrap: No permissions"
 POLICY_DENY="fieldwork-excluded-client-policy: denied unsafe excluded-client command"
 POLICY_CLIENT="${FIELDWORK_POLICY_CLIENT:-/usr/local/bin/fieldwork-bash-policy}"
@@ -117,7 +118,7 @@ run_claude_probe() {
   timeout "$limit" "$CAGE_HELPER" \
     "$CLAUDE_BIN" "$@" --setting-sources "" --strict-mcp-config \
     --mcp-config /usr/local/lib/fieldwork/empty-mcp.json \
-    --tools "Bash,Edit,Read,Write,Glob,Grep" \
+    --tools "$CLAUDE_TOOLS" --allowedTools "$CLAUDE_TOOLS" \
     --add-dir /usr/local/share/fieldwork-claude \
     -p --verbose --output-format stream-json \
     --max-turns 10 "$prompt_text"

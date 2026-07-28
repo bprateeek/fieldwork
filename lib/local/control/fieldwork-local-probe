@@ -11,6 +11,9 @@ import subprocess
 import sys
 
 
+CLAUDE_TOOLS = "Bash,Edit,Read,Write,Glob,Grep"
+
+
 def parse_events(output: bytes) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
     events = []
     items = []
@@ -263,7 +266,7 @@ command_base = [
     f"HOME={account.pw_dir}", "PATH=/usr/local/bin:/usr/bin:/bin", "LANG=C.UTF-8", "LC_ALL=C.UTF-8",
     f"CLAUDE_CONFIG_DIR={account.pw_dir}/.claude", "CLAUDE_CODE_DISABLE_AUTO_MEMORY=1", *claude_env,
     str(claude), "--setting-sources", "", "--strict-mcp-config", "--mcp-config", str(root / "empty-mcp.json"),
-    "--tools", "Bash,Edit,Read,Write,Glob,Grep",
+    "--tools", CLAUDE_TOOLS, "--allowedTools", CLAUDE_TOOLS,
     "-p", "--verbose", "--output-format", "stream-json",
     "--max-turns", "2",
 ]

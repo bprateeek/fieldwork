@@ -14,6 +14,9 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 POLICY = ROOT / "lib/scripts/fieldwork-bash-policy"
 LOCAL_PROBE = ROOT / "lib/local/control/fieldwork-local-probe"
+LOCAL_LAUNCHER = ROOT / "lib/local/control/fieldwork-local-claude"
+VPS_PROBE = ROOT / "lib/scripts/fieldwork-session-probe"
+STRICT_POLICY = ROOT / "lib/local/control/strict-managed-settings.json"
 REQUEST_ID = "00000000-0000-4000-8000-000000000001"
 DENIAL = b"fieldwork-excluded-client-policy: denied unsafe excluded-client command"
 
@@ -89,6 +92,22 @@ class BashPolicyTests(unittest.TestCase):
         self.assertIn('"--max-turns", "2"', source)
         self.assertIn('"CLAUDE_CODE_SKIP_PROMPT_HISTORY=1"', source)
         self.assertNotIn("--resume", source)
+
+    def test_scrubbed_claude_drivers_explicitly_authorize_the_fixed_tools(self) -> None:
+        managed = json.loads(STRICT_POLICY.read_text(encoding="utf-8"))
+        expected = ",".join(managed["permissions"]["allow"])
+        self.assertEqual(expected, "Bash,Edit,Read,Write,Glob,Grep")
+        self.assertEqual(literal_assignment(LOCAL_PROBE, "CLAUDE_TOOLS"), expected)
+        probe_source = LOCAL_PROBE.read_text(encoding="utf-8")
+        self.assertIn('"--tools", CLAUDE_TOOLS, "--allowedTools", CLAUDE_TOOLS', probe_source)
+        for path in (LOCAL_LAUNCHER, VPS_PROBE):
+            with self.subTest(path=path):
+                source = path.read_text(encoding="utf-8")
+                self.assertIn(f"CLAUDE_TOOLS={expected}", source)
+                self.assertIn(
+                    '--tools "$CLAUDE_TOOLS" --allowedTools "$CLAUDE_TOOLS"',
+                    source,
+                )
 
     def test_local_probe_pairs_current_stream_json_results(self) -> None:
         analyze = load_probe_helpers()["analyze_attempt"]
