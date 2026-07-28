@@ -10,6 +10,77 @@ import stat
 import subprocess
 import sys
 
+
+def parse_events(output: bytes) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    events = []
+    items = []
+    for raw in output.splitlines():
+        try:
+            event = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        events.append(event)
+        message = event.get("message")
+        content = message.get("content", []) if isinstance(message, dict) else []
+        if isinstance(content, list):
+            items.extend(item for item in content if isinstance(item, dict))
+    return events, items
+
+
+def tool_command(item: dict[str, object]) -> str:
+    tool_input = item.get("input")
+    if not isinstance(tool_input, dict):
+        return ""
+    return str(tool_input.get("command", ""))
+
+
+def result_text(value: object) -> str:
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return ""
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def analyze_attempt(output: bytes, expected_command: str) -> tuple[str, str]:
+    """Return the paired result text or a stable, non-sensitive failure label."""
+    events, items = parse_events(output)
+    tool_uses = [item for item in items if item.get("type") == "tool_use"]
+    if len(tool_uses) != 1:
+        return "", f"tool-use-count-{len(tool_uses)}"
+    use = tool_uses[0]
+    if use.get("name") != "Bash" or tool_command(use) != expected_command:
+        return "", "unexpected-tool-use"
+    ident = use.get("id")
+    if not isinstance(ident, str) or not ident:
+        return "", "missing-tool-use-id"
+
+    payloads = []
+    paired = False
+    for event in events:
+        message = event.get("message")
+        content = message.get("content", []) if isinstance(message, dict) else []
+        if not isinstance(content, list):
+            continue
+        matching = [
+            item for item in content
+            if isinstance(item, dict)
+            and item.get("type") == "tool_result"
+            and item.get("tool_use_id") == ident
+        ]
+        if not matching:
+            continue
+        paired = True
+        payloads.extend(item.get("content", "") for item in matching)
+        if "tool_use_result" in event:
+            payloads.append(event["tool_use_result"])
+    if not paired:
+        return "", "missing-tool-result"
+    return "\n".join(result_text(value) for value in payloads), ""
+
+
 if os.getuid() != 0:
     print("fieldwork-local probe must run as root", file=sys.stderr)
     raise SystemExit(1)
@@ -158,9 +229,6 @@ probe_commands = (
     "printf fieldwork-probe-env-wrapper",
     "printf fieldwork-probe-policy",
 )
-prompt = "Run exactly these harmless literal printf commands as separate Bash tool calls, in order, then stop:\n"
-prompt += "\n".join(f"{number}) {value}" for number, value in enumerate(probe_commands, 1))
-
 policy_denial = b"fieldwork-excluded-client-policy: denied unsafe excluded-client command"
 policy_selftests = (
     "/usr/local/bin/fieldwork-pr-upload --status "
@@ -183,7 +251,11 @@ for selftest_command in policy_selftests:
         print("managed Bash policy failed an excluded-client composition self-test", file=sys.stderr)
         raise SystemExit(1)
 
-claude_env = ["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1", "FIELDWORK_SESSION_PROBE=1"]
+claude_env = [
+    "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1",
+    "CLAUDE_CODE_SKIP_PROMPT_HISTORY=1",
+    "FIELDWORK_SESSION_PROBE=1",
+]
 if oauth_token is not None:
     claude_env.append(f"CLAUDE_CODE_OAUTH_TOKEN={oauth_token}")
 command_base = [
@@ -193,121 +265,80 @@ command_base = [
     str(claude), "--setting-sources", "", "--strict-mcp-config", "--mcp-config", str(root / "empty-mcp.json"),
     "--tools", "Bash,Edit,Read,Write,Glob,Grep",
     "-p", "--verbose", "--output-format", "stream-json",
-    "--max-turns", "26",
+    "--max-turns", "2",
 ]
 
-def run_claude(prompt_text: str, resume: str | None = None) -> subprocess.CompletedProcess[bytes]:
-    command = [*command_base]
-    if resume is not None:
-        command.extend(("--resume", resume))
-    command.append(prompt_text)
+def run_claude(probe_command: str) -> subprocess.CompletedProcess[bytes]:
+    prompt_text = (
+        "Run one authorized deterministic Fieldwork installation diagnostic. "
+        "Make exactly one Bash tool call, with its command input set to this exact literal string:\n"
+        f"{probe_command}\n"
+        "Do not call any other tool. Stop after that tool result."
+    )
     return subprocess.run(
-        command, cwd=project, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=180,
+        [*command_base, prompt_text], cwd=project, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, timeout=120,
     )
 
-try:
-    attempts = [run_claude(prompt)]
-except subprocess.TimeoutExpired:
-    print("hostile probe timed out", file=sys.stderr)
-    raise SystemExit(1)
-
-def parse_events(output: bytes) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
-    events = []
-    items = []
-    for raw in output.splitlines():
-        try:
-            event = json.loads(raw)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(event, dict):
-            continue
-        events.append(event)
-        message = event.get("message")
-        content = message.get("content", []) if isinstance(message, dict) else []
-        if isinstance(content, list):
-            items.extend(item for item in content if isinstance(item, dict))
-    return events, items
-
-def tool_command(item: dict[str, object]) -> str:
-    tool_input = item.get("input")
-    if not isinstance(tool_input, dict):
-        return ""
-    return str(tool_input.get("command", ""))
-
-for _ in range(3):
-    output_so_far = b"\n".join(attempt.stdout for attempt in attempts)
-    events, items = parse_events(output_so_far)
-    seen_commands = {
-        tool_command(item)
-        for item in items if item.get("type") == "tool_use" and item.get("name") == "Bash"
-    }
-    missing = [value for value in probe_commands if value not in seen_commands]
-    if not missing:
-        break
-    session_id = next(
-        (
-            str(event.get("session_id", "")) for event in events
-            if event.get("type") == "system" and event.get("subtype") == "init"
-            and re.fullmatch(r"[0-9a-f-]{36}", str(event.get("session_id", "")))
-        ),
-        "",
-    )
-    if not session_id:
-        break
-    followup_prompt = (
-        "Continue the authorized diagnostic. Run each remaining literal printf command "
-        "as a separate Bash tool call, in this order, then stop:\n" + "\n".join(missing)
-    )
+attempts = []
+command_results = {}
+attempt_errors = {}
+for probe_command in probe_commands:
     try:
-        attempts.append(run_claude(followup_prompt, session_id))
+        attempt = run_claude(probe_command)
     except subprocess.TimeoutExpired:
-        print("hostile probe follow-up timed out", file=sys.stderr)
+        print(f"hostile probe timed out at {probe_command}", file=sys.stderr)
         raise SystemExit(1)
+    attempts.append(attempt)
+    result, error = analyze_attempt(attempt.stdout, probe_command)
+    command_results[probe_command] = result
+    if attempt.returncode:
+        attempt_errors[probe_command] = f"claude-exit-{attempt.returncode}"
+    elif error:
+        attempt_errors[probe_command] = error
 
 combined_stdout = b"\n".join(attempt.stdout for attempt in attempts)
 combined_stderr = b"\n".join(attempt.stderr for attempt in attempts)
-_, items = parse_events(combined_stdout)
-uses = {item.get("id"): item for item in items if item.get("type") == "tool_use" and item.get("name") == "Bash"}
-results = {item.get("tool_use_id"): item for item in items if item.get("type") == "tool_result"}
-def result_for(command: str) -> str:
-    for ident, use in reversed(tuple(uses.items())):
-        if tool_command(use) == command:
-            value = results.get(ident, {}).get("content", "")
-            if isinstance(value, list):
-                return " ".join(str(part.get("text", "")) for part in value if isinstance(part, dict))
-            return str(value)
-    return ""
-def result_text(value: object) -> str:
-    if isinstance(value, list):
-        return " ".join(str(part.get("text", "")) for part in value if isinstance(part, dict))
-    return str(value)
-command_results = {command: result_for(command) for command in probe_commands}
-build = command_results["printf fieldwork-probe-build"]
-upload = command_results["printf fieldwork-probe-upload"]
-verify = command_results["printf fieldwork-probe-verify"]
-prepare = command_results["printf fieldwork-probe-prepare"]
-plain = command_results["printf fieldwork-probe-plain"]
-combined = "\n".join(result_text(item.get("content", "")) for item in results.values())
-seen_commands = {
-    tool_command(use) for use in uses.values()
-}
-missing = [value for value in probe_commands if value not in seen_commands]
+_, combined_items = parse_events(combined_stdout)
+uses = [
+    item for item in combined_items
+    if item.get("type") == "tool_use" and item.get("name") == "Bash"
+]
+missing = [value for value in probe_commands if not command_results.get(value)]
+
+build = command_results.get("printf fieldwork-probe-build", "")
+upload = command_results.get("printf fieldwork-probe-upload", "")
+verify = command_results.get("printf fieldwork-probe-verify", "")
+prepare = command_results.get("printf fieldwork-probe-prepare", "")
+plain = command_results.get("printf fieldwork-probe-plain", "")
+combined = "\n".join(command_results.values())
 client_checks = {
     "build": "fieldwork-pr-build" in build,
     "upload": "unknown_request" in upload,
     "verify": "[fieldwork-verify] OK" in verify,
     "prepare": "fieldwork-pr-prepare" in prepare,
     "plain": "fieldwork-probe-plain" in plain,
-    "composition": policy_denial.decode() in command_results["printf fieldwork-probe-composition"],
-    "env-wrapper": policy_denial.decode() in command_results["printf fieldwork-probe-env-wrapper"],
-    "policy": policy_denial.decode() in command_results["printf fieldwork-probe-policy"],
+    "composition": policy_denial.decode() in command_results.get(
+        "printf fieldwork-probe-composition", ""
+    ),
+    "env-wrapper": policy_denial.decode() in command_results.get(
+        "printf fieldwork-probe-env-wrapper", ""
+    ),
+    "policy": policy_denial.decode() in command_results.get(
+        "printf fieldwork-probe-policy", ""
+    ),
 }
-if missing or not all(client_checks.values()):
+if attempt_errors or missing or not all(client_checks.values()):
+    error_summary = ", ".join(
+        f"{command.removeprefix('printf fieldwork-probe-')}:{error}"
+        for command, error in attempt_errors.items()
+    )
     print("an excluded client or ordinary sandbox command did not execute as expected", file=sys.stderr)
     print(
         "hostile probe diagnostics: "
         f"attempt_rcs={[attempt.returncode for attempt in attempts]} "
         f"bash_calls={len(uses)} "
+        f"errors={{{error_summary}}} "
         f"missing={[value.removeprefix('printf fieldwork-probe-') for value in missing]} "
         f"checks={client_checks}",
         file=sys.stderr,

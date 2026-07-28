@@ -32,7 +32,8 @@ python3 -m py_compile \
   lib/scripts/fieldwork-session-probe-cage \
   lib/scripts/fieldwork-pr-prepare lib/scripts/fieldwork-bot \
   lib/scripts/fieldwork-task-run lib/scripts/fieldwork-task-dispatcher \
-  lib/local/local-admin lib/local/control/fieldwork-policy-helper
+  lib/local/local-admin lib/local/control/fieldwork-policy-helper \
+  lib/local/control/fieldwork-local-probe
 
 check "JSON schemas and managed policy"
 for file in \
@@ -308,6 +309,9 @@ if grep -Fq -- '--permission-mode auto' lib/local/control/fieldwork-local-probe 
   exit 1
 fi
 grep -Fq 'FIELDWORK_SESSION_PROBE=1' lib/local/control/fieldwork-local-probe
+grep -Fq 'for probe_command in probe_commands:' lib/local/control/fieldwork-local-probe
+grep -Fq 'CLAUDE_CODE_SKIP_PROMPT_HISTORY=1' lib/local/control/fieldwork-local-probe
+assert_no_match grep -Fq -- '--resume' lib/local/control/fieldwork-local-probe
 grep -Fq 'CI OAuth token file must be a root-owned mode 0600 regular file' lib/local/control/fieldwork-local-probe
 grep -Fq 'FIELDWORK_OAUTH_ENV_ESCAPE' lib/local/control/fieldwork-local-probe
 grep -Fq 'FIELDWORK_PROC_ENV_ESCAPE' lib/local/control/fieldwork-local-probe

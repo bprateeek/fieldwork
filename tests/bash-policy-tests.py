@@ -37,6 +37,21 @@ def literal_assignment(path: Path, name: str) -> object:
     raise AssertionError(f"missing literal assignment {name} in {path}")
 
 
+def load_probe_helpers() -> dict[str, object]:
+    names = {"parse_events", "tool_command", "result_text", "analyze_attempt"}
+    tree = ast.parse(LOCAL_PROBE.read_text(encoding="utf-8"), filename=str(LOCAL_PROBE))
+    functions = [
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name in names
+    ]
+    if {node.name for node in functions} != names:
+        raise AssertionError("local probe transcript helpers are incomplete")
+    namespace = {"json": json}
+    module = ast.Module(body=functions, type_ignores=[])
+    exec(compile(module, str(LOCAL_PROBE), "exec"), namespace)
+    return namespace
+
+
 def invoke(
     command: str, *, probe: bool = False, **tool_input: object
 ) -> subprocess.CompletedProcess[bytes]:
@@ -66,6 +81,75 @@ class BashPolicyTests(unittest.TestCase):
         self.assertEqual(len(commands), 18)
         self.assertTrue(all(command.startswith("printf fieldwork-probe-") for command in commands))
         self.assertIn('"verify": "[fieldwork-verify] OK" in verify', probe_source)
+
+    def test_local_probe_drives_one_command_per_claude_process(self) -> None:
+        source = LOCAL_PROBE.read_text(encoding="utf-8")
+        self.assertIn("for probe_command in probe_commands:", source)
+        self.assertIn("result, error = analyze_attempt(attempt.stdout, probe_command)", source)
+        self.assertIn('"--max-turns", "2"', source)
+        self.assertIn('"CLAUDE_CODE_SKIP_PROMPT_HISTORY=1"', source)
+        self.assertNotIn("--resume", source)
+
+    def test_local_probe_pairs_current_stream_json_results(self) -> None:
+        analyze = load_probe_helpers()["analyze_attempt"]
+        command = "printf fieldwork-probe-build"
+        ident = "toolu_probe_1"
+        events = (
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [{
+                        "type": "tool_use", "id": ident, "name": "Bash",
+                        "input": {"command": command},
+                    }],
+                },
+            },
+            {
+                "type": "user",
+                "message": {
+                    "content": [{
+                        "type": "tool_result", "tool_use_id": ident,
+                        "content": "[fieldwork-pr-build] request input is missing",
+                    }],
+                },
+                "tool_use_result": {
+                    "stdout": "",
+                    "stderr": "[fieldwork-pr-build] request input is missing",
+                    "interrupted": False,
+                },
+            },
+        )
+        output = "\n".join(json.dumps(event) for event in events).encode()
+        result, error = analyze(output, command)
+        self.assertEqual(error, "")
+        self.assertIn("fieldwork-pr-build", result)
+        self.assertIn("stderr", result)
+
+    def test_local_probe_rejects_unpaired_or_multiple_tool_uses(self) -> None:
+        analyze = load_probe_helpers()["analyze_attempt"]
+        command = "printf fieldwork-probe-plain"
+        one_use = {
+            "type": "assistant",
+            "message": {"content": [{
+                "type": "tool_use", "id": "toolu_1", "name": "Bash",
+                "input": {"command": command},
+            }]},
+        }
+        _, error = analyze(json.dumps(one_use).encode(), command)
+        self.assertEqual(error, "missing-tool-result")
+
+        two_uses = {
+            "type": "assistant",
+            "message": {"content": [
+                one_use["message"]["content"][0],
+                {
+                    "type": "tool_use", "id": "toolu_2", "name": "Bash",
+                    "input": {"command": "pwd"},
+                },
+            ]},
+        }
+        _, error = analyze(json.dumps(two_uses).encode(), command)
+        self.assertEqual(error, "tool-use-count-2")
 
     def test_exact_excluded_client_forms_are_allowed(self) -> None:
         commands = (
